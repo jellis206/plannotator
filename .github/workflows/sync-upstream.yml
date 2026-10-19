@@ -1,0 +1,70 @@
+# Fork only: merge backnotprop/plannotator main into this main daily, keeping local commits on
+# top. A clean merge that passes tests is pushed. A conflict or failing test
+# opens a PR from sync/upstream (upstream's main) instead, to resolve by hand;
+# while that PR is open, later runs leave its branch alone.
+# Upstream changes to .github/workflows can only be pushed with SYNC_TOKEN, a
+# token with contents, pull requests and workflows write; github.token can't.
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: "20 12 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+      - name: Merge upstream main
+        id: merge
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch https://github.com/backnotprop/plannotator.git main
+          if git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            echo "Already up to date."
+            exit 0
+          fi
+          echo "upstream=$(git rev-parse FETCH_HEAD)" >> "$GITHUB_OUTPUT"
+          if git merge --no-edit FETCH_HEAD; then
+            echo "status=merged" >> "$GITHUB_OUTPUT"
+          else
+            git merge --abort
+            echo "status=conflict" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: oven-sh/setup-bun@v2
+        if: steps.merge.outputs.status == 'merged'
+        with:
+          bun-version: latest
+      - name: Test
+        id: test
+        if: steps.merge.outputs.status == 'merged'
+        continue-on-error: true
+        run: bun install --frozen-lockfile && bash apps/pi-extension/vendor.sh && bun test
+      - name: Push
+        if: steps.merge.outputs.status == 'merged' && steps.test.outcome == 'success'
+        run: git push origin main
+      - name: Open PR
+        if: steps.merge.outputs.status == 'conflict' || steps.test.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
+          REASON: ${{ steps.merge.outputs.status == 'conflict' && 'conflicts with' || 'fails tests after merging into' }}
+        run: |
+          open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head sync/upstream --state open --json number --jq length)
+          if [ "$open" != 0 ]; then
+            echo "A sync/upstream PR is already open."
+            exit 0
+          fi
+          git push --force origin "${{ steps.merge.outputs.upstream }}:refs/heads/sync/upstream"
+          gh pr create --repo "$GITHUB_REPOSITORY" --base main --head sync/upstream \
+            --title "Sync backnotprop/plannotator main" \
+            --body "Upstream backnotprop/plannotator@main $REASON main. Resolve here, then merge. Opened by .github/workflows/sync-upstream.yml."
