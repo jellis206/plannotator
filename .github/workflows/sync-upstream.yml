@@ -1,6 +1,6 @@
 # Fork only: merge backnotprop/plannotator main into this main daily, keeping local commits on
-# top. A clean merge that passes tests is pushed. A conflict or failing test
-# opens a PR from sync/upstream (upstream's main) instead, to resolve by hand;
+# top. No tests: this fork carries no code of its own, and upstream tests its
+# main. A clean merge is pushed; a conflict opens a PR from sync/upstream (upstream's main) instead, to resolve by hand;
 # while that PR is open, later runs leave its branch alone.
 # Upstream changes to .github/workflows can only be pushed with SYNC_TOKEN, a
 # token with contents, pull requests and workflows write; github.token can't.
@@ -41,23 +41,13 @@ jobs:
             git merge --abort
             echo "status=conflict" >> "$GITHUB_OUTPUT"
           fi
-      - uses: oven-sh/setup-bun@v2
-        if: steps.merge.outputs.status == 'merged'
-        with:
-          bun-version: latest
-      - name: Test
-        id: test
-        if: steps.merge.outputs.status == 'merged'
-        continue-on-error: true
-        run: bun install --frozen-lockfile && bash apps/pi-extension/vendor.sh && bun test
       - name: Push
-        if: steps.merge.outputs.status == 'merged' && steps.test.outcome == 'success'
+        if: steps.merge.outputs.status == 'merged'
         run: git push origin main
       - name: Open PR
-        if: steps.merge.outputs.status == 'conflict' || steps.test.outcome == 'failure'
+        if: steps.merge.outputs.status == 'conflict'
         env:
           GH_TOKEN: ${{ secrets.SYNC_TOKEN || github.token }}
-          REASON: ${{ steps.merge.outputs.status == 'conflict' && 'conflicts with' || 'fails tests after merging into' }}
         run: |
           open=$(gh pr list --repo "$GITHUB_REPOSITORY" --head sync/upstream --state open --json number --jq length)
           if [ "$open" != 0 ]; then
@@ -67,4 +57,4 @@ jobs:
           git push --force origin "${{ steps.merge.outputs.upstream }}:refs/heads/sync/upstream"
           gh pr create --repo "$GITHUB_REPOSITORY" --base main --head sync/upstream \
             --title "Sync backnotprop/plannotator main" \
-            --body "Upstream backnotprop/plannotator@main $REASON main. Resolve here, then merge. Opened by .github/workflows/sync-upstream.yml."
+            --body "Upstream backnotprop/plannotator@main conflicts with main. Resolve here, then merge. Opened by .github/workflows/sync-upstream.yml."
