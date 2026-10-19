@@ -127,6 +127,7 @@ jobs:
           packages/ui/components/DiagramBlock.anchor.test.tsx
           packages/ui/components/DiagramBlock.askAI.test.tsx
           packages/ui/components/Viewer.askAISelectionLine.test.tsx
+          packages/ui/components/Viewer.textComments.test.tsx
           packages/ui/components/ImageLightbox.test.tsx
           packages/ui/components/HostTitle.dom.test.tsx
           packages/inbox/images.test.tsx
@@ -152,7 +153,7 @@ jobs:
           packages/inbox/notificationStates.test.tsx
           packages/inbox/attachmentStepping.test.tsx
           packages/inbox/fullView.test.tsx
-          packages/inbox/fullViewRemembered.test.tsx
+          packages/inbox/fullScreenThread.test.tsx
           packages/inbox/attachmentSteppingSave.test.tsx
           packages/inbox/listColumn.test.tsx
           packages/inbox/endedSession.test.tsx
@@ -185,6 +186,7 @@ jobs:
           packages/inbox/openIn.test.tsx
           packages/inbox/videoAttachment.test.tsx
           packages/inbox/skillReferences.test.tsx
+          packages/inbox/messageComments.test.tsx
           packages/ui/components/HumanOnlySkillNotice.test.tsx
           packages/ui/components/MenuVersionSection.test.tsx
           packages/ui/components/blocks/QuestionBlock.test.tsx
