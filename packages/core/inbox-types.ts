@@ -385,6 +385,77 @@ export interface InboxMessage {
    * Absent on every other message and on older records.
    */
   ack?: InboxAck | null;
+  /**
+   * On a person's reply: the agent sessions they tagged with `@` (approval
+   * "inbox-tag-agents", Lines variant), in the order typed, never the session
+   * the reply goes to anyway (its owner, `InboxStore.recipientOf`). ONE
+   * message, handed to its owner and to every tagged session; each records
+   * its own delivery in its entry, so each gets its own line and Send now.
+   * A message with tags is settled for each recipient only by that
+   * recipient's own delivery or its own wait_for_reply, never by another
+   * agent's read. Absent on every other message and on older records.
+   */
+  tags?: InboxTag[];
+}
+
+/**
+ * One agent session a person's reply tags (`InboxMessage.tags`). The last
+ * line of the message wins, as for every record: a delivery, a Send now and
+ * a read are new snapshots of the whole message.
+ */
+export interface InboxTag {
+  /** The connection's host (`claude-code`, `pi`); null for an MCP agent that never named one. */
+  host: string | null;
+  session: string;
+  /** The name an MCP agent gave itself, for the person's view only; null otherwise. */
+  name?: string | null;
+  /**
+   * The readable label the person picked, as it reads in their text after
+   * `@` ("Pi", "Claude Code (another session)"): the sent message paints that
+   * token and names the session's line with it. Absent from an older window.
+   */
+  label?: string | null;
+  /**
+   * Its connection wakes it (the Claude Code mod, Pi, OpenCode 2, with the
+   * tag capability): the reply arrives as a turn. False: an agent that reads
+   * the Inbox only (MCP, OpenCode 1); it sees the tag the next time it reads
+   * the thread or waits for a reply.
+   */
+  wakes: boolean;
+  /** It reached the session (its connection delivered it, or its own wait_for_reply returned it). */
+  delivery?: InboxDelivery | null;
+  /** The person pressed Send now for this session. */
+  deliver_now_at?: string | null;
+  /** A session that is not woken read the thread with read_thread after the tag (its own read only). */
+  read_at?: string | null;
+}
+
+/** The most sessions one reply may tag. */
+export const INBOX_TAGS_MAX = 8;
+
+/**
+ * Who a person's last message went to, for the Sent row (`InboxListRow.sent.recipients`):
+ * the owner first, then the tagged sessions in the order typed.
+ */
+export interface InboxSentRecipient {
+  host: string | null;
+  session: string;
+  name?: string | null;
+  owner: boolean;
+  wakes: boolean;
+  /** It reached the session; null while it waits. */
+  delivered_at: string | null;
+}
+
+/**
+ * Who a thread involves, for the overlapping marks on the row and the thread
+ * head: the distinct agent sessions that wrote in it or were tagged in it,
+ * the thread's first agent first. `name` is an MCP agent's own name.
+ */
+export interface InboxParticipant {
+  host: string | null;
+  session: string;
+  name?: string | null;
 }
 
 /**
@@ -748,7 +819,20 @@ export interface InboxListRow extends InboxThreadSummary {
      * Absent from an older Inbox.
      */
     wakes?: boolean;
+    /**
+     * When the reply tags agents (`InboxMessage.tags`): every session it goes
+     * to, the owner first, each with its own delivery ("1 of 3 delivered").
+     * `checked_at` is then set once every recipient a connection wakes has
+     * it. Absent otherwise and from an older Inbox.
+     */
+    recipients?: InboxSentRecipient[];
   } | null;
+  /**
+   * When more than one agent session is in the thread (it wrote there or the
+   * person tagged it): all of them, the thread's first agent first, for the
+   * overlapping marks. Absent with one session and from an older Inbox.
+   */
+  participants?: InboxParticipant[];
   /**
    * When the latest agent message arrived (`last_at` also moves on the
    * person's messages and the Inbox's notes). The window's held list counts
@@ -1128,6 +1212,59 @@ export interface InboxAgentsModel {
   note_text: string;
   /** A switch's refusal, after POST /api/inbox/agents. */
   error?: string | null;
+  /**
+   * The open sessions of the three Plannotator hosts that poll the Inbox now
+   * (packages/server/inbox-restart.ts), for Settings → Agents' "Open sessions"
+   * row. Absent from an Inbox older than the field.
+   */
+  sessions?: Partial<Record<InboxToolHostId, InboxHostSessions>>;
+}
+
+/** The three hosts that connect through Plannotator's own plugin or extension. */
+export type InboxToolHostId = "claude-code" | "pi" | "opencode";
+
+/**
+ * A polling session runs an older Plannotator plugin than a restart would
+ * load (`fix: "restart"`), or the installed plugin is itself behind this
+ * Inbox's Plannotator, so a restart alone does not help (`fix:
+ * "update_plugin"`; Pi: `"update_extension"`, `pi update --extensions` then
+ * `/reload`). `loaded` is the version the session runs (null when its
+ * connection predates reporting it), `installed` what a restart loads (Pi:
+ * the Inbox's own version, which the extension should match).
+ */
+export interface InboxSessionOutdated {
+  loaded: string | null;
+  installed: string | null;
+  fix: "restart" | "update_plugin" | "update_extension";
+  /** With `update_plugin`: the command that updates the plugin itself. */
+  update_command?: string;
+}
+
+/** One open session as Settings → Agents lists it. */
+export interface InboxOpenSession {
+  session: string;
+  /** The folder's name the session works in, or null when its connection does not say. */
+  project: string | null;
+  /** Its working folder as the window shows it (`~` for the home folder); null when unknown. */
+  folder: string | null;
+  started_at: string;
+  busy: boolean | null;
+  /** The plugin or extension version it loaded; null when it does not say. */
+  plugin: string | null;
+  outdated: InboxSessionOutdated | null;
+  /** `cd <folder> && claude --resume <session>` (Claude Code, with a known folder); null otherwise. */
+  restart_command: string | null;
+}
+
+export interface InboxHostSessions {
+  running: number;
+  /** Sessions with `outdated` set. */
+  outdated: number;
+  /** What a restart loads (Claude Code: the installed plugin's version); null when unknown. */
+  installed: string | null;
+  /** The command that updates the plugin itself, when the installed plugin is behind this Inbox (Claude Code). */
+  update_command: string | null;
+  sessions: InboxOpenSession[];
 }
 
 /** The hosts whose every request carries the `plannotator_inbox` tool in full once it is on (Claude Code defers it behind tool search). */
@@ -1145,16 +1282,18 @@ export type InboxToolCostHost = "pi" | "opencode";
  * `plannotator inbox --help`. History on both hosts: 11,736 bytes (2,796
  * tokens with o200k_base) before the long field descriptions were shortened
  * (INBOX_AGENT_FIELD_DESCRIPTIONS); 7,058 bytes (1,661 with o200k_base) before
- * Decisions (list_decisions, record_decision) were removed. The current value
- * is that measurement less the 668 bytes the two actions took in the entry
- * (the generated tool JSON before and after), not yet re-measured on the hosts.
+ * Decisions (list_decisions, record_decision) were removed; about 6,390 bytes
+ * after (estimated from the generated entry, never re-measured). The current
+ * value is measured on Pi with the read_thread window's fields (`expand`,
+ * `before`, `after`, `format`) and the `search` action added: 7,328 bytes,
+ * 1,732 tokens with o200k_base.
  */
 export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
-  pi: { bytes: 6390, tokens: 1800 },
-  opencode: { bytes: 6390, tokens: 1800 },
+  pi: { bytes: 7328, tokens: 2000 },
+  opencode: { bytes: 7328, tokens: 2000 },
 };
 
-/** "about 6 KB, roughly 1,800 tokens" for a host's measured cost. */
+/** "about 7 KB, roughly 2,000 tokens" for a host's measured cost. */
 export function inboxToolCostText(host: InboxToolCostHost): string {
   const cost = INBOX_TOOL_COST[host];
   return `about ${Math.round(cost.bytes / 1000)} KB, roughly ${cost.tokens.toLocaleString("en-US")} tokens`;
@@ -1235,4 +1374,58 @@ export interface InboxComposeSession {
 export interface InboxComposeProject {
   project: { id: string | null; name: string; root: string };
   sessions: InboxComposeSession[];
+}
+
+/**
+ * The first Plannotator release whose Claude Code mod reports `plugin` on its
+ * bridge poll (packages/server/inbox-restart.ts). A new mod ALWAYS sends the
+ * field (version or root null when it could not read them), so a poll without
+ * it means a mod older than this. Must merge before the version bump to it.
+ */
+export const INBOX_PLUGIN_REPORTS_LOADED_SINCE = "0.28.24";
+
+/**
+ * The first Plannotator release whose Claude Code mod has Send now (#1968).
+ * A session that loaded this or newer already has Send now, so a missing Send
+ * now there has another cause (its own Ask question holds the turn, the engine
+ * refused a row) and the reply line never blames the plugin for it.
+ */
+export const INBOX_SEND_NOW_SINCE = "0.28.24";
+
+/**
+ * Whether a session that loaded `version` (null: unknown, an older mod)
+ * predates Send now. A version that is not a plain release (a development
+ * build) is taken as having it.
+ */
+export function inboxLoadedPredatesSendNow(version: string | null | undefined): boolean {
+  if (version === null || version === undefined || version === "") return true;
+  const parts = /^v?(\d+)\.(\d+)\.(\d+)$/.exec(version.trim());
+  if (!parts) return false;
+  const min = INBOX_SEND_NOW_SINCE.split(".").map(Number);
+  const have = parts.slice(1, 4).map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (have[i]! !== min[i]!) return have[i]! < min[i]!;
+  }
+  return false;
+}
+
+/**
+ * The oldest Claude Code engine the mod offers Send now on (a copy of the
+ * mod's `SESSION_APPEND_MIN_ENGINE`, apps/hook/hooks/mod/inbox.ts; the mod's
+ * send-now-engine test keeps them equal). The restart line under a reply uses
+ * it only to stay quiet where a restart would not bring Send now (an engine
+ * too old for it); the window never says so (owner, 2026-10-19).
+ */
+export const INBOX_SEND_NOW_MIN_ENGINE = "2.1.301";
+
+/** Whether a reported engine version is too old for Send now; false when it is unknown or unreadable. */
+export function inboxEngineTooOldForSendNow(version: string | null | undefined): boolean {
+  const parts = /^(\d+)\.(\d+)\.(\d+)/.exec(typeof version === "string" ? version.trim() : "");
+  if (!parts) return false;
+  const min = INBOX_SEND_NOW_MIN_ENGINE.split(".").map(Number);
+  const have = parts.slice(1, 4).map(Number);
+  for (let i = 0; i < 3; i++) {
+    if (have[i]! !== min[i]!) return have[i]! < min[i]!;
+  }
+  return false;
 }

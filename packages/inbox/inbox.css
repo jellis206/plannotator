@@ -683,7 +683,7 @@ dialog.ib-dlg::backdrop { background: oklch(0 0 0 / 0.45); }
    length). It keeps running under the pointer: hover and the selection paint over it (above), and the
    focus ring stays on top. Only a colour fades, so reduced motion keeps it. */
 @keyframes ib-lit { 0%, 40% { background-color: var(--ib-lit); } 100% { background-color: transparent; } }
-:is(.ib-row, .ib-nrow)[data-lit]::before { animation: ib-lit 1500ms cubic-bezier(0.23, 1, 0.32, 1) both; }
+:is(.ib-row, .ib-nrow)[data-lit]::before { animation: ib-lit 3000ms ease-in-out both; }
 .ib-nrow.ib-sent .ib-p, .ib-nrow.ib-sent .ib-l2 .ib-s { color: var(--muted-foreground); font-weight: 400; }
 /* The Soft paint on the list (owner, 2026-10-16: Soft modernizes today's Inbox, it does not relayout it). Every
    rule here changes colour, surface, radius or face only: rows, bands, chips and badges keep today's sizes,
@@ -813,6 +813,11 @@ button.ib-band:hover { background: var(--ib-band-hover-s, var(--ib-band)); }
 .ib-rtext.pn-ref-input.pn-ref-composing { color: var(--foreground); }
 .ib-cfield [data-skill-menu] { margin-bottom: 8px; }
 .ib-cfield [data-skill-human-only-notice] { padding: 0 12px 6px; margin-top: -2px; }
+/* The picker at the caret (compose): portaled into the dialog, hung off a box laid over the caret's line
+   (ComposerField's CaretSkillMenu). Painted after the footer, it floats over it and past the dialog's edge (the
+   dialog is overflow: visible); on a phone it stays above the footer. The box itself takes no clicks. */
+.ib-skanchor { position: absolute; z-index: 60; pointer-events: none; }
+.ib-skanchor > [data-skill-menu] { pointer-events: auto; }
 /* Files pasted into the reply box: compose's tiles, inside the box above its chips. A tile never runs past
    the box: at least 200 px wide in a row, the whole box when that is narrower (a 320 px phone). */
 .ib-rfiles { padding: 0 8px 4px; }
@@ -1159,6 +1164,32 @@ button.ib-band:hover { background: var(--ib-band-hover-s, var(--ib-band)); }
 .ib-docscroll:has([data-popout]) { z-index: 7; }
 .ib-toolstrip { position: absolute; top: 14px; left: 16px; z-index: 3; padding: 3px; border-radius: 9px; background: var(--card); box-shadow: var(--card-shadow); }
 .ib-htmlframe { position: absolute; inset: 0; }
+/* A page the attached page links to, not attached: read-only over the attached page, which stays mounted under it (htmlLinks.ts). */
+.ib-htmlframe.ib-covered { visibility: hidden; }
+.ib-linked { position: absolute; inset: 0; display: flex; flex-direction: column; background: var(--background); }
+.ib-linkband { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 7px 14px; font-size: var(--ib-fs-13, 13px); line-height: 1.3; background: var(--card); color: var(--card-foreground); border-bottom: 1px solid var(--border); }
+.ib-linkband .ib-btn { flex: none; gap: 4px; max-width: 100%; }
+.ib-linkband-back { display: block; min-width: 0; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib-linkband-t { flex: 1 1 200px; min-width: 0; color: var(--muted-foreground); overflow-wrap: anywhere; }
+.ib-linkband-t b { color: var(--foreground); font-weight: 600; }
+.ib-linkband-tab { flex: none; white-space: nowrap; text-decoration: none; }
+.ib-linkedframe { position: relative; flex: 1; min-height: 0; }
+/* Full screen: no header, so the band floats at the top left like the changed chip (the toolbar holds the top right). */
+.ib-view.ib-fullview .ib-linkband { position: absolute; top: 12px; left: 12px; z-index: 8; max-width: calc(100% - 360px); box-sizing: border-box; padding: 5px 12px 5px 6px; border-radius: 10px; border: 1px solid var(--border); background: var(--popover); color: var(--popover-foreground); box-shadow: 0 10px 30px rgba(0, 0, 0, 0.28); }
+:root.light .ib-view.ib-fullview .ib-linkband { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
+.ib-view.ib-fullview.ib-drawer:not(.ib-phone) .ib-linkband { max-width: calc(100% - 680px); min-width: min(320px, calc(100% - 24px)); }
+.ib-view.ib-fullview.ib-phone .ib-linkband { top: calc(10px + env(safe-area-inset-top)); left: 10px; right: 10px; max-width: none; }
+/* The page starts below the floating band, so nothing at its top is hidden under it. */
+.ib-view.ib-fullview .ib-linkedframe { margin-top: calc(var(--ib-linkband-h, 40px) + 20px); }
+.ib-view.ib-fullview.ib-phone .ib-linkedframe { margin-top: calc(var(--ib-linkband-h, 80px) + 16px + env(safe-area-inset-top)); }
+.pn-inbox .ib-view.ib-phone .ib-linkband .ib-btn, .pn-inbox .ib-view.ib-phone .ib-linkband-tab { min-height: 44px; display: inline-flex; align-items: center; }
+/* Why a link opened nothing: a note at the foot of the page for a moment (also said in the pane's live region). */
+.ib-linknote { position: absolute; left: 50%; bottom: calc(22px + var(--ib-fvfoot, 0px)); transform: translateX(-50%); z-index: 9; display: flex; align-items: center; gap: 8px; width: max-content; max-width: min(520px, calc(100% - 32px)); box-sizing: border-box; padding: 8px 14px; border-radius: 10px; background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border); box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3); font-size: var(--ib-fs-13, 13px); line-height: 1.35; pointer-events: none; opacity: 0; visibility: hidden; transition: opacity 150ms ease, visibility 0s linear 150ms; }
+:root.light .ib-linknote { box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12); }
+.ib-linknote.ib-on { opacity: 1; visibility: visible; transition: opacity 150ms ease; }
+.ib-linknote > .ib-ic { color: var(--muted-foreground); flex: none; }
+.ib-view.ib-fullview.ib-phone .ib-linknote { bottom: calc(80px + max(var(--ib-fvfoot, 0px), env(safe-area-inset-bottom))); }
+@media (prefers-reduced-motion: reduce) { .ib-linknote, .ib-linknote.ib-on { transition: none; } }
 .ib-view-error { position: absolute; top: 12px; left: 16px; right: 16px; z-index: 5; margin: 0; }
 /* The bar under the open file (stepping design record, v2): a row of the pane's
    grid, never over the file. The stepper at its left; in full screen the
@@ -1986,7 +2017,7 @@ button.ib-vtime:hover { background: color-mix(in oklch, var(--primary) 22%, tran
   .ib-m3 .ib-key { max-width: 100%; }
   /* No hover on a phone, so no tooltip: the thread's name wraps to two lines instead of being cut on one. */
   .ib-m3 .ib-key > .ib-keyt { max-width: none; white-space: normal; overflow-wrap: anywhere; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
-  .ib-mrow[data-lit] { animation: ib-lit 1500ms cubic-bezier(0.23, 1, 0.32, 1) both; }
+  .ib-mrow[data-lit] { animation: ib-lit 3000ms ease-in-out both; }
   .ib-m3 .ib-c, .ib-m3 .ib-att { font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); white-space: nowrap; }
 
   /* a thread: Back on the left, the actions on the right, the reply at the foot above the keyboard */
@@ -2041,9 +2072,9 @@ button.ib-vtime:hover { background: color-mix(in oklch, var(--primary) 22%, tran
      the description under the name; a tap inserts on pointerdown, so the keyboard stays up. */
   .ib-cfield [data-skill-menu] { left: -1px; right: -1px; margin-bottom: 10px; }
   .ib-cfield [data-skill-menu-list] { max-height: min(198px, var(--ib-vvh, 100dvh) * 0.4) !important; }
-  .ib-cfield [data-skill-item] { min-height: 44px; flex-wrap: wrap; row-gap: 0; align-content: center; }
-  .ib-cfield [data-skill-item-part="description"] { order: 3; flex-basis: 100%; padding-left: 26px; font-size: var(--ib-fs-12-5, 12.5px); }
-  .ib-cfield [data-skill-item-part="root"] { margin-left: auto; }
+  .ib-cfield [data-skill-item], .ib-skanchor [data-skill-item] { min-height: 44px; flex-wrap: wrap; row-gap: 0; align-content: center; }
+  .ib-cfield [data-skill-item-part="description"], .ib-skanchor [data-skill-item-part="description"] { order: 3; flex-basis: 100%; padding-left: 26px; font-size: var(--ib-fs-12-5, 12.5px); }
+  .ib-cfield [data-skill-item-part="root"], .ib-skanchor [data-skill-item-part="root"] { margin-left: auto; }
   .ib-cfield [data-skill-human-only-notice] > summary { min-height: 44px; }
   .ib-skills > summary { min-height: 44px; align-items: center; }
   .ib-rfoot { flex-wrap: wrap; }
@@ -3308,3 +3339,141 @@ svg.ib-ic.ib-glyph { stroke: currentColor; fill: none; stroke-width: 1.6; stroke
   .ib-annpop, .ib-nmpop { border-radius: 16px 16px 0 0; }
   .ib-annpop, .ib-nmpop { box-shadow: 0 -16px 48px rgba(0, 0, 0, 0.28); }
 }
+
+/* ─────────────── Tag agents in a reply or a comment (approval "inbox-tag-agents", Lines variant) ─────────────── */
+
+/* A tag in the composer's highlight layer: colour, background, radius and box-shadow only (ui's metric rule). */
+.pn-inbox .ib-tg-tok, [data-comment-popover] .ib-tg-tok { color: var(--primary); background: color-mix(in oklch, var(--primary) 13%, transparent); border-radius: 3px; box-shadow: 0 0 0 2px color-mix(in oklch, var(--primary) 13%, transparent); }
+/* A tag in a sent reply, painted from the labels it carries (tagHighlight.ts). */
+::highlight(ib-tag-ref) { color: var(--primary); background-color: color-mix(in oklch, var(--primary) 12%, transparent); }
+
+/* The @ picker: a listbox grouped by agent, the skill picker's place above the field. */
+.ib-tg-menu { position: absolute; left: 0; right: 0; bottom: 100%; margin-bottom: 8px; z-index: 110; background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 12px 32px rgb(0 0 0 / 0.16), 0 2px 8px rgb(0 0 0 / 0.08); padding: 6px; max-height: min(430px, 62vh); overflow-y: auto; overscroll-behavior: contain; font-size: var(--ib-fs-13, 13px); text-align: left; }
+.ib-tg-group + .ib-tg-group { margin-top: 4px; padding-top: 4px; border-top: 1px solid color-mix(in oklch, var(--border) 70%, transparent); }
+.ib-tg-gh { padding: 6px 10px 3px; font-size: var(--ib-fs-11-5, 11.5px); font-weight: 600; color: var(--muted-foreground); letter-spacing: 0.01em; }
+.ib-tg-opt { display: flex; align-items: center; gap: 10px; padding: 6px 10px; border-radius: 8px; cursor: pointer; min-width: 0; }
+.ib-tg-opt:hover { background: color-mix(in oklch, var(--muted) 55%, transparent); }
+.ib-tg-opt[aria-selected="true"] { background: var(--muted); }
+.ib-tg-opt .ib-mk.ib-big { width: 22px; height: 22px; border-radius: 6px; }
+.ib-tg-opt .ib-mk.ib-big > svg, .ib-tg-opt .ib-mk.ib-big > img { width: 14px; height: 14px; }
+.ib-tg-opt[aria-selected="true"] .ib-mk.ib-big { background: var(--card); }
+.ib-tg-ol { flex: 1; min-width: 0; display: flex; flex-direction: column; line-height: 1.3; }
+.ib-tg-on { font-weight: 600; color: var(--foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib-tg-od { font-size: var(--ib-fs-12, 12px); color: var(--muted-foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib-tg-badge { flex: none; font-size: var(--ib-fs-11, 11px); font-weight: 550; padding: 1px 7px; border-radius: 999px; color: var(--primary); background: color-mix(in oklch, var(--primary) 12%, transparent); }
+.ib-tg-badge.ib-tg-quiet { color: var(--muted-foreground); background: var(--muted); }
+.ib-tg-reader .ib-tg-on { font-weight: 550; }
+.ib-tg-blocked { cursor: default; }
+.ib-tg-blocked .ib-tg-on { color: var(--muted-foreground); }
+.ib-tg-empty { padding: 10px; color: var(--muted-foreground); margin: 0; }
+
+/* Under the field: who it goes to, and the heads-ups. */
+.ib-tg-notes { display: flex; flex-direction: column; gap: 5px; padding: 2px 12px 8px; font-size: var(--ib-fs-12-5, 12.5px); line-height: 1.45; color: var(--muted-foreground); }
+.ib-tg-goes { display: flex; flex-wrap: wrap; align-items: center; gap: 5px 6px; }
+.ib-tg-goes-l { color: var(--muted-foreground); margin-right: 2px; }
+.ib-tg-to { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; padding: 1px 8px 1px 3px; border-radius: 999px; background: color-mix(in oklch, var(--muted) 70%, transparent); color: var(--foreground); font-size: var(--ib-fs-12, 12px); }
+.ib-tg-to > span:last-child { min-width: 0; overflow-wrap: anywhere; }
+.ib-tg-to i { font-style: normal; color: var(--muted-foreground); }
+.ib-tg-note { display: flex; align-items: flex-start; gap: 6px; margin: 0; min-width: 0; }
+.ib-tg-note > svg { margin-top: 2px; flex: none; }
+.ib-tg-note > span { min-width: 0; overflow-wrap: anywhere; }
+.ib-tg-note b { font-weight: 550; color: var(--foreground); }
+.ib-tg-warn > svg { color: color-mix(in oklch, var(--warning) 80%, var(--foreground)); }
+[data-comment-popover] .ib-tg-notes { padding: 4px 0 0; }
+/* The popover is portaled out of .pn-inbox: its heads-up icons take the window's icon look here. */
+[data-comment-popover] .ib-tg-notes svg.ib-ic { width: 14px; height: 14px; flex: none; stroke: currentColor; fill: none; stroke-width: 1.6; stroke-linecap: round; stroke-linejoin: round; }
+
+/* Per-agent delivery under a sent reply (Lines). */
+.ib-tg-dl { list-style: none; margin: 10px 0 0; padding: 0; display: flex; flex-direction: column; gap: 5px; }
+.pn-inbox .ib-tg-dl > li { display: grid; grid-template-columns: 16px minmax(0, 1fr) auto; align-items: center; column-gap: 7px; row-gap: 4px; margin: 0; padding: 0; text-align: left; font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); }
+.pn-inbox .ib-tg-dl > li::before, .pn-inbox .ib-tg-dl > li::marker { content: none; }
+.pn-inbox .ib-tg-dl > li > .ib-dl-text { min-width: 0; overflow-wrap: anywhere; }
+.pn-inbox .ib-tg-dl > li > .ib-mk { align-self: start; margin-top: 1px; }
+.pn-inbox .ib-tg-dl > li > .ib-sendnow { justify-self: start; margin-left: 0; }
+.ib-tg-dl > li[data-delivery="delivered"] > .ib-dl-text { color: var(--foreground); }
+
+/* Several agents on one thread: overlapping marks (the row, the thread head). */
+.ib-tg-stack { display: inline-flex; align-items: center; flex: none; }
+.ib-tg-stack .ib-mk { width: 18px; height: 18px; border-radius: 50%; background: var(--muted); box-shadow: 0 0 0 1.5px var(--card); }
+.ib-tg-stack .ib-mk > svg, .ib-tg-stack .ib-mk > img { width: 13px; height: 13px; }
+.ib-tg-stack .ib-mk + .ib-mk { margin-left: -5px; }
+.ib-tg-plus { display: inline-flex; align-items: center; height: 16px; margin-left: 3px; padding: 0 5px; border-radius: 999px; font-size: var(--ib-fs-10-5, 10.5px); font-weight: 600; color: var(--muted-foreground); background: var(--muted); }
+.ib-tg-hwho { display: inline-flex; align-items: center; gap: 6px; color: var(--foreground); font-weight: 500; min-width: 0; }
+
+.pn-inbox .ib-tg-opt:focus-visible { outline: 2px solid var(--ring); outline-offset: -2px; }
+
+/* Phones: 44 px rows in the picker, full width above the field, and nothing runs off at 320 px. */
+@media (max-width: 767px), (max-height: 500px) and (max-width: 1023px) and (pointer: coarse) {
+  .ib-tg-menu { left: -1px; right: -1px; margin-bottom: 10px; max-height: min(300px, calc(var(--ib-vvh, 100dvh) * 0.45)); }
+  .ib-tg-opt { min-height: 44px; }
+  .ib-tg-opt .ib-mk.ib-big { width: 26px; height: 26px; }
+  .ib-tg-on { font-size: var(--ib-fs-14, 14px); }
+  .ib-tg-od { font-size: var(--ib-fs-12-5, 12.5px); }
+  .ib-tg-goes { gap: 5px; }
+  .pn-inbox .ib-tg-dl > li > .ib-sendnow { grid-column: 2; min-height: 44px; }
+}
+@media (max-width: 360px) {
+  .ib-tg-opt { flex-wrap: wrap; row-gap: 2px; }
+  .ib-tg-badge { margin-left: 36px; }
+}
+/*
+ * A session that needs a restart after an update (owner approval "restart-warning", 2026-10-19):
+ * the line under a reply ("Steps"), the sidebar's "Reload Claude Code N", Settings → Agents' "Open sessions".
+ */
+.ib-rw-note { flex-basis: 100%; display: flex; align-items: flex-start; gap: 6px; color: var(--muted-foreground); font-size: var(--ib-fs-12-5, 12.5px); line-height: 1.5; min-width: 0; }
+.pn-inbox .ib-rw-note > svg.ib-ic { width: 14px; height: 14px; flex: none; margin-top: 2px; }
+.ib-rw-note > span { min-width: 0; overflow-wrap: anywhere; }
+.ib-rw-note code { font-family: var(--font-mono); font-size: var(--ib-fs-12, 12px); white-space: nowrap; }
+.pn-inbox .ib-rw-lnk { color: var(--primary); font: inherit; font-weight: 550; background: none; border: 0; padding: 0; cursor: pointer; display: inline-flex; align-items: center; gap: 3px; margin-left: 6px; vertical-align: baseline; }
+.pn-inbox .ib-rw-lnk:hover { text-decoration: underline; text-underline-offset: 2px; }
+.pn-inbox .ib-rw-lnk .ib-rw-chev { width: 12px; height: 12px; transition: transform 150ms ease-out; }
+.pn-inbox .ib-rw-lnk[aria-expanded="true"] .ib-rw-chev { transform: rotate(180deg); }
+@media (prefers-reduced-motion: reduce) { .pn-inbox .ib-rw-lnk .ib-rw-chev { transition: none; } }
+.ib-rw-steps { flex-basis: 100%; margin: 2px 0 0 20px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 8px; background: color-mix(in oklch, var(--muted) 35%, var(--card)); font-size: var(--ib-fs-12-5, 12.5px); line-height: 1.5; color: var(--foreground); max-width: 640px; min-width: 0; box-sizing: border-box; }
+.ib-rw-steps[hidden] { display: none; }
+.ib-rw-steps ol { margin: 0; padding-left: 18px; list-style: decimal; display: flex; flex-direction: column; gap: 6px; }
+.ib-rw-steps li::marker { color: var(--muted-foreground); }
+.ib-rw-steps code, .ib-rw-cmd code { font-family: var(--font-mono); font-size: var(--ib-fs-12, 12px); }
+.ib-rw-steps .ib-rw-after { margin: 8px 0 0; color: var(--muted-foreground); }
+.ib-rw-cmd { display: flex; align-items: center; gap: 8px; margin-top: 6px; padding: 6px 6px 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); min-width: 0; }
+.ib-rw-cmd code { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--foreground); }
+.pn-inbox .ib-rw-copy { flex: none; display: inline-flex; align-items: center; gap: 5px; height: 26px; padding: 0 9px; border-radius: 6px; border: 1px solid var(--border); background: var(--card); color: var(--foreground); font-size: var(--ib-fs-12, 12px); font-weight: 500; cursor: pointer; white-space: nowrap; }
+.pn-inbox .ib-rw-copy .ib-ic { width: 14px; height: 14px; }
+.pn-inbox .ib-rw-copy:hover { background: var(--muted); }
+.pn-inbox .ib-rw-copy[data-copied] { color: var(--success); border-color: color-mix(in oklch, var(--success) 45%, transparent); }
+.pn-inbox :is(.ib-rw-lnk, .ib-rw-copy, .ib-rw-restart):focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; border-radius: 4px; }
+
+/* Settings → Agents: the open sessions row and its list. */
+.ib-rw-sess { grid-column: 2 / -1; margin: 4px 0 2px; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; min-width: 0; }
+.ib-rw-sess[hidden] { display: none; }
+.ib-rw-srow { display: flex; align-items: center; gap: 10px; padding: 7px 8px 7px 12px; font-size: var(--ib-fs-12-5, 12.5px); min-width: 0; }
+.ib-rw-sess > li + li .ib-rw-srow { border-top: 1px solid color-mix(in oklch, var(--border) 60%, transparent); }
+.ib-rw-sess { list-style: none; padding: 0; }
+.ib-rw-sw { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 1px; }
+.ib-rw-srow .ib-rw-sp { font-weight: 550; color: var(--foreground); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib-rw-srow .ib-rw-sm { color: var(--muted-foreground); min-width: 0; overflow-wrap: anywhere; }
+.ib-agrow .ib-agsub.ib-agwarn code { font-family: var(--font-mono); font-size: var(--ib-fs-12, 12px); }
+
+/* After an update: the sidebar row under What's new. */
+.pn-inbox .ib-rw-restart { color: var(--foreground); }
+.pn-inbox .ib-rw-restart > .ib-rw-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* Phones: 44 px targets for the new controls (the Inbox's ::after pattern), nothing past 320 px. */
+@media (max-width: 767px), (max-height: 500px) and (max-width: 1023px) and (pointer: coarse) {
+  .pn-inbox :is(.ib-rw-lnk, .ib-rw-copy) { position: relative; }
+  .pn-inbox .ib-rw-lnk::after { content: ''; position: absolute; inset: -13px -6px; }
+  .pn-inbox .ib-rw-copy { height: 32px; }
+  .pn-inbox .ib-rw-copy::after { content: ''; position: absolute; inset: -6px -4px; }
+  .ib-rw-steps { margin-left: 0; }
+  .ib-rw-sess { grid-column: 1 / -1; }
+  .ib-rw-cmd { flex-wrap: wrap; }
+}
+/* The steps: /reload-plugins first; /exit and the resume command only as the fallback, quieter. */
+.ib-rw-steps .ib-rw-fallback { margin: 10px 0 0; padding-top: 8px; border-top: 1px solid color-mix(in oklch, var(--border) 60%, transparent); color: var(--muted-foreground); }
+.ib-rw-steps .ib-rw-warn { margin: 6px 0 0; color: var(--muted-foreground); }
+
+/* A sent reply's tag chip carries its agent's mark over the `@` (approved shot 5): the `@` is drawn clear and the mark sits in its place, in a layer of the message's own (tagHighlight.ts). */
+::highlight(ib-tag-at) { color: transparent; }
+.ib-tg-marks { position: relative; height: 0; z-index: 51; pointer-events: none; }
+.ib-tg-mark { position: absolute; display: inline-flex; align-items: center; justify-content: center; }
+.ib-tg-mark .ib-mk, .ib-tg-mark .ib-mk > svg, .ib-tg-mark .ib-mk > img { width: 100%; height: 100%; }

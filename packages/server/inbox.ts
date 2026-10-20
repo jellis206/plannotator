@@ -46,7 +46,7 @@ import {
   INBOX_APP_ID,
   INBOX_SOUND_DEFAULT_VOLUME,
   INBOX_TEXT_SIZE_DEFAULT,
-  inboxAgentName,
+  INBOX_HOST_NAMES,
   isInboxId,
   isInboxSoundVolume,
   isInboxTextSize,
@@ -94,6 +94,7 @@ import {
   INBOX_BRIDGE_POLL_PATH,
   INBOX_MAX_REQUEST_BYTES,
   INBOX_SEND_NOW_POLL_FIELD,
+  INBOX_TAGS_POLL_FIELD,
   type InboxReplyCommand,
 } from "@plannotator/shared/inbox/connection";
 import {
@@ -118,7 +119,9 @@ import { createInboxOpenInRoute, systemOpenInLauncher, type InboxOpenInLauncher 
 import { recordInboxAttachments, sweepStaleInboxSendTemps } from "@plannotator/shared/inbox/attachments";
 import { inboxBodyForAgent, inboxUploadAttachments, removeInboxAttachmentFiles, removeInboxUploads } from "@plannotator/shared/inbox/uploads";
 import { createInboxLiveSessions } from "./inbox-sessions";
+import { claudePluginBehindInbox, claudeRestartCommand, claudeSessionOutdated, CLAUDE_PLUGIN_UPDATE_COMMAND, createClaudePluginInstallReader, piSessionOutdated } from "./inbox-restart";
 import { createInboxCompose, INBOX_UPLOAD_SWEEP_MS } from "./inbox-compose";
+import { createInboxTagsRoute } from "./inbox-tags";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
 import type { PairingProbes } from "./inbox-pairing-checks";
 import { createInboxRelay } from "./inbox-relay";
@@ -166,6 +169,8 @@ const THEME_ID = /^[a-z0-9][a-z0-9-]{0,63}$/;
 export const INBOX_FORBIDDEN_PORT = 19432;
 const SSE_HEARTBEAT_MS = 15_000;
 const DEFAULT_HEALTH_TICK_MS = 60_000;
+/** How often the sidebar's "Reload Claude Code N" is checked against the live sessions (a session restarted or went away). */
+const INBOX_RESTART_WATCH_MS = 5_000;
 /**
  * How often the Inbox checks that `inbox.json` is still there and still its
  * own (`probeInboxData`); two misses in a row end it, so an Inbox whose data
@@ -363,6 +368,12 @@ const ERROR_STATUS: Record<string, number> = {
   open_not_allowed: 422,
   app_not_available: 422,
   attachment_too_large: 413,
+  // A page an attached HTML page links to, shown read-only in its pane (inbox-attachments.ts `linked-page`).
+  linked_page_not_html: 415,
+  linked_page_refused: 403,
+  linked_page_outside: 403,
+  linked_page_missing: 404,
+  linked_page_too_large: 413,
   annotation_not_allowed: 422,
   annotation_not_found: 404,
   annotation_closed: 409,
@@ -372,6 +383,10 @@ const ERROR_STATUS: Record<string, number> = {
   session_not_live: 409,
   // Send now: the session's connection does not poll now, or cannot deliver into a running turn.
   send_now_unavailable: 409,
+  // Tags: a live session whose Plannotator is too old to word a tag truthfully.
+  tag_needs_update: 409,
+  // Tags: the session is known, but as another agent than the tag says.
+  tag_host_mismatch: 409,
   // Compose: a new thread the person starts (packages/server/inbox-compose.ts).
   already_delivered: 409,
   not_addressed: 422,
@@ -593,6 +608,26 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     return pending;
   };
 
+  /**
+   * The projects a path names, never making one (the agents' search writes
+   * nothing): resolveProject's lookup without its creation, plus the project
+   * an Inbox from before worktrees folded kept for the worktree itself.
+   */
+  const findProjects = async (path: string): Promise<{ projects: InboxProject[]; unresolved: boolean }> => {
+    const { root, folder, settled, worktree } = await projectRoots.resolve(path);
+    const projects: InboxProject[] = [];
+    const existing = store.projectByRoot(root);
+    if (existing) projects.push(existing);
+    else if (!settled) {
+      const repositories = store.listProjects().filter((project) => existsSync(join(project.root, ".git")));
+      const holder = nearestProjectHolding(repositories, folder);
+      if (holder) projects.push(holder);
+    }
+    const earlier = worktree ? store.projectByRoot(worktree) : null;
+    if (earlier && !projects.some((project) => project.id === earlier.id)) projects.push(earlier);
+    return { projects, unresolved: !settled && projects.length === 0 };
+  };
+
   const mcp = createMcpHandler(
     () =>
       createInboxMcpServer({
@@ -604,6 +639,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           recordInboxAttachments(store.dir, paths, { base, at: new Date().toISOString() }),
         // An open wait_for_reply keeps its session present (never "ended").
         presence: { seen: (session) => live.seenOverMcp(session), hold: (session) => live.holdOverMcp(session) },
+        // The agents' read-only search reads the window's own ⌘K index, and finds projects without making one.
+        searchIndex: search.index,
+        findProjects,
       }),
     { legacy: "stateless", maxRequestBodySize: INBOX_MAX_REQUEST_BYTES },
   );
@@ -677,6 +715,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       update: updates.current(),
       /** This Inbox started on a newer version than the last one: the sidebar's "What's new in X" link. */
       updated: updates.updated(),
+      /** Claude Code sessions a restart would bring up to date (inbox-restart.ts): the sidebar's "Reload Claude Code N". Additive. */
+      restart_claude_code: live.restartCount(),
       notice: portChanged ? "The Inbox moved to a new port: allow notifications again on this page." : null,
       projects: projectFolders(rows),
       project: projectFilter,
@@ -816,6 +856,15 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       notes_offered: loadConfig().inboxAgentNotes?.offered === true,
       notes_asked: await notesAsked(options),
       note_text: INBOX_NOTE_BLOCK,
+      // The open sessions that poll now, per host, and which need a restart or an update (inbox-restart.ts).
+      sessions: live.hostSessions((host) => {
+        if (host !== "claude-code") return { installed: host === "pi" && version !== "dev" ? version : null, update_command: null };
+        const install = claudePluginInstall.read();
+        return {
+          installed: install?.version ?? null,
+          update_command: claudePluginBehindInbox(install, version) ? CLAUDE_PLUGIN_UPDATE_COMMAND : null,
+        };
+      }),
     };
   };
 
@@ -1249,7 +1298,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (cursor !== null) for (const line of store.changesSince(cursor)) sendLine(line);
         const unsubscribe = store.subscribe(sendLine);
         // `updated` (additive): the "What's new in X" link appears or goes once its notes are fetched or cannot be.
-        const onStatus = () => send(`event: status\ndata: ${JSON.stringify({ update: updates.current(), updated: updates.updated() })}\n\n`);
+        // `restart_claude_code` (additive): the sidebar's "Reload Claude Code N" follows the sessions as they restart.
+        const onStatus = () =>
+          send(`event: status\ndata: ${JSON.stringify({ update: updates.current(), updated: updates.updated(), restart_claude_code: live.restartCount() })}\n\n`);
         statusListeners.add(onStatus);
         // An Inbox window (not the phone's door): counted while its stream is open, with what it reported.
         const windowId = parseWindowId(url.searchParams.get("window"));
@@ -1310,19 +1361,46 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     const parent = reply.reply_to ? store.message(reply.reply_to) : null;
     return parent?.author.kind === "agent" ? parent.author.session : null;
   };
-  /** `sendNow`: the polling connection said it can deliver into a running turn; only then does a Send now reply carry `now`. */
-  const replyCommand = (reply: InboxMessage, sendNow = false): InboxReplyCommand => {
+  /**
+   * An agent named from a known host only (`Claude Code`), never from a name
+   * or a host string it chose itself: these go into another session's
+   * prompt. Anything else is "another agent" (`fallback`).
+   */
+  const hostAgentName = (host: string | null | undefined, fallback = "another agent"): string =>
+    host && Object.hasOwn(INBOX_HOST_NAMES, host) ? INBOX_HOST_NAMES[host]! : fallback;
+  /**
+   * `sendNow`: the polling connection said it can deliver into a running turn;
+   * only then does a Send now reply carry `now`. `session`: the polling
+   * session, when the reply may tag it (approval "inbox-tag-agents"): a
+   * session the reply tags gets the tagged wake, and the owner of a reply
+   * that tags others is told who else it went to.
+   */
+  const replyCommand = (reply: InboxMessage, sendNow = false, session: string | null = null): InboxReplyCommand => {
+    const tag = session && !store.isOwner(reply, session) ? (reply.tags?.find((t) => t.session === session) ?? null) : null;
+    if (tag) {
+      return {
+        type: reply.to && !reply.reply_to ? "message" : "reply",
+        id: reply.id,
+        thread_id: reply.thread_id,
+        reply_to: reply.reply_to,
+        subject: store.threadSubject(reply.thread_id),
+        body: inboxBodyForAgent(reply),
+        url: threadPageUrl(baseUrl, reply.thread_id),
+        tagged: { owner: hostAgentName(store.recipientOf(reply)?.host) },
+        ...(tag.deliver_now_at && sendNow ? { now: true } : {}),
+      };
+    }
+    const alsoTagged = (reply.tags ?? []).map((t) => hostAgentName(t.host));
+    return { ...ownerCommand(reply, sendNow), ...(alsoTagged.length > 0 ? { also_tagged: alsoTagged } : {}) };
+  };
+  const ownerCommand = (reply: InboxMessage, sendNow: boolean): InboxReplyCommand => {
     // A reply the person sent to another session because the one that asked
     // had ended: the wake says so, naming the agent that asked.
     const asked = reply.to && reply.reply_to ? store.message(reply.reply_to) : null;
     // Named from the host (`Claude Code`), never from the name the agent gave
     // itself: this line goes into another session's prompt.
     const redirected =
-      asked && asked.author.kind === "agent" && asked.author.session !== reply.to!.session
-        ? asked.author.host
-          ? inboxAgentName({ kind: "agent", host: asked.author.host, name: null })
-          : "agent"
-        : null;
+      asked && asked.author.kind === "agent" && asked.author.session !== reply.to!.session ? hostAgentName(asked.author.host, "agent") : null;
     // More words in a thread the person started, handed to a session that has
     // seen nothing of it (the person moved them there): read the thread first.
     const root = store.message(reply.thread_id);
@@ -1370,7 +1448,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // Step 8: a polling session is live (New message can reach it) while its poll is held.
     const answered = await live.pollStarted(session, bridgeHost(body), body);
     const sendNow = body[INBOX_SEND_NOW_POLL_FIELD] === true;
-    const commands = () => store.pendingReplies(session).map((reply) => replyCommand(reply, sendNow));
+    // Tags: what this session was only tagged in goes to a connection that words it truthfully.
+    const tags = body[INBOX_TAGS_POLL_FIELD] === true;
+    const commands = () => store.pendingReplies(session, { tags }).map((reply) => replyCommand(reply, sendNow, session));
     const now = commands();
     if (now.length > 0 || waitMs === 0) {
       answered();
@@ -1389,7 +1469,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       };
       const timer = setTimeout(finish, waitMs);
       const unsubscribe = store.subscribe((line) => {
-        if (line.kind === "message" && line.record.author.kind === "person" && store.pendingReplies(session).length > 0) finish();
+        if (line.kind === "message" && line.record.author.kind === "person" && store.pendingReplies(session, { tags }).length > 0) finish();
       });
       req.signal.addEventListener("abort", finish);
     });
@@ -1427,9 +1507,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     try {
       const body = (await req.json()) as unknown;
       for (const call of Array.isArray(body) ? body : [body]) {
-        const args = (call as { method?: unknown; params?: { arguments?: { agent_session?: unknown } } } | null)?.params?.arguments;
+        const args = (call as { method?: unknown; params?: { arguments?: { agent_session?: unknown; agent_host?: unknown; agent_name?: unknown } } } | null)?.params
+          ?.arguments;
         if ((call as { method?: unknown } | null)?.method !== "tools/call" || typeof args?.agent_session !== "string") continue;
-        live.seenOverMcp(args.agent_session.trim());
+        // Who it is, when the call says: an MCP agent the person can tag (inbox-tags.ts).
+        live.seenOverMcp(args.agent_session.trim(), { host: args.agent_host, name: args.agent_name });
       }
     } catch {
       // Not JSON: the MCP handler answers it.
@@ -1437,11 +1519,39 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   };
 
   // ── New message (step 8): the live sessions and the window's two routes (packages/server/inbox-sessions.ts) ──
+  // Which polling sessions run an older plugin than a restart loads (inbox-restart.ts).
+  const claudePluginInstall = createClaudePluginInstallReader(agentEnvironment);
   const live = createInboxLiveSessions({
     store,
     serverSession,
     resolveRoot: async (path) => (await projectRoots.resolve(path)).root,
+    outdatedOf: (host, plugin, folder) => {
+      if (host === "claude-code") {
+        return claudeSessionOutdated({
+          loaded: plugin,
+          records: claudePluginInstall.records(),
+          folder,
+          cliVersion: version,
+          pluginsDir: claudePluginInstall.pluginsDir(),
+          changedAt: claudePluginInstall.changedAt,
+        });
+      }
+      return host === "pi" ? piSessionOutdated(plugin, version) : null;
+    },
+    displayFolder: (path) => displayPath(path, agentEnvironment) ?? path,
+    restartCommandOf: (host, folder, session) => (host === "claude-code" ? claudeRestartCommand(folder, session) : null),
   });
+  // The sidebar's "Reload Claude Code N" is pushed as it changes (a session restarts, goes away, or an update lands).
+  let lastRestartCount = 0;
+  const restartWatch = setInterval(() => {
+    const count = live.restartCount();
+    if (count === lastRestartCount) return;
+    lastRestartCount = count;
+    for (const listener of statusListeners) listener();
+  }, INBOX_RESTART_WATCH_MS);
+  (restartWatch as { unref?: () => void }).unref?.();
+
+  const tagsRoute = createInboxTagsRoute({ store, serverSession, live, json });
 
   // Compose: a new thread the person starts with a live agent, drafts and uploads (packages/server/inbox-compose.ts).
   const compose = createInboxCompose({
@@ -1900,6 +2010,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
             // An unknown message is the store's 404, never "not live".
             const asked = body.to === undefined ? undefined : store.message(messageId);
             const to = body.to === undefined || !asked ? undefined : live.replyTarget(asked.thread_id, body.to);
+            // The sessions the person tagged with `@` (approval "inbox-tag-agents"): each one live
+            // with a connection that understands tags, or an MCP agent the Inbox knows; any other
+            // is refused before anything is written. A replay answers what it wrote, as it was.
+            const tagKey = typeof body.idempotency_key === "string" ? body.idempotency_key.trim() : "";
+            const tags =
+              body.tags === undefined || body.tags === null || (tagKey && store.replyByKey(messageId, tagKey)) ? undefined : live.tagTargets(body.tags);
             // Files the person pasted into the reply box: their uploads become
             // attachments on the reply, exactly as compose's become a thread's.
             // A replay answers the reply it wrote before anything is copied
@@ -1915,6 +2031,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
               result = store.sendReply(messageId, {
                 ...(attachments.length > 0 ? { attachments } : {}),
                 ...(to === undefined ? {} : { to }),
+                ...(tags && tags.length > 0 ? { tags } : {}),
                 words: typeof body.words === "string" ? body.words : undefined,
                 questions: (body.questions as never) ?? [],
                 idempotency_key: body.idempotency_key as string,
@@ -1974,6 +2091,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       // Step 8: the live sessions of a thread's project, and New message.
       const newMessage = await live.route(req, path);
       if (newMessage) return newMessage;
+      // Tags (approval "inbox-tag-agents"): who the person can tag with `@` (packages/server/inbox-tags.ts).
+      const taggable = tagsRoute.route(req, path);
+      if (taggable) return taggable;
 
       // #1813: an image a message's body shows, read from wherever it is on this
       // computer outside hidden folders (packages/server/inbox-message-images.ts).
@@ -2132,6 +2252,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // No capture writes after stop (a restart to update starts the next binary on this store).
     imageCapture.stop();
     clearInterval(uploadSweep);
+    clearInterval(restartWatch);
     void mcp.close().catch(() => {});
     server.stop(true);
     // The tailnet mapping and the door listener, the Wi-Fi listener and its

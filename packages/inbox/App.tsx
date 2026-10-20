@@ -88,6 +88,7 @@ import { DraftsPage } from './compose/DraftsPage';
 import { useComposeSessions } from './compose/useComposeSessions';
 import { composeActions, composeTargets, hostLabel, type ComposeAction } from './compose/model';
 import type { DraftView } from './api';
+import { inboxTabCount, useTabCount } from './tabCount';
 
 // The Inbox has no /api/config and no browser-agent tools: settings stay in
 // the page's own cookies, except the theme, which goes to config.json `theme`
@@ -129,6 +130,8 @@ const SIDEBAR_OPEN_COOKIE = 'plannotator-inbox-sidebar-open';
 const COMPOSE_LAST_COOKIE = 'plannotator-inbox-compose-last';
 /** How often the Drafts page reads its drafts again, so each chip follows its session. */
 const DRAFTS_REFRESH_MS = 10_000;
+/** Settings → Agents re-reads the agents this often while open, so "Open sessions" follows the sessions as they restart. */
+const AGENTS_SESSIONS_REFRESH_MS = 5_000;
 /** A look seen on sight that the server did not take is sent again this many times, 1 s, 2 s, 4 s… apart. */
 const SEEN_RETRIES = 5;
 const SEEN_RETRY_MS = 1000;
@@ -142,8 +145,11 @@ interface Route {
   version?: string | null;
   project: string | null;
   thread: string | null;
-  /** An attachment open beside the thread: `file=att_…`, `v=sent` for the version the agent sent, `at=` an annotation to show. */
-  file?: { id: string; version: 'current' | 'sent'; focus: string | null } | null;
+  /**
+   * An attachment open beside the thread: `file=att_…`, `v=sent` for the version the agent sent, `at=` an annotation to show,
+   * `linked=` a page the attached HTML page links to, shown read-only over it (its path in the page's folder, `#fragment` kept).
+   */
+  file?: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null } | null;
   /** The message whose guided review is open over the window (`#thread=…&guide=msg_…`). */
   guide?: string | null;
   /**
@@ -175,7 +181,7 @@ function routeOf(fullHash: string): Route {
     page: 'inbox',
     project: params.get('project'),
     thread,
-    file: fileId ? { id: fileId, version: params.get('v') === 'sent' ? 'sent' : 'current', focus: params.get('at') } : null,
+    file: fileId ? { id: fileId, version: params.get('v') === 'sent' ? 'sent' : 'current', focus: params.get('at'), linked: params.get('linked') } : null,
     guide: thread ? params.get('guide') : null,
     msg: thread ? params.get('msg') : null,
   };
@@ -196,6 +202,7 @@ function hashOf(route: Route): string {
       params.set('file', route.file.id);
       if (route.file.version === 'sent') params.set('v', 'sent');
       if (route.file.focus) params.set('at', route.file.focus);
+      if (route.file.linked) params.set('linked', route.file.linked);
     }
     if (route.thread && route.guide) params.set('guide', route.guide);
     hash = params.toString();
@@ -348,6 +355,9 @@ function Inbox() {
     storage.setItem(SIDEBAR_OPEN_COOKIE, String(next));
   }, []);
   const [latest, setLatest] = useState<ListModel | null>(null);
+  // The tab's count (tabCount.ts): every thread with news the person has not looked at, from the
+  // latest read (not the held list on screen, and not the sidebar's project filter).
+  useTabCount(useMemo(() => (latest ? inboxTabCount(latest.sections) : 0), [latest]));
   /** The list on screen: held until the person acts (the "N new" notice). */
   const [shown, setShown] = useState<InboxListSection[] | null>(null);
   const [thread, setThread] = useState<InboxThread | null>(null);
@@ -390,6 +400,8 @@ function Inbox() {
   const [restarting, setRestarting] = useState(false);
   /** This run started on a newer version: the sidebar's "What's new in X" link. */
   const [updated, setUpdated] = useState<string | null>(null);
+  // Claude Code sessions a /reload-plugins would bring up to date: the sidebar's "Reload Claude Code N" (owner approval "restart-warning").
+  const [restartClaudeCode, setRestartClaudeCode] = useState(0);
   /** The update control's dialogs and what they read (GET /api/inbox/update). */
   const [updateDialog, setUpdateDialog] = useState<null | 'update' | 'restart' | 'failed'>(null);
   const [updateDetails, setUpdateDetails] = useState<UpdateDetails | null>(null);
@@ -569,6 +581,7 @@ function Inbox() {
       if (adopt && slide) armSlide();
       setUpdate(next.update);
       setUpdated(next.updated ?? null);
+      setRestartClaudeCode(next.restart_claude_code ?? 0);
       // Held: the order waits for an action, but each row's own state (a delivery, an agent's read) follows at once.
       setShown((current) => (adopt || current === null || !hasRows(current) ? next.sections : refreshHeldRows(current, next.sections, heldOpen())));
       setLoadError(null);
@@ -714,8 +727,12 @@ function Inbox() {
   }, [refreshAgents]);
   // Settings → Agents reads them again each time it opens: an agent installed meanwhile shows at once.
   const agentsSection = route.page === 'settings' && route.section === 'agents';
+  // While it is open it follows the agent sessions too: a session that restarts leaves "Open sessions" by itself.
   useEffect(() => {
-    if (agentsSection) void refreshAgents();
+    if (!agentsSection) return;
+    void refreshAgents();
+    const timer = setInterval(() => void refreshAgents(), AGENTS_SESSIONS_REFRESH_MS);
+    return () => clearInterval(timer);
   }, [agentsSection, refreshAgents]);
 
   const loadUpdateDetails = useCallback(async () => {
@@ -749,9 +766,10 @@ function Inbox() {
             if (open) void refreshThread(open);
           }, 80);
         },
-        onStatus: (next, nextUpdated) => {
+        onStatus: (next, nextUpdated, nextRestart) => {
           setUpdate(next);
           if (nextUpdated !== undefined) setUpdated(nextUpdated);
+          if (nextRestart !== undefined) setRestartClaudeCode(nextRestart);
         },
         // Whether any open Inbox tab can show a notification (Settings → General).
         onReach: setNotifyReach,
@@ -1071,7 +1089,9 @@ function Inbox() {
       {
         icon: 'check',
         lead: `Sent to ${hostLabel(sent.host)}`,
-        detail: `in ${sent.projectName}. It takes it as its next turn.`,
+        // Short enough for one line; the thread's own line says Queued / Sending / Delivered.
+        detail: `in ${sent.projectName}`,
+        speech: `Sent to ${hostLabel(sent.host)} in ${sent.projectName}. It takes it as its next turn.`,
         action: { label: 'Open', onPress: () => {
           dismissToast();
           go({ page: 'inbox', project: routeRef.current.page === 'inbox' ? routeRef.current.project : null, thread: sent.threadId });
@@ -1381,7 +1401,7 @@ function Inbox() {
     showToast({
       ...copy,
       // Stopped partway: the warning, and why, whole (it may wrap); Undo still covers what did apply.
-      ...(incomplete ? { icon: 'warn' as const, detail: `${incomplete} · ${name}`, wrap: true } : {}),
+      ...(incomplete ? { icon: 'warn' as const, detail: `${incomplete} · ${name}`, speech: undefined, wrap: true } : {}),
       onUndo: () => {
         void (async () => {
           try {
@@ -2027,7 +2047,13 @@ function Inbox() {
             onChanged={afterWrite}
             onClose={() => close({ ...route, thread: null, file: null })}
             file={route.file ?? null}
-            onOpenFile={(file, options) => (file ? writeRoute({ ...routeRef.current, file }, options) : closeTo({ ...routeRef.current, file }))}
+            onOpenFile={(file, options) => {
+              if (!file) return closeTo({ ...routeRef.current, file });
+              const next = { ...routeRef.current, file };
+              // Back through a linked page's stack: the browser's Back when this entry was opened from there.
+              if (options?.back && backTo(hashOf(next))) return;
+              writeRoute(next, options);
+            }}
             onOpenGuide={(messageId) => go({ ...route, guide: messageId })}
             landing={
               route.msg
@@ -2112,6 +2138,9 @@ function Inbox() {
             onSettings={() => go({ page: 'settings', project: null, thread: null })}
             onUpdate={pressUpdate}
             onWhatsNew={openWhatsNew}
+            // Not on a page opened over the tailnet: Settings → Agents is local only there.
+            restartClaudeCode={settings && settings.via !== 'tailnet' ? restartClaudeCode : 0}
+            onRestartSessions={() => go({ page: 'settings', project: null, thread: null, section: 'agents' })}
             mcpCommand={settings?.mcp_command ?? null}
           />
         }
