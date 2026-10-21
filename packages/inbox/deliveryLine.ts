@@ -13,7 +13,14 @@
  * it when it next reads this thread". Pure: Thread.tsx draws it.
  */
 
-import { inboxEngineTooOldForSendNow, inboxLoadedPredatesSendNow, type InboxSessionOutdated } from '@plannotator/core/inbox-types';
+import {
+  inboxDeliveryState,
+  inboxEngineTooOldForSendNow,
+  inboxLoadedPredatesSendNow,
+  type InboxDeliveryReason,
+  type InboxDeliveryState,
+  type InboxSessionOutdated,
+} from '@plannotator/core/inbox-types';
 
 /** How the session the message goes to is connected now (the sessions route's `asker.connection`). */
 export interface RecipientConnection {
@@ -35,7 +42,6 @@ export interface RecipientConnection {
  * installed plugin is itself behind this Inbox (`update_plugin`).
  */
 export interface RestartNote {
-  text: string;
   fix: InboxSessionOutdated['fix'];
   /** The command that brings the session back as itself; null when the Inbox does not know its folder. */
   command: string | null;
@@ -50,7 +56,7 @@ export interface RestartNote {
  * engine too old for Send now stays quiet (a restart would not bring it; the
  * owner chose to say nothing about that, 2026-10-19).
  */
-export function restartNote(name: string, connection: RecipientConnection | null | undefined): RestartNote | null {
+export function restartNote(connection: RecipientConnection | null | undefined): RestartNote | null {
   const outdated = connection?.outdated;
   if (!connection || !outdated || connection.busy !== true || connection.send_now) return null;
   if (inboxEngineTooOldForSendNow(connection.engine)) return null;
@@ -59,31 +65,13 @@ export function restartNote(name: string, connection: RecipientConnection | null
   if (!inboxLoadedPredatesSendNow(outdated.loaded)) return null;
   const command = connection.restart_command ?? null;
   if (outdated.fix === 'update_plugin') {
-    const behind = outdated.installed ? ` (${outdated.installed})` : '';
-    return {
-      fix: outdated.fix,
-      command,
-      updateCommand: outdated.update_command ?? null,
-      text: `No Send now here: the Plannotator plugin ${name} has installed${behind} is older than this Inbox. Update the plugin, then type /reload-plugins in that ${name} to get Send now.`,
-    };
+    return { fix: outdated.fix, command, updateCommand: outdated.update_command ?? null };
   }
   if (outdated.fix !== 'restart') return null;
-  const versions = outdated.loaded && outdated.installed
-    ? outdated.loaded === outdated.installed
-      ? ` (${outdated.installed}, reinstalled since it started)`
-      : ` (${outdated.loaded}; ${outdated.installed} is installed)`
-    : outdated.installed
-      ? ` (${outdated.installed} is installed)`
-      : '';
-  return {
-    fix: outdated.fix,
-    command,
-    updateCommand: null,
-    text: `No Send now here: this ${name} runs an older Plannotator plugin${versions}. Type /reload-plugins in it to get Send now.`,
-  };
+  return { fix: outdated.fix, command, updateCommand: null };
 }
 
-export type DeliveryLineState = 'delivered' | 'undelivered' | 'saved' | 'queued' | 'sending';
+export type DeliveryLineState = InboxDeliveryState;
 
 export interface DeliveryLine {
   state: DeliveryLineState;
@@ -119,31 +107,70 @@ export interface DeliveryLineInput {
 
 export function deliveryLine(input: DeliveryLineInput): DeliveryLine {
   const { name } = input;
-  if (input.deliveredAt) return { state: 'delivered', text: `Delivered to ${name}, ${input.time(input.deliveredAt)}` };
-  if (input.undelivered) {
-    return { state: 'undelivered', text: `Not delivered. That ${input.undelivered.host} session stopped before it took this. If it is resumed, it still gets it.` };
+  // The state is the shared rule's (packages/core/inbox-delivery.ts, through @plannotator/core/inbox-types), which also decides the list row's glyph.
+  const decision = inboxDeliveryState({
+    delivered: !!input.deliveredAt,
+    undelivered: !!input.undelivered,
+    askerEnded: !!input.askerEnded,
+    wakes: input.wakes,
+    sendingNow: input.sendingNow,
+    connection: input.connection,
+  });
+  const text = deliveryText(decision.reason, {
+    name,
+    at: input.deliveredAt,
+    time: input.time,
+    undeliveredHost: input.undelivered?.host ?? name,
+    endedName: input.askerEnded?.name ?? name,
+  });
+  return {
+    state: decision.state,
+    text,
+    ...(decision.reason === 'ended' ? { ended: true } : {}),
+    ...(decision.reason === 'working' ? { sendNow: decision.sendNow } : {}),
+  };
+}
+
+/** The words for each case of the rule: the thread's line, and the list row's tooltip. */
+export function deliveryText(
+  reason: InboxDeliveryReason,
+  words: { name: string; at: string | null; time: (iso: string) => string; undeliveredHost: string; endedName: string },
+): string {
+  const { name } = words;
+  switch (reason) {
+    case 'delivered':
+      return words.at ? `Delivered to ${name}, ${words.time(words.at)}` : `Delivered to ${name}`;
+    case 'undelivered':
+      return `Not delivered. That ${words.undeliveredHost} session stopped before it took this. If it is resumed, it still gets it.`;
+    case 'ended':
+      return `Saved for ${words.endedName}. The session that asked has ended, so it waits here until an agent reads this thread.`;
+    case 'reads':
+      return `Saved for ${name}. It sees it when it next reads this thread.`;
+    case 'sending_now':
+      return `Sending to ${name} now…`;
+    case 'working':
+      return `Queued · ${name} is working; it gets this when its turn ends.`;
+    case 'idle':
+      return `Sending to ${name}…`;
+    case 'away':
+      return `Queued for ${name}; it gets this when its session is back.`;
+    case 'next_turn':
+      return `Queued for ${name}; it gets this as its next turn.`;
+    case 'ack_pending':
+      return `Goes to ${name} in a few seconds`;
   }
-  if (input.askerEnded) {
-    return {
-      state: 'saved',
-      ended: true,
-      text: `Saved for ${input.askerEnded.name}. The session that asked has ended, so it waits here until an agent reads this thread.`,
-    };
-  }
-  if (!input.wakes) return { state: 'saved', text: `Saved for ${name}. It sees it when it next reads this thread.` };
-  const connection = input.connection;
-  // Pressed, and the session can take it now. While it cannot (its own Ask this session question holds
-  // it), the reply waits for the turn to end: it reads as queued.
-  if (input.sendingNow && !(connection?.busy === true && !connection.send_now)) return { state: 'sending', text: `Sending to ${name} now…` };
-  if (connection?.busy === true) {
-    return { state: 'queued', text: `Queued · ${name} is working; it gets this when its turn ends.`, sendNow: connection.send_now && !input.sendingNow };
-  }
-  if (connection?.busy === false) return { state: 'sending', text: `Sending to ${name}…` };
-  if (connection === null) return { state: 'queued', text: `Queued for ${name}; it gets this when its session is back.` };
-  return { state: 'queued', text: `Queued for ${name}; it gets this as its next turn.` };
 }
 
 /** The Sent row's line in the list, which knows no connection: queued for a waking agent, saved otherwise. */
 export function sentRowLine(name: string, wakes: boolean | undefined): string {
   return wakes === true ? `Queued for ${name}; it gets this as its next turn.` : `Saved for ${name}. It sees it when it next reads this thread.`;
+}
+
+/**
+ * A Sent row whose last message is the person's Re-ask note (approval
+ * "inbox-reask"): it stays Sent until the agent asks again, read or not.
+ */
+export function reaskRowLine(name: string, checkedAt: string | null, wakes: boolean | undefined): string {
+  if (checkedAt) return `Asked ${name} to re-ask; waiting for its message.`;
+  return wakes === true ? `Re-ask queued for ${name}; it gets this as its next turn.` : `Re-ask saved for ${name}. It sees it when it next reads this thread.`;
 }

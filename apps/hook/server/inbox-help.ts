@@ -21,16 +21,16 @@
  * the platform.
  */
 
-import { INBOX_SECTIONS, INBOX_THREAD_NAME_MAX, inboxToolCostText, type InboxSectionId } from "@plannotator/core/inbox-types";
+import { INBOX_CARD_ACTION_ON, INBOX_SECTIONS, INBOX_THREAD_NAME_MAX, inboxToolCostText, type InboxSectionId } from "@plannotator/core/inbox-types";
 import { QUESTION_AUTHORING_GUIDE } from "@plannotator/core/question-block";
 import { INBOX_SET_ASIDE_HEADING } from "@plannotator/core/inbox-questions";
 import { HARNESSES, harnessPanel, shellLine, type ConnectContext, type Harness } from "@plannotator/inbox/harnesses";
 import { join } from "node:path";
-import { INBOX_MCP_TOOLS, INBOX_WAIT_DEFAULT_MS, INBOX_WAIT_MAX_SECONDS } from "@plannotator/server/inbox-mcp";
+import { INBOX_MCP_TOOLS, INBOX_SERVED_TOOLS, INBOX_WAIT_DEFAULT_MS, INBOX_WAIT_MAX_SECONDS } from "@plannotator/server/inbox-mcp";
 import { INBOX_BODY_CUT_BYTES, INBOX_EARLIER_PERSON_BYTES, INBOX_THREAD_WINDOW, sizeText } from "@plannotator/server/inbox-mcp-read";
 import { INBOX_AGENT_SEARCH_LIMIT } from "@plannotator/server/inbox-mcp-search";
 import { INBOX_TOOL_DEFAULTS, INBOX_TOOL_HOSTS } from "@plannotator/shared/config";
-import { INBOX_FILLED_ARGUMENTS, INBOX_TAGGED_INSTRUCTION, INBOX_TOOL_NAME } from "@plannotator/shared/inbox/connection";
+import { INBOX_FILLED_ARGUMENTS, INBOX_REASK_INSTRUCTION, INBOX_TAGGED_INSTRUCTION, INBOX_TOOL_NAME } from "@plannotator/shared/inbox/connection";
 import { INBOX_COMMAND_USAGE } from "./cli";
 import { createAgentEnvironment, displayPath, type AgentEnvironment } from "@plannotator/server/inbox-agents";
 import { noteTarget } from "@plannotator/server/inbox-agent-notes";
@@ -152,6 +152,20 @@ export const TOOL_GUIDE: Record<InboxMcpToolName, InboxToolGuide> = {
       "Send the person a guided review of a code change: `guide` (the shape get_guide_brief gives) plus `patch` (the exact unified diff it describes), or a complete `snapshot` instead of both. `body` is your note above the card (default: the guide's intent). It takes send_message's routing fields (`subject`, `thread`, `reply_to`, `supersedes`, `idempotency_key`). A guide that does not match its patch is refused with `invalid_guide: …` naming the file. Code diffs only.",
     ],
   },
+  card: {
+    args: ["op", "card_id", "title", "column", "say", "you", "thread_id", "pr", "reason", "idempotency_key", "asked_by", "include_resolved"],
+    lines: [
+      "Keep a card on the person's Board for work that outlasts the reply it was asked in: a lane or background task started, a PR opened, \"I'll send you X\". Not for a quick answer. Make it when you take such an ask, then keep it current with one short call at the moments you already note: work started, a PR opened, something sent to the person, waiting on them, shipped. The person reads the Board instead of asking each terminal where things are; each card shows how long ago anyone last wrote to it. A card is its own record: it never changes a thread or the person's list.",
+      "- `op`: `create`, `move`, `say`, `link`, `ship`, `drop` or `list`. Every op but create and list takes `card_id` (`crd_…`, from create or list); an op refuses a field it does not take.",
+      "- `column`: `asked` (nobody has started), `designing` (research, a plan, mocks, a sheet, options: anything that is not code), `your_look` (a non-code thing waits on the person: a sheet, options, questions, a triage call), `building` (code, or a PR not ready for them), `your_review` (code waits on the person: screenshots before a merge, a green PR to merge, a release go), `shipped` (merged or live, staging included), `dropped`. The stage is the kind of thing the next move makes: code, a PR or a release is building, anything else designing. Waiting on the person wins over work you keep doing beside it. Work you hold back yourself stays in its column, with the reason in `say`.",
+      "- `you`: what the person owes, one line, shown as \"You: …\" in your_look and your_review. Moving a card into either needs it; it is dropped when the card leaves them, and refused elsewhere. `say`: your last word, one line (\"lane running, sheet in ~1 h\"), shown in the other columns.",
+      "- create: `title`, or `thread_id` (a thread or message id of this project) to link it and take its subject as the title; `column` (default asked; a live column or shipped), `say`, `you`, `pr`, `idempotency_key` (the same key answers the first card). The card is your session's: list shows it as yours.",
+      "- move: `column`, with any of `say`, `you`, `pr` and `thread_id`; to dropped it needs `reason`. say: `say` and/or `you`, or `title` to rename. link: `thread_id` and/or `pr` (`owner/repo#123`, or a GitHub, GitLab or Bitbucket PR URL). Every write counts as hearing from the card.",
+      "- ship: when it is merged or live. A merged PR never moves a card by itself: ship it. Reported broken again: move it back to asked. drop: `reason` (required from you, one line); the Board shows the person your drop and its reason until they look, and they can restore it.",
+      "- list: your cards in this project (`asked_by: \"anyone\"` for every card here) in the live columns and the icebox; `include_resolved` adds shipped and dropped. One line each: id, title, column, `You:` or said, when it was last heard, dropped reason (and whether the person has seen your drop yet), threads, PRs, the agent it belongs to. Read it after a compaction or in a new session to pick your work back up.",
+      "- The icebox is the person's pause: you cannot put a card there or move one out of it (`card_icebox_person_only`, `card_iceboxed`), and only the person restores a card they dropped (`card_dropped_by_person`); you can still `say` and `link` on such a card. Leave an iceboxed card's work alone. A card or thread of another project is refused (`card_other_project`): pass that project's `project_path`.",
+    ],
+  },
 };
 
 const SECTION_LABEL = (id: InboxSectionId): string => INBOX_SECTIONS.find((section) => section.id === id)?.label ?? id;
@@ -262,6 +276,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "- Long work you finished while the person was away: one short summary, with the files to look at in `attachments`.",
     "- A plan, document, HTML prototype or diagram the person should read and annotate (`attachments`).",
     "- A guided review of a finished code change (get_guide_brief, then submit_guide).",
+    ...(INBOX_CARD_ACTION_ON ? ["- Work that outlasts your reply (a lane, a PR, something you promised to send): a card on the person's Board (card), kept current as it moves."] : []),
     "",
     "Do not use it for:",
     "",
@@ -295,7 +310,8 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "",
     "Agents ask, the person decides: no tool answers a question, approves or sends anything for the person. A refusal comes back as an error whose text starts with a code, `<code>: <message>`.",
     "",
-    ...INBOX_MCP_TOOLS.flatMap(toolBlock),
+    // Every tool this Inbox serves (`card` only while INBOX_CARD_ACTION_ON lets it ship).
+    ...INBOX_SERVED_TOOLS.flatMap(toolBlock),
     "## Threads",
     "",
     "Where send_message (and submit_guide) puts a message; the first rule that applies wins:",
@@ -317,6 +333,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "- A reply that answers some of your questions usually skips the ones the person left unanswered: they come back as `Skipped (not answered in this reply)`. Treat them as skipped, and ask again if you still need them.",
     "- A reply that answers none of them (the person only wrote back, or sent annotations) leaves them all open and says so after their words: `No questions answered yet; all N are still open. Don't re-ask them; the person will answer in the Inbox.` Do not ask them again: the answers come in a later reply.",
     "- The person may mark your latest message 👍 Looks good: they read it and need nothing more. About ten seconds later (after the person's Undo window) it reaches you: with a connection that wakes you, as one short message, `Plannotator Inbox: <subject> (<id>)` and then `The person marked your message 👍 Looks good (<message id>). No reply needed unless you have a question.`; otherwise wait_for_reply returns `status: \"acknowledged\"`, and read_thread shows `ack: { label, at }` on that message. Do not answer it; go on, and use `reply_to` only if you have something new for them. Only a message with no open question takes it, so it never answers a question. A wait on every thread you asked (no `thread_id`, no `cursor`) is not answered again by a 👍 you were already given.",
+    `- The person may press Re-ask: you get one message (with a wake: \`Plannotator Inbox: <subject> (<id>)\`, then \`${INBOX_REASK_INSTRUCTION}\`) listing your questions still open in the thread by id. Check each against where the work is now and send ONE message with \`reply_to\` that id: the ones still needed, asked again with the context the person needs today and a \`Replaces: <id>\` line in each block; the ids of those that no longer apply in \`supersedes\`, with a line on why. Answers the person had picked come with it under "Answers to your questions": don't ask those again. Until you do, the old questions stay open and the thread waits on you.`,
     `- The person may mark a thread read without answering: its waiting questions close unanswered, and you get one message from them that starts \`${INBOX_SET_ASIDE_HEADING}\` and lists them. Do not wait on those; ask again if you must.`,
     "",
     QUESTION_AUTHORING_GUIDE.trimEnd(),

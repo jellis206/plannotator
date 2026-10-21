@@ -18,6 +18,8 @@ import type {
   InboxThread,
   InboxComposeProject,
   InboxDraft,
+  InboxReplyDraft,
+  InboxReplyDraftRow,
   InboxDraftStatus,
   InboxUpload,
 } from '@plannotator/core/inbox-types';
@@ -28,6 +30,7 @@ import type {
   InboxAgentId,
   InboxAgentsModel,
   InboxAnnotationRecord,
+  InboxCardWire,
   InboxAttachmentState,
   InboxMessageWire,
   InboxNoteAgentId,
@@ -145,6 +148,16 @@ export interface WhatsNewModel {
   release_url: string;
   notes: string;
   skipped: { version: string; text: string }[];
+  /**
+   * The notes' image sources (as written) saved on this computer, loaded from
+   * `whatsNewImageUrl`. Absent from an older Inbox (no image is loaded).
+   */
+  images?: string[];
+}
+
+/** Where the What's new page loads one of the notes' saved images. */
+export function whatsNewImageUrl(version: string, src: string): string {
+  return `/api/inbox/whats-new/image?version=${encodeURIComponent(version)}&src=${encodeURIComponent(src)}`;
 }
 
 /** "Over your tailnet" (packages/server/inbox-tailscale.ts): the switch, the address or why not, and who may open it. */
@@ -381,6 +394,11 @@ export function setPageSession(value: string): void {
   if (pageSession === null) pageSession = value;
 }
 
+/** The page's serverSession (null before the first list read), for a keepalive request built by hand. */
+export function pageServerSession(): string | null {
+  return pageSession;
+}
+
 async function post<T>(path: string, body: Record<string, unknown>): Promise<T> {
   return readJson<T>(
     await fetch(path, {
@@ -562,8 +580,20 @@ export const inboxApi = {
       uploads?: string[];
       /** The sessions the person tagged with `@` (approval "inbox-tag-agents"): each one gets this reply too. */
       tags?: { host?: string | null; session: string; label?: string }[];
+      /**
+       * This reply carries the reply box's words: their draft goes (approval "inbox-reply-drafts"),
+       * named by the `updated_at` they were saved as, so a newer draft from another window stays.
+       */
+      clear_draft?: string;
     },
   ) => post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reply`, input),
+  /**
+   * Re-ask (approval "inbox-reask"): a note asking the session that wrote this
+   * message for its open questions again, in one message. `to`: another live
+   * session, because the one that asked has ended.
+   */
+  reask: (messageId: string, input: { idempotency_key: string; to?: { host: string; session: string } }) =>
+    post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reask`, input),
   resolve: (messageId: string, resolved: boolean) =>
     post<unknown>(`/api/inbox/messages/${encodeURIComponent(messageId)}/resolve`, { resolved }),
   health: () => get<InboxHealth>('/api/inbox/health'),
@@ -647,7 +677,18 @@ export const inboxApi = {
     post<{ thread_id: string; message: InboxMessage; project?: { id: string; name: string; root: string }; replayed: boolean }>('/api/inbox/messages', { ...input }),
   readdress: (messageId: string, to: { host: string; session: string }) =>
     post<{ message: InboxMessage; row: InboxListRow | null }>(`/api/inbox/messages/${encodeURIComponent(messageId)}/to`, { to }),
-  drafts: () => get<{ serverSession: string; drafts: DraftView[] }>('/api/inbox/drafts'),
+  /** `replies` (additive): open threads holding unsent work; an older Inbox sends none. */
+  drafts: () => get<{ serverSession: string; drafts: DraftView[]; replies?: InboxReplyDraftRow[] }>('/api/inbox/drafts'),
+  // Reply drafts (approval "inbox-reply-drafts"): the reply box's words per thread.
+  replyDraft: (threadId: string) => get<{ draft: InboxReplyDraft | null }>(`/api/inbox/threads/${encodeURIComponent(threadId)}/draft`),
+  /** Save (compare-and-set on `base`, the `updated_at` last read; null to create); an empty body deletes it. */
+  saveReplyDraft: (threadId: string, body: string, base: string | null, baseBody: string | null = null) =>
+    post<{ draft: InboxReplyDraft | null }>(`/api/inbox/threads/${encodeURIComponent(threadId)}/draft`, {
+      body,
+      base,
+      ...(baseBody !== null ? { base_body: baseBody } : {}),
+    }),
+  discardReplyDraft: (threadId: string) => post<{ ok: true; deleted: boolean }>(`/api/inbox/threads/${encodeURIComponent(threadId)}/draft/delete`, {}),
   saveDraft: (id: string, input: { body: string; to: InboxDraft['to']; project: InboxDraft['project']; files: string[]; base: string | null; thread_name?: string }) =>
     post<{ draft: DraftView }>(`/api/inbox/drafts/${encodeURIComponent(id)}`, { ...input }),
   deleteDraft: (id: string) => post<{ ok: true; deleted: boolean }>(`/api/inbox/drafts/${encodeURIComponent(id)}/delete`, {}),
@@ -699,7 +740,9 @@ export type InboxEvent =
   /** `first`: the message's first line, not a later rewrite of it (a look, an archive, an Unarchive). Absent from an older Inbox. */
   | { seq: number; kind: 'message'; id: string; first?: boolean; message: InboxMessage }
   | { seq: number; kind: 'question'; id: string; question: InboxQuestion }
-  | { seq: number; kind: 'annotation'; id: string; annotation: InboxAnnotationRecord };
+  | { seq: number; kind: 'annotation'; id: string; annotation: InboxAnnotationRecord }
+  /** A Board card (approval "inbox-board"); absent from an older Inbox. */
+  | { seq: number; kind: 'card'; id: string; card: InboxCardWire };
 
 /** A thread's attachments as they are now, and the person's annotations waiting for a Send. */
 export interface AttachmentsModel {
@@ -749,11 +792,19 @@ export function subscribeInboxEvents(
     /** Whether a notification can reach the person now (inbox-windows.ts); never called by an older Inbox. */
     onReach?: (reach: InboxNotifyReach) => void;
     /**
+     * A row's delivery may have moved with the live sessions (a turn started or
+     * ended, a session went away): no store line, so the list is read again.
+     * Never called by an older Inbox.
+     */
+    onDeliveries?: () => void;
+    /**
      * The stream (re)connected: the server's `hello`. A reconnect carries the
      * URL it was first opened with, so its `permission=` may be stale (a grant
      * since, a restarted Inbox that forgot the window): report again here.
      */
     onConnect?: () => void;
+    /** A reply draft was saved or discarded (`event: drafts`, approval "inbox-reply-drafts"); never called by an older Inbox. */
+    onDrafts?: (threadId: string) => void;
   },
   /** This window, so the server counts it (and what its browser allows) while the stream is open. */
   win?: { id: string; permission: InboxWindowPermission; origin: string },
@@ -773,6 +824,15 @@ export function subscribeInboxEvents(
       // A malformed frame changes nothing.
     }
   });
+  source.addEventListener('drafts', (event) => {
+    try {
+      const data = JSON.parse((event as MessageEvent<string>).data) as { thread_id?: unknown };
+      if (typeof data.thread_id === 'string') handlers.onDrafts?.(data.thread_id);
+    } catch {
+      // A malformed frame changes nothing.
+    }
+  });
+  source.addEventListener('deliveries', () => handlers.onDeliveries?.());
   source.addEventListener('record', (event) => {
     let parsed: InboxEvent | null = null;
     try {

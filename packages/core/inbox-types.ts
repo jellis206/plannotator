@@ -16,11 +16,16 @@
 
 import type { QuestionAnswer, QuestionKind } from "./question-block";
 import type { InboxAnnotationRecord, InboxAttachment, InboxAttachmentKind, InboxInlineImage } from "./inbox-attachments";
+import type { InboxRowDelivery } from "./inbox-delivery";
+import { INBOX_CARD_ACTION_ON, type InboxCard } from "./inbox-cards";
 
 // The attachment shapes and file rules (step 2) live in their own module and
 // reach the Inbox through this published entry, so core's export map is unchanged.
 export * from "./inbox-attachments";
 export * from "./inbox-open-in";
+export * from "./inbox-delivery";
+// The Board's cards (approval "inbox-board"), the same way.
+export * from "./inbox-cards";
 // The surface bridge's messages (the phone, PLAN step S1), the same way.
 export * from "./inbox-surface-bridge";
 
@@ -49,8 +54,8 @@ export function ulid(now: number = Date.now()): string {
   return timePart + randomPart;
 }
 
-/** `upl`: a file the person uploaded for a message; `drf`: a draft of one (compose). */
-export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev" | "upl" | "drf";
+/** `upl`: a file the person uploaded for a message; `drf`: a draft of one (compose); `crd`: a Board card. */
+export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev" | "upl" | "drf" | "crd";
 
 export function inboxId(prefix: InboxIdPrefix, now?: number): string {
   return `${prefix}_${ulid(now)}`;
@@ -65,6 +70,8 @@ const ID_RE: Record<InboxIdPrefix, RegExp> = {
   dev: /^dev_[0-9A-HJKMNP-TV-Z]{26}$/,
   upl: /^upl_[0-9A-HJKMNP-TV-Z]{26}$/,
   drf: /^drf_[0-9A-HJKMNP-TV-Z]{26}$/,
+  /** A Board card (approval "inbox-board"). */
+  crd: /^crd_[0-9A-HJKMNP-TV-Z]{26}$/,
 };
 
 export function isInboxId(prefix: InboxIdPrefix, value: unknown): value is string {
@@ -254,6 +261,15 @@ export interface InboxMessage {
    * Absent on every other message.
    */
   ack_of?: string;
+  /**
+   * On the person's Re-ask note (approval "inbox-reask"): the open questions
+   * (`<message id>/<key>`) it asked the agent to ask again, together in one
+   * new message, with `Replaces:` lines for those still needed. It is the
+   * person's reply (never an Inbox note): delivered like one, and while it is
+   * the thread's last message the row sits in Sent. Picks the person had made
+   * but not sent go with it as answers. Absent on every other message.
+   */
+  reask?: string[];
   /**
    * On a root: the seq up to which the asking agent has read the person's
    * replies (wait_for_reply returned one, or read_thread read the thread),
@@ -794,10 +810,22 @@ export interface InboxListRow extends InboxThreadSummary {
   /** The thread's name (send_message's `thread`), or null for a session's default thread. */
   thread_name: string | null;
   section: InboxSectionId;
-  /** Waiting on the person or new to them: drawn bold. */
+  /**
+   * Waiting on the person or new to them: drawn bold. Not for a row in New only
+   * for the person's own unsent words or comments (`unsent`).
+   */
   unread: boolean;
   /** No question is open, some are picked and not sent: it waits only for Send. */
   answered_not_sent: boolean;
+  /**
+   * What the person has not sent in this thread yet (approval "inbox-reply-drafts"):
+   * words typed in the reply box (`reply_at`, when they were last saved; null
+   * when none), picks saved and not sent, and comments (on attached files, the
+   * guided review or the messages) waiting for a Send. Null when nothing is
+   * unsent. A thread holding any of it never sits in Quiet unless it is
+   * archived. Additive: absent from an older Inbox.
+   */
+  unsent?: InboxRowUnsent | null;
   /** When the oldest open question was asked, or null when none is open. */
   waiting_since: string | null;
   /**
@@ -878,6 +906,22 @@ export interface InboxListRow extends InboxThreadSummary {
    * on its own. Derived. Absent from an older Inbox.
    */
   back_from_archive?: boolean;
+  /**
+   * The thread's last message (the Inbox's notes read past) is the person's
+   * Re-ask note: the row sits in Sent until the agent asks again (owner's
+   * rule, approval "inbox-reask"). Absent from an older Inbox.
+   */
+  reask_pending?: boolean;
+  /**
+   * Where the person's latest sent item in the thread is (approval
+   * "inbox-row-delivery", "Ticks"): their reply or message when it is the
+   * thread's last message (the Inbox's notes read past), else a 👍 Looks good
+   * on the latest agent message once the Inbox sent it through. Computed with
+   * the rule the thread's delivery line uses (`inboxDeliveryState`) from the
+   * live sessions, so a row and its thread agree. Null when there is none (an
+   * agent wrote last, a 👍 not sent). Absent from an older Inbox.
+   */
+  delivery?: InboxRowDelivery | null;
 }
 
 export interface InboxListSection {
@@ -900,12 +944,14 @@ export function inboxRowWaitsOnPerson(row: Pick<InboxListRow, "section" | "unsee
  * Mark read is offered on the thread (the list row's hover action, and each
  * thread a project's "Mark all as read" takes): something waits on the
  * person, and the thread is open or came back from the archive (Mark read
- * sends a came-back thread back to the archive).
+ * sends a came-back thread back to the archive). Never on a thread whose Mark
+ * read still stands: unsent work can keep it in New ("inbox-reply-drafts"),
+ * and marking it again then undoing would drop the earlier Mark read.
  */
 export function inboxRowOffersMarkRead(
-  row: Pick<InboxListRow, "section" | "unseen" | "answered_not_sent" | "resolved_at" | "back_from_archive">,
+  row: Pick<InboxListRow, "section" | "unseen" | "answered_not_sent" | "resolved_at" | "back_from_archive"> & { read_at?: string | null },
 ): boolean {
-  return (row.resolved_at === null || row.back_from_archive === true) && inboxRowWaitsOnPerson(row);
+  return (row.resolved_at === null || row.back_from_archive === true) && (row.read_at ?? null) === null && inboxRowWaitsOnPerson(row);
 }
 
 export interface InboxThread {
@@ -932,14 +978,16 @@ export interface InboxThread {
 
 // ─────────────────────────────── Lines ───────────────────────────────
 
-export type InboxRecordKind = "project" | "message" | "question" | "annotation";
+/** `card`: a Board card (approval "inbox-board"); a reader that does not know a kind skips its lines. */
+export type InboxRecordKind = "project" | "message" | "question" | "annotation" | "card";
 
 /** One line of the store: a full snapshot of one record. */
 export type InboxLine =
   | { v: 1; seq: number; at: string; kind: "project"; id: string; record: InboxProject }
   | { v: 1; seq: number; at: string; kind: "message"; id: string; record: InboxMessage }
   | { v: 1; seq: number; at: string; kind: "question"; id: string; record: InboxQuestionRecord }
-  | { v: 1; seq: number; at: string; kind: "annotation"; id: string; record: InboxAnnotationRecord };
+  | { v: 1; seq: number; at: string; kind: "annotation"; id: string; record: InboxAnnotationRecord }
+  | { v: 1; seq: number; at: string; kind: "card"; id: string; record: InboxCard };
 
 // ─────────────────────────────── Health ───────────────────────────────
 
@@ -1283,14 +1331,19 @@ export type InboxToolCostHost = "pi" | "opencode";
  * tokens with o200k_base) before the long field descriptions were shortened
  * (INBOX_AGENT_FIELD_DESCRIPTIONS); 7,058 bytes (1,661 with o200k_base) before
  * Decisions (list_decisions, record_decision) were removed; about 6,390 bytes
- * after (estimated from the generated entry, never re-measured). The current
- * value is measured on Pi with the read_thread window's fields (`expand`,
- * `before`, `after`, `format`) and the `search` action added: 7,328 bytes,
- * 1,732 tokens with o200k_base.
+ * after (estimated from the generated entry, never re-measured); 7,328 bytes
+ * (1,732 with o200k_base) measured on Pi with the read_thread window's fields
+ * (`expand`, `before`, `after`, `format`) and the `search` action added. The
+ * current value adds the Board's `card` action (approval "inbox-board"):
+ * 8,503 bytes, 2,047 tokens with o200k_base, computed from the generated
+ * entry in Pi's request shape (that computation gives 7,325 for the entry Pi
+ * measured at 7,328); the Pi and OpenCode cost tests hold it to 5%. While the
+ * card action is held back (INBOX_CARD_ACTION_ON false), the size without it.
  */
+const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 8503, tokens: 2400 } : { bytes: 7328, tokens: 2000 };
 export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
-  pi: { bytes: 7328, tokens: 2000 },
-  opencode: { bytes: 7328, tokens: 2000 },
+  pi: INBOX_TOOL_COST_NOW,
+  opencode: INBOX_TOOL_COST_NOW,
 };
 
 /** "about 7 KB, roughly 2,000 tokens" for a host's measured cost. */
@@ -1337,6 +1390,41 @@ export interface InboxDraftTo {
  * never in the event log, so never seen by agents, phones or search. A draft
  * never sends itself and is never re-addressed on its own.
  */
+/** What a list row says is not sent yet (`InboxListRow.unsent`). */
+export interface InboxRowUnsent {
+  /** When the reply box's words were last saved, or null when the thread holds no reply draft. */
+  reply_at: string | null;
+  /** Picks saved and not sent. */
+  picks: number;
+  /** Comments (on attached files, the guided review, the messages) waiting for a Send. */
+  comments: number;
+}
+
+/** The thread holds something the person has not sent: reply words, picks or comments. */
+export function inboxHasUnsent(unsent: InboxRowUnsent | null | undefined): boolean {
+  return !!unsent && (unsent.reply_at !== null || unsent.picks > 0 || unsent.comments > 0);
+}
+
+/**
+ * The words the person typed in a thread's reply box and did not send
+ * (approval "inbox-reply-drafts"): one per thread, kept outside the event log
+ * (`inbox/reply-drafts/<thread id>.json`), so agents, the MCP, phones' event
+ * stream and search never see it.
+ */
+export interface InboxReplyDraft {
+  v: 1;
+  thread_id: string;
+  body: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** A row on the Drafts page's "Replies not sent" (`GET /api/inbox/drafts` `replies`). */
+export interface InboxReplyDraftRow extends InboxListRow {
+  /** The reply draft's first words (whitespace folded, at most 160 characters), or null when only picks or comments wait. */
+  reply_preview: string | null;
+}
+
 export interface InboxDraft {
   v: 1;
   id: string;

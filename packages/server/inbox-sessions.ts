@@ -207,14 +207,28 @@ export function createInboxLiveSessions(options: {
     return options.resolveRoot(path).catch(() => null);
   };
 
+  /**
+   * How many times a session's busy or Send now flag changed. Part of the
+   * delivery signature: the signature is only compared once a second, so a
+   * turn that ends and starts again between two looks (idle, then busy again)
+   * left it unchanged, while a window that read the list in between kept the
+   * idle state ("Sending") with no event to read it again.
+   */
+  let deliveryChanges = 0;
+  const setDeliveryFlags = (entry: SeenSession, busy: boolean | null, sendNow: boolean) => {
+    if (entry.busy !== busy || entry.sendNow !== sendNow) deliveryChanges += 1;
+    entry.busy = busy;
+    entry.sendNow = sendNow;
+  };
+
   const applyState = (entry: SeenSession, body: Record<string, unknown>, at: number) => {
     if (typeof body.busy !== "boolean") return;
     if (body.busy) {
-      entry.busy = true;
+      setDeliveryFlags(entry, true, entry.sendNow);
       entry.idleSince = null;
     } else {
       entry.idleSince = entry.busy === false && entry.idleSince !== null ? entry.idleSince : (finiteMs(body.idle_since) ?? at);
-      entry.busy = false;
+      setDeliveryFlags(entry, false, entry.sendNow);
     }
   };
 
@@ -238,7 +252,7 @@ export function createInboxLiveSessions(options: {
       tags: false,
     };
     entry.host = host;
-    entry.sendNow = body[INBOX_SEND_NOW_POLL_FIELD] === true;
+    setDeliveryFlags(entry, entry.busy, body[INBOX_SEND_NOW_POLL_FIELD] === true);
     entry.tags = body[INBOX_TAGS_POLL_FIELD] === true;
     // What the session loaded (additive poll fields; an older connection sends neither).
     entry.plugin = parseLoadedPlugin(body.plugin);
@@ -266,7 +280,7 @@ export function createInboxLiveSessions(options: {
     entry.host = host;
     entry.lastSeen = at;
     applyState(entry, body, at);
-    if (typeof body[INBOX_SEND_NOW_POLL_FIELD] === "boolean") entry.sendNow = body[INBOX_SEND_NOW_POLL_FIELD] === true;
+    if (typeof body[INBOX_SEND_NOW_POLL_FIELD] === "boolean") setDeliveryFlags(entry, entry.busy, body[INBOX_SEND_NOW_POLL_FIELD] === true);
   };
 
   const isLive = (entry: SeenSession) => entry.holding > 0 || now() - entry.lastSeen <= INBOX_SESSION_LIVE_MS;
@@ -490,6 +504,35 @@ export function createInboxLiveSessions(options: {
     };
   };
 
+  /** The fields a list row's delivery reads (`InboxStore.setDeliveryPresence`): `connectionOf` without its plugin checks. */
+  const deliveryConnectionOf = (session: string): { busy: boolean | null; send_now: boolean } | null => {
+    const entry = sessions.get(session);
+    if (!entry || !isLive(entry)) return null;
+    return { busy: entry.busy, send_now: entry.sendNow };
+  };
+
+  /**
+   * Everything the rows' delivery reads from the sessions, as one string:
+   * which sessions are live, busy or idle, can take Send now, and are still
+   * there for the asker grace (MCP presence and the Inbox's own start
+   * included). Time alone changes it (a session stops polling, a grace runs
+   * out), so the server compares it on a short timer and tells the windows
+   * when it moved (`event: deliveries`). O(sessions), from memory.
+   */
+  const deliverySignature = (): string => {
+    const t = now();
+    const parts: string[] = [now() - startedAt <= INBOX_ASKER_GRACE_MS ? "g" : "", String(deliveryChanges)];
+    for (const [id, entry] of sessions) {
+      const recent = entry.holding > 0 || t - entry.lastSeen <= INBOX_ASKER_GRACE_MS;
+      if (!recent) continue;
+      parts.push(`${id}:${isLive(entry) ? 1 : 0}${entry.busy === null ? "n" : entry.busy ? "b" : "i"}${entry.sendNow ? "s" : ""}`);
+    }
+    for (const [id, entry] of mcpSeen) {
+      if (entry.holding > 0 || t - entry.lastSeen <= INBOX_ASKER_GRACE_MS) parts.push(`m:${id}`);
+    }
+    return parts.join("|");
+  };
+
   /** The folder a restart runs in (shown with ~): where the session started, else where it works now. */
   const folderOf = (entry: SeenSession): string | null => {
     const path = entry.folder ?? entry.cwd;
@@ -669,6 +712,8 @@ export function createInboxLiveSessions(options: {
     isSessionLive,
     composeTarget,
     connectionOf,
+    deliveryConnectionOf,
+    deliverySignature,
     hostSessions,
     restartCount,
     mcpAgents,

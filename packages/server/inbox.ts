@@ -44,6 +44,10 @@ import { timingSafeEqual } from "node:crypto";
 import { createMcpHandler } from "@modelcontextprotocol/server";
 import {
   INBOX_APP_ID,
+  INBOX_CARD_COLUMNS,
+  isInboxCardColumn,
+  isInboxCardDropUnseen,
+  type InboxCardColumn,
   INBOX_SOUND_DEFAULT_VOLUME,
   INBOX_TEXT_SIZE_DEFAULT,
   INBOX_HOST_NAMES,
@@ -121,6 +125,7 @@ import { inboxBodyForAgent, inboxUploadAttachments, removeInboxAttachmentFiles, 
 import { createInboxLiveSessions } from "./inbox-sessions";
 import { claudePluginBehindInbox, claudeRestartCommand, claudeSessionOutdated, CLAUDE_PLUGIN_UPDATE_COMMAND, createClaudePluginInstallReader, piSessionOutdated } from "./inbox-restart";
 import { createInboxCompose, INBOX_UPLOAD_SWEEP_MS } from "./inbox-compose";
+import { createInboxReplyDrafts } from "./inbox-reply-drafts";
 import { createInboxTagsRoute } from "./inbox-tags";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
 import type { PairingProbes } from "./inbox-pairing-checks";
@@ -128,6 +133,7 @@ import { createInboxRelay } from "./inbox-relay";
 import type { TailscaleRunner } from "@plannotator/shared/tailscale";
 import { createInboxTailscale, PHONES_TAILNET_HTTPS_PORT, type InboxTailscale } from "./inbox-tailscale";
 import { createInboxUpdates, type InboxUpdatesOptions } from "./inbox-updates";
+import { INBOX_WHATS_NEW_IMAGE_PATH, whatsNewImageRoute } from "./inbox-whats-new-images";
 import { inboxCanonicalBaseUrl, inboxCanonicalRedirect } from "./inbox-canonical";
 import { createInboxWindows, parseWindowId, parseWindowOrigin, parseWindowPermission } from "./inbox-windows";
 import {
@@ -171,6 +177,8 @@ const SSE_HEARTBEAT_MS = 15_000;
 const DEFAULT_HEALTH_TICK_MS = 60_000;
 /** How often the sidebar's "Reload Claude Code N" is checked against the live sessions (a session restarted or went away). */
 const INBOX_RESTART_WATCH_MS = 5_000;
+/** How often the live sessions' delivery signature is compared while a window listens (`event: deliveries`). */
+const INBOX_DELIVERY_WATCH_MS = 1_000;
 /**
  * How often the Inbox checks that `inbox.json` is still there and still its
  * own (`probeInboxData`); two misses in a row end it, so an Inbox whose data
@@ -226,7 +234,7 @@ export interface InboxServerOptions {
    */
   updates?: Pick<
     InboxUpdatesOptions,
-    "fetchRelease" | "fetchReleaseTag" | "whatsNewWaitMs" | "launchInstaller" | "isManaged" | "listSessions" | "now" | "probeVersion"
+    "fetchRelease" | "fetchReleaseTag" | "fetchImage" | "whatsNewWaitMs" | "launchInstaller" | "isManaged" | "listSessions" | "now" | "probeVersion"
   >;
   /**
    * The window: the built single-file app (`apps/hook/dist/inbox.html`, which
@@ -346,6 +354,8 @@ const ERROR_STATUS: Record<string, number> = {
   invalid_supersedes: 422,
   // A pick on a question a Mark read closed: Move back first.
   question_set_aside: 409,
+  // Re-ask: every question of that session is answered, picked or closed already.
+  nothing_to_reask: 409,
   thread_resolved: 409,
   // 👍 Looks good: refused on a person's message, on an older agent message, and while a question is open.
   ack_not_allowed: 422,
@@ -397,6 +407,14 @@ const ERROR_STATUS: Record<string, number> = {
   upload_too_large: 413,
   markup_too_large: 413,
   upload_not_found: 404,
+  // The Board's cards (approval "inbox-board"): who may move a card.
+  card_not_found: 404,
+  card_no_project: 404,
+  card_other_project: 422,
+  card_icebox_person_only: 403,
+  card_iceboxed: 409,
+  card_dropped_by_person: 409,
+  card_person_only: 403,
   // Over your tailnet (packages/server/inbox-tailscale.ts).
   tailscale_env_decides: 409,
   tailscale_unavailable: 409,
@@ -548,6 +566,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   let baseUrl = "";
   let portChanged = false;
   const statusListeners = new Set<() => void>();
+  /** A reply draft was saved or deleted (inbox-reply-drafts.ts): the windows' streams say `event: drafts`. */
+  const draftListeners = new Set<(threadId: string) => void>();
   // The Inbox windows open now and whether any can show a notification (inbox-windows.ts).
   const windows = createInboxWindows({ graceMs: options.windowGraceMs });
   const binaryPath = options.binaryPath !== undefined ? options.binaryPath : version !== "dev" ? process.execPath : null;
@@ -733,6 +753,53 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     if (!isInboxId("prj", value)) throw new InboxError("validation_error", "project: a prj_ id.", { field: "project" });
     if (!store.project(value)) throw new InboxError("project_not_found", `No project ${value}.`);
     return value;
+  };
+
+  /**
+   * The Board's cards (`GET /api/inbox/cards`): `?project=prj_…` and
+   * `?column=building,your_review` filter; every card otherwise, in the
+   * Board's column order, the latest move first.
+   */
+  const cardsModel = (url: URL) => {
+    const project = projectFilterOf(url);
+    const raw = url.searchParams.get("column");
+    let columns: Set<InboxCardColumn> | null = null;
+    if (raw !== null && raw !== "") {
+      columns = new Set();
+      for (const value of raw.split(",")) {
+        if (!isInboxCardColumn(value)) throw new InboxError("validation_error", `column: one or more of ${INBOX_CARD_COLUMNS.join(", ")}, comma-separated.`, { field: "column" });
+        columns.add(value);
+      }
+    }
+    const cards = store.listCards({ projectIds: project ? new Set([project]) : null, columns }).map((card) => store.cardWire(card));
+    // An agent's drops the person has not seen, in the project (or everywhere): the Board's "N dropped by an agent".
+    const droppedUnseen = store.listCards({ projectIds: project ? new Set([project]) : null, columns: new Set(["dropped"]) }).filter(isInboxCardDropUnseen).length;
+    return { serverSession, cursor: store.cursor(), cards, dropped_unseen: droppedUnseen };
+  };
+
+  /**
+   * The person's moves on a card (`POST /api/inbox/cards/:id`): `op` move
+   * (`column`, any; a move to dropped may carry `reason`), icebox (the pause
+   * only the person makes), drop (`reason` optional), restore (back to the
+   * column the card left for the Icebox or Dropped).
+   */
+  const personCardMove = (id: string, body: Record<string, unknown>) => {
+    if (!isInboxId("crd", id)) throw new InboxError("validation_error", "A card id (crd_).", { field: "card" });
+    const by = { kind: "person" } as const;
+    const reason = body.reason === undefined || body.reason === null || body.reason === "" ? undefined : body.reason;
+    switch (body.op) {
+      case "move":
+        if (body.column === undefined) throw new InboxError("validation_error", "column: where the card goes.", { field: "column" });
+        return store.updateCard(id, { by, column: body.column, reason: body.column === "dropped" ? reason : undefined });
+      case "icebox":
+        return store.updateCard(id, { by, column: "icebox" });
+      case "drop":
+        return store.updateCard(id, { by, column: "dropped", reason });
+      case "restore":
+        return store.updateCard(id, { by, restore: true });
+      default:
+        throw new InboxError("validation_error", "op: move, icebox, drop or restore.", { field: "op" });
+    }
   };
 
   /** `?archived=include|exclude` on the list: where archived threads go. Default `include` (in Quiet). */
@@ -1265,6 +1332,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return { seq: line.seq, kind: line.kind, id: line.id, question: store.questionWire(line.record) };
       case "annotation":
         return { seq: line.seq, kind: line.kind, id: line.id, annotation: line.record };
+      case "card":
+        // A Board card (approval "inbox-board"). A reader that does not know the kind skips it.
+        return { seq: line.seq, kind: line.kind, id: line.id, card: store.cardWire(line.record) };
     }
   };
 
@@ -1315,13 +1385,21 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         // Windows only: the phone's door (contract 7.9) gets hello, record, status and the heartbeat.
         const sendReach = () => send(`event: reach\ndata: ${JSON.stringify(windows.reach(notificationsState().enabled))}\n\n`);
         const stopReach = windowId ? windows.subscribe(sendReach) : () => {};
+        // A reply draft changed (any window's, or this one's): the list reads the rows' `unsent` again. Windows only.
+        const onDraft = (threadId: string) => send(`event: drafts\ndata: ${JSON.stringify({ thread_id: threadId })}\n\n`);
+        if (windowId) draftListeners.add(onDraft);
         if (windowId) sendReach();
+        // A row's delivery moved with the live sessions (no store line): windows only, like `reach`.
+        const sendDeliveries = () => send(`event: deliveries\ndata: {}\n\n`);
+        if (windowId) deliveryListeners.add(sendDeliveries);
         const heartbeat = setInterval(() => send(": ping\n\n"), SSE_HEARTBEAT_MS);
         cleanup = () => {
           clearInterval(heartbeat);
           unsubscribe();
           statusListeners.delete(onStatus);
           stopReach();
+          draftListeners.delete(onDraft);
+          deliveryListeners.delete(sendDeliveries);
           leave();
         };
         req.signal.addEventListener("abort", () => {
@@ -1430,6 +1508,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       ...(!reply.ack_of && store.canNameThread(reply.thread_id, reply.to?.session ?? recipientOf(reply)) ? { name_thread: true } : {}),
       // The person's 👍 Looks good (amended 2026-10-16): the wake is the one ack line.
       ...(reply.ack_of ? { ack_of: reply.ack_of } : {}),
+      // The person's Re-ask (approval "inbox-reask"): the wake takes INBOX_REASK_INSTRUCTION.
+      ...((reply.reask?.length ?? 0) > 0 ? { reask: true } : {}),
     };
   };
 
@@ -1551,6 +1631,22 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   }, INBOX_RESTART_WATCH_MS);
   (restartWatch as { unref?: () => void }).unref?.();
 
+  // The list rows' delivery (approval "inbox-row-delivery"): the store reads the live sessions for it.
+  store.setDeliveryPresence({ connection: live.deliveryConnectionOf, askerLive: live.askerLive });
+  // A session's turn starting or ending, its connection going away, or an asker grace running out moves a
+  // row's delivery without writing a store line. The sessions' delivery signature is compared on a short
+  // timer, only while a window listens, and `event: deliveries` tells the windows to read the list again.
+  const deliveryListeners = new Set<() => void>();
+  let lastDeliverySignature = "";
+  const deliveryWatch = setInterval(() => {
+    if (deliveryListeners.size === 0) return;
+    const signature = live.deliverySignature();
+    if (signature === lastDeliverySignature) return;
+    lastDeliverySignature = signature;
+    for (const listener of deliveryListeners) listener();
+  }, INBOX_DELIVERY_WATCH_MS);
+  (deliveryWatch as { unref?: () => void }).unref?.();
+
   const tagsRoute = createInboxTagsRoute({ store, serverSession, live, json });
 
   // Compose: a new thread the person starts with a live agent, drafts and uploads (packages/server/inbox-compose.ts).
@@ -1563,6 +1659,16 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     json,
   });
   compose.sweep();
+  // Reply drafts: the words typed in a thread's reply box, kept per thread (packages/server/inbox-reply-drafts.ts).
+  const replyDrafts = createInboxReplyDrafts({
+    store,
+    serverSession,
+    readBody: (req) => readBody(req),
+    json,
+    onChange: (threadId) => {
+      for (const listener of draftListeners) listener(threadId);
+    },
+  });
   const uploadSweep = setInterval(() => compose.sweep(), INBOX_UPLOAD_SWEEP_MS);
   (uploadSweep as { unref?: () => void }).unref?.();
 
@@ -1737,9 +1843,17 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json({ ok: true, restarting: true });
       }
       // The update control (packages/server/inbox-updates.ts). Updating changes
-      // this computer, so none of it answers a page that came through the tailnet.
-      if (path === "/api/inbox/update" || path.startsWith("/api/inbox/update/") || path === "/api/inbox/whats-new") {
+      // this computer, so none of it answers a page that came through the tailnet;
+      // nor does the What's new page, nor its images (inbox-whats-new-images.ts).
+      if (
+        path === "/api/inbox/update" ||
+        path.startsWith("/api/inbox/update/") ||
+        path === "/api/inbox/whats-new" ||
+        path === INBOX_WHATS_NEW_IMAGE_PATH
+      ) {
         if (via === "tailnet") return localOnly();
+        // A stored image of a release's notes: read only, never fetched here.
+        if (path === INBOX_WHATS_NEW_IMAGE_PATH) return whatsNewImageRoute(req, url, dataDir);
         if (path === "/api/inbox/whats-new") {
           if (req.method !== "GET") return json({ error: "Use GET." }, 405);
           // Notes this machine never saved (a version installed outside the
@@ -1871,6 +1985,35 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       // Compose: live sessions in every project, a new thread, Send to another session, drafts and uploads.
       const composed = await compose.route(req, url);
       if (composed) return composed;
+      // Reply drafts: the reply box's words per thread (approval "inbox-reply-drafts").
+      const drafted = await replyDrafts.route(req, url);
+      if (drafted) return drafted;
+
+      // The Board's cards (approval "inbox-board", step 1): the person's read and moves.
+      if (path === "/api/inbox/cards") {
+        if (req.method !== "GET") return json({ error: "Use GET." }, 405);
+        return json(cardsModel(url));
+      }
+      // The person looked at Dropped: an agent's drops there are seen (in `project`, or everywhere).
+      if (path === "/api/inbox/cards/dropped/seen") {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        let projectIds: Set<string> | null = null;
+        if (body.project !== undefined && body.project !== null) {
+          if (!isInboxId("prj", body.project)) throw new InboxError("validation_error", "project: a prj_ id.", { field: "project" });
+          if (!store.project(body.project)) throw new InboxError("project_not_found", `No project ${body.project}.`);
+          projectIds = new Set([body.project]);
+        }
+        return json({ cards: store.markCardDropsSeen(projectIds).map((card) => store.cardWire(card)) });
+      }
+      const cardMatch = /^\/api\/inbox\/cards\/([A-Za-z0-9_]+)$/.exec(path);
+      if (cardMatch) {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        return json({ card: store.cardWire(personCardMove(cardMatch[1]!, body)) });
+      }
 
       const threadMatch = /^\/api\/inbox\/threads\/([A-Za-z0-9_]+)$/.exec(path);
       if (threadMatch && req.method === "GET") {
@@ -1992,7 +2135,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       const guide = await inboxGuideRoute(req, path, store, serverSession);
       if (guide) return guide;
 
-      const messageMatch = /^\/api\/inbox\/messages\/([A-Za-z0-9_]+)\/(picks|reply|resolve)$/.exec(path);
+      const messageMatch = /^\/api\/inbox\/messages\/([A-Za-z0-9_]+)\/(picks|reply|reask|resolve)$/.exec(path);
       if (messageMatch) {
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         const body = await readBody(req);
@@ -2048,9 +2191,33 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
               }
               throw error;
             }
+            // The Send that carried the reply box's words: its draft goes (a replay too, since the first one sent them),
+            // a compare-and-set on the `updated_at` those words were saved as, so another window's newer draft stays.
+            if (typeof body.clear_draft === "string") {
+              const threadId = store.message(messageId)?.thread_id;
+              if (threadId && store.clearSentReplyDraft(threadId, body.clear_draft)) for (const listener of draftListeners) listener(threadId);
+            }
             if (result.replayed) removeInboxAttachmentFiles(store.dir, attachments);
             // Sent: the uploads are the reply's attachments now.
             else if (attachments.length > 0) removeInboxUploads(store.dir, uploads.filter((id): id is string => typeof id === "string"));
+            return json({
+              message_id: messageId,
+              questions: store.questionsOf(messageId),
+              reply: result.reply,
+              replayed: result.replayed,
+            });
+          }
+          case "reask": {
+            // Re-ask (approval "inbox-reask"): a note asking the session that
+            // wrote this message for its open questions again, in one message.
+            // `to`: another live session, because the one that asked has ended
+            // (checked as a reply's is; null: not live, 409, nothing written).
+            const asked = body.to === undefined ? undefined : store.message(messageId);
+            const to = body.to === undefined || !asked ? undefined : live.replyTarget(asked.thread_id, body.to);
+            const result = store.sendReask(messageId, {
+              idempotency_key: body.idempotency_key as string,
+              ...(to === undefined ? {} : { to }),
+            });
             return json({
               message_id: messageId,
               questions: store.questionsOf(messageId),
@@ -2253,6 +2420,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     imageCapture.stop();
     clearInterval(uploadSweep);
     clearInterval(restartWatch);
+    clearInterval(deliveryWatch);
     void mcp.close().catch(() => {});
     server.stop(true);
     // The tailnet mapping and the door listener, the Wi-Fi listener and its
