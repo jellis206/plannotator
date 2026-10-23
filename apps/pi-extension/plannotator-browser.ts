@@ -54,7 +54,14 @@ import {
 	getStartupErrorMessage,
 	hasPlanBrowserHtml,
 	hasReviewBrowserHtml,
+	reviewDiagramEngineDirectory,
 } from "./plannotator-browser-runtime.ts";
+import { diagramEngineSourcesFromDir, type DiagramEngineSources } from "./generated/diagram-engine-assets.ts";
+
+/** The diagram engine files, read once per extension process (the first review that needs them). */
+let reviewDiagramEngineSources: Promise<DiagramEngineSources | null> | undefined;
+const readReviewDiagramEngine = () =>
+	(reviewDiagramEngineSources ??= diagramEngineSourcesFromDir(reviewDiagramEngineDirectory)());
 export { getLastAssistantMessageText } from "./assistant-message.ts";
 export {
 	getStartupErrorMessage,
@@ -410,6 +417,9 @@ export async function startPlanReviewBrowserSession(
 		pasteApiUrl: process.env.PLANNOTATOR_PASTE_URL || undefined,
 		sessionBridge: options.sessionBridge,
 		planRevisions: options.planRevisions,
+		// Pi delivers an approval's notes (deliverPlanDecision's approved-with-
+		// notes prompt; the event API's review result carries `feedback`).
+		approvalNotesSupported: true,
 	}));
 
 	const session = startBrowserDecisionSession(server, ctx, server.waitForDecision, signal, {
@@ -820,6 +830,7 @@ async function createCodeReviewBrowserSession(
 		agentCwd,
 		worktreePool,
 		htmlContent: reviewHtmlContent,
+		diagramEngine: readReviewDiagramEngine,
 		sharingEnabled: resolveSharingEnabled(loadConfig()),
 		// Pi's review consumer (index.ts) sends approve-time feedback after the
 		// approved prompt, so the advert is unconditional — same shape as the

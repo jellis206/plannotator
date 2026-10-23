@@ -45,8 +45,15 @@ import {
   type InboxAnswerRefusal,
 } from "@plannotator/core/inbox-questions";
 import {
+  checkInboxActionResult,
+  composeInboxActionsReply,
+  parseInboxActionBlocks,
+  parseInboxDoneRef,
+} from "@plannotator/core/inbox-actions";
+import {
   inboxId,
   INBOX_ACK_LABEL,
+  INBOX_AUTO_SEND_ACK_NOTES,
   INBOX_RECORD_VERSION,
   type InboxAck,
   type InboxAddressee,
@@ -65,10 +72,13 @@ import {
   type InboxListSection,
   type InboxThread,
   type InboxThreadSummary,
+  checkInboxSubject,
   checkInboxThreadName,
+  displayInboxSubject,
   type InboxThreadNaming,
   inboxThreadNameKey,
   isInboxNote,
+  isInboxActionReport,
   inboxAgentName,
   INBOX_HOST_NAMES,
   INBOX_TAGS_MAX,
@@ -79,6 +89,8 @@ import {
   inboxDefaultSkip,
   inboxDeliveryState,
   type InboxDeliveryConnection,
+  type InboxDeliveryDecision,
+  type InboxDeliverNowBy,
   type InboxQuestionState,
   type InboxRowDelivery,
 } from "@plannotator/core/inbox-types";
@@ -180,6 +192,14 @@ export interface InboxSendInput {
    */
   supersedes?: readonly string[] | null;
   /**
+   * Action items (`:::action` blocks) of the same thread the agent saw done by
+   * itself: `<message id>` (each open action item of it) or `<message id>/<key>`.
+   * Recorded on the action item (`action_result` by the agent); nothing is sent to
+   * the person or back. One id that names no open action item of the thread refuses
+   * the whole send (`invalid_done`).
+   */
+  done?: readonly string[] | null;
+  /**
    * The send came through a connection that wakes its session with the
    * person's reply (the Claude Code mod, Pi, OpenCode 2): kept on the message
    * (`InboxMessage.wakes`), the only evidence that the asking session can be
@@ -200,9 +220,18 @@ export interface InboxSendResult {
    * everywhere else.
    */
   naming?: InboxThreadNaming;
+  /** The action items this send marked done (`done`), `<message id>/<key>`. Absent when none. */
+  done?: string[];
 }
 
 export interface InboxAnswerEntry {
+  /**
+   * A Send only: the message the question is on, when it is not the message
+   * the reply answers. It must be another message of the same thread from
+   * the same agent session (one Send to one session is one reply, approval
+   * "inbox-explicit-skip"). Absent: the reply's own message.
+   */
+  message_id?: string;
   key: string;
   revision: number;
   /** Absent: keep the current pick (Send only). Null: clear the pick. */
@@ -229,12 +258,17 @@ export interface InboxReplyInput {
    */
   to?: InboxAddressee | null;
   /**
-   * Skip the message's questions this Send leaves unanswered (no pick): each
-   * is sent as a skip marked `by_reply`, in the same reply. The window sends
-   * true unless the person pressed Keep open; absent (an older window, the
-   * MCP) keeps them open.
+   * The open questions the person chose to skip with this Send ("Skip them"
+   * on the chip; approval "inbox-explicit-skip", 2026-10-21): each is sent as
+   * a skip marked `by_reply`, in the same reply. A key alone is a question of
+   * the reply's own message; `{ message_id, key }` names one on another
+   * message of the same thread and session. A listed question that is no
+   * longer open (answered, picked, closed, replaced) is left alone, so a race
+   * never refuses the Send; one that is not a question of that message is
+   * refused. Absent or empty: nothing is skipped. A Send never skips on its
+   * own (the old `skip_unanswered` flag is gone).
    */
-  skip_unanswered?: boolean;
+  skip?: unknown;
   /**
    * Files the person pasted into the reply box, already copied out of their
    * uploads (`inboxUploadAttachments`): the reply carries them as compose's
@@ -295,6 +329,11 @@ function withoutExportLocation(annotation: Record<string, unknown>): Record<stri
   return rest;
 }
 
+/** An action item named where a question's answer or skip goes: it is marked on its card (Done, Can't do it). */
+function actionNotQuestion(field: string, key: string): InboxError {
+  return new InboxError("validation_error", `${field}: ${key} is an action item, not a question; mark it Done or Can't do it on its card.`, { field, key });
+}
+
 function refusalError(refusal: InboxAnswerRefusal): InboxError {
   switch (refusal.code) {
     case "validation_error":
@@ -334,6 +373,14 @@ function isAckNote(message: InboxMessage): boolean {
 /** A person's reply that tags agents (`tags`, approval "inbox-tag-agents"). */
 function hasTags(message: InboxMessage): boolean {
   return (message.tags?.length ?? 0) > 0;
+}
+
+/**
+ * A delivery's `into_turn`, written only for an item the Inbox marked to go
+ * in by itself (the connection's report, decided by the server).
+ */
+function intoTurnOf(by: InboxDeliverNowBy | null | undefined, intoTurn: boolean | undefined): { into_turn?: boolean } {
+  return by === "auto" && typeof intoTurn === "boolean" ? { into_turn: intoTurn } : {};
 }
 
 /** The tag a person's message carries for `session`, or null. */
@@ -423,6 +470,15 @@ export interface InboxDeliveryPresence {
   connection(session: string): InboxDeliveryConnection | null;
   /** Whether the session that asked is still there, with the sessions route's grace (`askerLive`). */
   askerLive(session: string): boolean;
+  /** The server's wait before an item goes into a busy session's turn by itself (`INBOX_AUTO_SEND_AFTER_MS`). Absent: never. */
+  autoSendAfterMs?: number;
+  /**
+   * The server's clock for an item waiting on `session`: since when it waits
+   * on that busy session, and since when it may go in by itself (null: not
+   * yet, the session has not been seen able to take it mid-turn). Null when
+   * no clock runs. Absent: never known.
+   */
+  waitOf?(session: string, itemId: string): { since: string; autoSince: string | null } | null;
 }
 
 export class InboxStore {
@@ -850,7 +906,9 @@ export class InboxStore {
 
   private wire(message: InboxMessage): InboxMessageWire {
     const questions = this.questionsOf(message.id);
-    return questions.length > 0 ? { ...message, questions } : { ...message };
+    // A subject is served as shown (displayInboxSubject), never as stored.
+    const shown = message.subject ? { ...message, subject: displayInboxSubject(message.subject) } : { ...message };
+    return questions.length > 0 ? { ...shown, questions } : shown;
   }
 
   messageWire(id: string): InboxMessageWire | null {
@@ -876,9 +934,14 @@ export class InboxStore {
    * that a subject derived from a question follows that question's
    * replacement (`superseded_by` with a key), down the chain. An agent-given
    * subject never changes, and a question withdrawn with nothing in its place
-   * keeps the subject it gave.
+   * keeps the subject it gave. Served as shown (`displayInboxSubject`: one
+   * line, no leaked tool-call text), never as an older store kept it.
    */
   threadSubject(threadId: string): string | null {
+    return displayInboxSubject(this.storedThreadSubject(threadId));
+  }
+
+  private storedThreadSubject(threadId: string): string | null {
     const root = this.messages.get(threadId);
     if (!root) return null;
     let id = this.subjectQuestion(root);
@@ -995,7 +1058,7 @@ export class InboxStore {
           ...(seq === undefined ? {} : { seq }),
           ...(message.author.kind === "person" ? { sent_annotations: carried.get(message.id) ?? 0 } : {}),
           // When the 👍 reached the agent: its note delivered as a turn, or an agent read it.
-          ...(message.ack ? { ack: { ...message.ack, delivered_at: this.ackDeliveredAt(message.ack) } } : {}),
+          ...(message.ack ? { ack: { ...message.ack, delivered_at: this.ackDeliveredAt(message.ack), ...this.ackNoteWire(message.ack) } } : {}),
         };
       }),
     };
@@ -1059,7 +1122,8 @@ export class InboxStore {
       if (message.author.kind === "agent") lastAgent = message;
       // The person's reply is a look; the Inbox's own notes (Mark read's
       // set-aside note, a late Undo's reopened note) are not.
-      if (message.author.kind === "person" && !isInboxNote(message)) lastPersonSeq = seqOf(message);
+      // An action item's report (written by the Inbox after the Undo window) is not a look either.
+      if (message.author.kind === "person" && !isInboxNote(message) && !isInboxActionReport(message)) lastPersonSeq = seqOf(message);
       if (message.author.kind === "agent") lastAgentAt = message.created_at;
       if (waitingSince === null || (askingStates && message.author.kind === "agent")) {
         const questions = this.questionsOf(message.id);
@@ -1155,7 +1219,9 @@ export class InboxStore {
       ...(root.started_by_person && root.to ? { addressee: { host: root.to.host, session: root.to.session } } : {}),
       ...(participants.length > 1 ? { participants } : {}),
     };
-    const section = inboxSectionOf(facts);
+    // An action item's report that lands after agent news the person has not looked at: the row shows the news
+    // (New), not Sent; `sent` stays on the row for its delivery tick.
+    const section = inboxSectionOf(isInboxActionReport(lastReal) && unseen > 0 ? { ...facts, sent: null } : facts);
     // In New only for the person's own unsent words or comments: not bold.
     const draftOnly = section === "new" && unseen === 0 && !facts.answered_not_sent && inboxHasUnsent(unsent);
     return { ...facts, section, unread: inboxRowUnread(section, draftOnly) };
@@ -1190,6 +1256,25 @@ export class InboxStore {
       return connection ? { busy: connection.busy, send_now: connection.send_now } : null;
     };
     const askerLive = (session: string): boolean => (presence ? presence.askerLive(session) : true);
+    // How long it waited on a busy session, and whether it goes in by itself (approval "inbox-busy-agent-reply"):
+    // the server's clock while it waits, the item's own record once the Inbox marked it.
+    const waitOf = (item: InboxMessage, session: string | null) => {
+      const clock = session ? (presence?.waitOf?.(session, item.id) ?? null) : null;
+      const ack = !!item.ack_of && !INBOX_AUTO_SEND_ACK_NOTES;
+      return {
+        waitingSince: clock?.since ?? item.wait_started_at ?? null,
+        autoSince: clock?.autoSince ?? null,
+        nowBy: item.deliver_now_by ?? null,
+        nowAt: item.deliver_now_at ?? null,
+        intoTurn: item.delivery?.into_turn ?? null,
+        autoSendAfterMs: ack ? null : (presence?.autoSendAfterMs ?? null),
+      };
+    };
+    const waitWire = (decision: InboxDeliveryDecision) => ({
+      ...(decision.wait ? { waiting_since: decision.wait.since, steerable: decision.wait.steerable, auto_send_at: decision.wait.autoSendAt } : {}),
+      ...(decision.autoAfterMin !== undefined ? { auto_after_min: decision.autoAfterMin } : {}),
+      ...(decision.turnEnded ? { turn_ended: true } : {}),
+    });
 
     if (lastReal.author.kind === "person") {
       if (isInboxNote(lastReal)) return null;
@@ -1222,6 +1307,7 @@ export class InboxStore {
           wakes: true,
           sendingNow: !!last.deliver_now_at,
           connection,
+          ...waitOf(last, lastTo.session),
         });
         return {
           kind,
@@ -1233,6 +1319,7 @@ export class InboxStore {
           host: to.host ?? null,
           name: null,
           ...(another ? { another_session: true } : {}),
+          ...waitWire(decision),
         };
       }
       // A reply that tags agents: the owner's own delivery, never another recipient's.
@@ -1250,6 +1337,7 @@ export class InboxStore {
         wakes: wakingSession !== null || (askedSession !== null && connection != null),
         sendingNow: !!last.deliver_now_at,
         connection,
+        ...waitOf(last, replySession),
       });
       const author = root.author.kind === "agent" ? root.author : null;
       return {
@@ -1262,6 +1350,7 @@ export class InboxStore {
         host: author?.host ?? null,
         name: author?.name ?? null,
         ...(decision.reason === "ended" && askingAuthor ? { asking: { host: askingAuthor.host ?? null, name: askingAuthor.name ?? null } } : {}),
+        ...waitWire(decision),
       };
     }
 
@@ -1271,7 +1360,11 @@ export class InboxStore {
     if (target.author.kind !== "agent" || !ack || ack.not_sent) return null;
     const base = { kind: "ack" as const, message_id: target.id, host: target.author.host ?? null, name: target.author.name ?? null, send_now: false };
     const deliveredAt = this.ackDeliveredAt(ack);
-    if (deliveredAt) return { ...base, state: "delivered", reason: "delivered", at: deliveredAt };
+    const note = ack.note_id ? this.messages.get(ack.note_id) : undefined;
+    if (deliveredAt) {
+      const decision = inboxDeliveryState({ delivered: true, undelivered: false, askerEnded: false, wakes: true, sendingNow: false, connection: undefined, ...(note ? waitOf(note, target.author.session ?? null) : {}) });
+      return { ...base, state: "delivered", reason: "delivered", at: deliveredAt, ...waitWire(decision) };
+    }
     if (ack.settled_seq == null) return { ...base, state: "queued", reason: "ack_pending", at: null };
     if (target.wakes === true && ack.note_id) {
       const session = target.author.session;
@@ -1280,10 +1373,12 @@ export class InboxStore {
         undelivered: false,
         askerEnded: false,
         wakes: true,
-        sendingNow: false,
+        sendingNow: !!note?.deliver_now_at,
         connection: session ? connectionOf(session) : undefined,
+        ...(note ? waitOf(note, session ?? null) : {}),
       });
-      return { ...base, state: decision.state === "sending" ? "sending" : "queued", reason: decision.reason, at: null };
+      // A 👍 offers no Send now of its own (it asks nothing of the agent), and waits for the turn to end (INBOX_AUTO_SEND_ACK_NOTES).
+      return { ...base, state: decision.state === "sending" ? "sending" : "queued", reason: decision.reason, at: null, ...waitWire(decision) };
     }
     return { ...base, state: "saved", reason: "reads", at: null };
   }
@@ -1362,7 +1457,8 @@ export class InboxStore {
     if (read) {
       const waiting = records.filter((r) => {
         const state = inboxQuestionState(r, false);
-        return state === "open" || state === "picked";
+        // An action item the person marked (its Undo window running) is on its way: Mark read leaves it.
+        return state === "open" || (state === "picked" && r.kind !== "action");
       });
       if (this.readAt(root, members) === null || waiting.length > 0) {
         const at = this.stamp();
@@ -1386,7 +1482,8 @@ export class InboxStore {
           this.appendQuestion(
             {
               ...record,
-              answer: inboxSkipAnswer(record, { byReply: false }),
+              // An action item keeps no answer: set aside is its whole state.
+              answer: record.kind === "action" ? null : inboxSkipAnswer({ key: record.key, kind: record.kind, prompt: record.prompt }, { byReply: false }),
               revision: record.revision + 1,
               set_aside: {
                 at,
@@ -1397,6 +1494,7 @@ export class InboxStore {
                   sent_revision: record.sent_revision,
                   picked_by: record.picked_by,
                   picked_at: record.picked_at,
+                  ...(record.kind === "action" ? { action_result: record.action_result ?? null } : {}),
                 },
               },
             },
@@ -1445,6 +1543,7 @@ export class InboxStore {
               sent_revision: previous.sent_revision,
               picked_by: previous.picked_by,
               picked_at: previous.picked_at,
+              ...(record.kind === "action" ? { action_result: previous.action_result ?? null } : {}),
               set_aside: null,
             },
             at,
@@ -1727,11 +1826,155 @@ export class InboxStore {
     return note?.delivery?.at ?? ack.seen_at ?? null;
   }
 
+  /** The window's view of a 👍's note: when it was written, and whether it was asked to go now (and by whom). */
+  private ackNoteWire(ack: InboxAck): {
+    note_at?: string;
+    deliver_now_at?: string | null;
+    deliver_now_by?: InboxDeliverNowBy | null;
+    wait_started_at?: string | null;
+    delivered_into_turn?: boolean | null;
+  } {
+    const note = ack.note_id ? this.messages.get(ack.note_id) : undefined;
+    if (!note) return {};
+    return {
+      note_at: note.created_at,
+      deliver_now_at: note.deliver_now_at ?? null,
+      deliver_now_by: note.deliver_now_by ?? null,
+      wait_started_at: note.wait_started_at ?? null,
+      delivered_into_turn: note.delivery?.into_turn ?? null,
+    };
+  }
+
   /** The note carrying a message's 👍 to the agent, while it stands. */
   ackNote(messageId: string): InboxMessage | null {
     const noteId = this.messages.get(messageId)?.ack?.note_id;
     const note = noteId ? this.messages.get(noteId) : undefined;
     return note && this.ackNoteLive(note) ? note : null;
+  }
+
+  /**
+   * The person's Done or Can't do it on an action item (approval
+   * "inbox-next-actions"), or its Undo (`outcome: null`). Recorded at once;
+   * once the Undo window passes `settleActions` sends it to the agent as the
+   * person's reply. Inside the window it can be undone, or changed (a new
+   * note, or Can't do it after Done), which starts the window again. Refused
+   * once sent (`action_already_sent`), on an action item that is closed, replaced or
+   * that the agent saw done (`action_closed`), on a question
+   * (`validation_error`), and on a message the archive closed.
+   */
+  markAction(messageId: string, key: string, input: { outcome?: unknown; note?: unknown }): InboxQuestion[] {
+    const message = this.targetMessage(messageId);
+    const record = this.questionRecords(message.id).find((r) => r.key === key);
+    if (!record) throw new InboxError("question_not_found", `No action item ${key} on message ${message.id}.`, { key, message_id: message.id });
+    if (record.kind !== "action") throw new InboxError("validation_error", `${key} is a question, not an action item; answer it on its card.`, { field: "key", key });
+    const checked = checkInboxActionResult(input);
+    if (!checked.ok) throw new InboxError("validation_error", checked.message, { field: checked.field });
+    const state = inboxQuestionState(record, false);
+    if (state === "sent") throw new InboxError("action_already_sent", `Action item ${key} was already sent to the agent.`, { key });
+    if (state !== "open" && state !== "picked") throw new InboxError("action_closed", `Action item ${key} is ${state}: it can no longer be marked.`, { key, state });
+    if (checked.outcome === null) {
+      // Undo inside the window: nothing was sent. Nothing to undo on an open action item.
+      if (state === "open") return this.questionsOf(messageId);
+      const at = this.stamp();
+      this.appendQuestion({ ...record, action_result: null, revision: record.revision + 1, picked_by: null, picked_at: null }, at);
+      return this.questionsOf(messageId);
+    }
+    const at = this.stamp();
+    this.appendQuestion(
+      {
+        ...record,
+        action_result: { outcome: checked.outcome, note: checked.note, at, by: "person" },
+        revision: record.revision + 1,
+        picked_by: INBOX_PERSON,
+        picked_at: at,
+      },
+      at,
+    );
+    return this.questionsOf(messageId);
+  }
+
+  /**
+   * The action items the person marked and that are not sent yet, grouped by the
+   * message that asked (in log order), for each message whose marked action items
+   * are ALL past their Undo window (`afterMs`): two Done clicks seconds apart
+   * on one message go together in one reply, once the later one's window
+   * passed. A message the archive closed waits (archive holds a pending Done
+   * back; Unarchive sends it).
+   */
+  private actionsDue(afterMs: number): { message: InboxMessage; records: InboxQuestionRecord[] }[] {
+    const now = this.now().getTime();
+    const byMessage = new Map<string, InboxQuestionRecord[]>();
+    for (const record of this.questions.values()) {
+      if (record.kind !== "action" || record.action_result?.by !== "person") continue;
+      if (inboxQuestionState(record, false) !== "picked") continue;
+      byMessage.set(record.message_id, [...(byMessage.get(record.message_id) ?? []), record]);
+    }
+    const out: { message: InboxMessage; records: InboxQuestionRecord[] }[] = [];
+    for (const [id, records] of byMessage) {
+      const message = this.messages.get(id);
+      if (!message || this.closedByArchive(message)) continue;
+      if (records.some((r) => Date.parse(r.action_result!.at) + afterMs > now)) continue;
+      out.push({ message, records });
+    }
+    return out.sort((a, b) => (this.messageSeq.get(a.message.id) ?? 0) - (this.messageSeq.get(b.message.id) ?? 0));
+  }
+
+  /** How many marked action items wait for their Undo window to pass (the server's timer). */
+  actionsPending(): number {
+    let count = 0;
+    for (const record of this.questions.values()) {
+      if (record.kind === "action" && record.action_result?.by === "person" && inboxQuestionState(record, false) === "picked") count++;
+    }
+    return count;
+  }
+
+  /**
+   * Send what the person marked once the Undo window passed: one reply per
+   * asking message ("Did 1 action item." and the "Action items you asked for"
+   * section), the person's reply like any Send's (delivered by the reply
+   * machinery: the wake, wait_for_reply, Send now), the action items marked sent
+   * with it first. Returns the replies written.
+   */
+  settleActions(afterMs: number): InboxMessage[] {
+    const out: InboxMessage[] = [];
+    for (const { message, records } of this.actionsDue(afterMs)) {
+      const replyId = inboxId("msg");
+      const at = this.stamp();
+      const sent = records.map((record) => ({ ...record, sent_revision: record.revision, sent_reply_id: replyId }) satisfies InboxQuestionRecord);
+      const all = this.questionRecords(message.id).filter((r) => r.kind === "action");
+      // What of that message still waits on the person, named on the report's last line (#2059).
+      const closed = this.closedByArchive(message);
+      const stillOpen = this.questionRecords(message.id)
+        .filter((r) => !sent.some((x) => x.id === r.id))
+        .filter((r) => {
+          const state = inboxQuestionState(r, closed);
+          return state === "open" || (r.kind !== "action" && state === "picked");
+        })
+        .map((r) => ({ kind: r.kind === "action" ? ("action" as const) : ("question" as const), position: r.position, prompt: r.prompt }));
+      const body = composeInboxActionsReply({ reported: sent, all: all.map((r) => sent.find((x) => x.id === r.id) ?? r), stillOpen });
+      const reply: InboxMessage = {
+        id: replyId,
+        project_id: message.project_id,
+        thread_id: message.thread_id,
+        reply_to: message.id,
+        author: { kind: "person" },
+        subject: null,
+        body,
+        created_at: at,
+        resolved_at: null,
+        idempotency_key: null,
+        action_report: sent.map((r) => r.id),
+      };
+      try {
+        for (const record of sent) this.appendQuestion(record, at);
+        this.appendMessage(reply, at);
+      } catch (error) {
+        for (const record of records) this.restoreQuestion(record);
+        throw error;
+      }
+      out.push(reply);
+    }
+    return out;
   }
 
   /** Acks not settled yet (still inside their Undo window, or a stop interrupted it). */
@@ -1819,7 +2062,7 @@ export class InboxStore {
       const message = this.messages.get(id);
       if (message?.author.kind === "agent") {
         if (throughSeq === undefined || seq <= throughSeq) latestAgent = Math.max(latestAgent, seq);
-      } else if (message && !isInboxNote(message)) seen = Math.max(seen, seq);
+      } else if (message && !isInboxNote(message) && !isInboxActionReport(message)) seen = Math.max(seen, seq);
     }
     if (latestAgent > seen) {
       const at = this.stamp();
@@ -2017,6 +2260,12 @@ export class InboxStore {
   sendMessage(input: InboxSendInput): InboxSendResult {
     const body = input.body;
     if (typeof body !== "string" || body.trim() === "") throw new InboxError("validation_error", "body: a message needs a body.", { field: "body" });
+    // One line of plain text, checked before anything else (a reply ignores
+    // its subject, but leaked tool-call text means the call itself was
+    // malformed): nothing is written, so a corrected retry with the same
+    // idempotency_key lands once.
+    const subjectCheck = checkInboxSubject(input.subject);
+    if (!subjectCheck.ok) throw new InboxError("validation_error", `subject: ${subjectCheck.message}`, { field: "subject" });
     let threadName: string | null = null;
     if (input.thread !== undefined && input.thread !== null && !input.reply_to) {
       const checked = checkInboxThreadName(input.thread);
@@ -2038,6 +2287,7 @@ export class InboxStore {
     const replyThread = replyTo && typeof input.thread === "string" && input.thread.trim() !== "" ? input.thread.trim() : null;
 
     const supersedes = this.normalizeSupersedes(input.supersedes);
+    const done = this.normalizeDone(input.done);
     const key = input.idempotency_key?.trim() || null;
     if (key) {
       for (const message of this.messages.values()) {
@@ -2054,14 +2304,21 @@ export class InboxStore {
           (!message.thread_naming || inboxThreadNameKey(message.reply_thread ?? "") === inboxThreadNameKey(replyThread ?? ""));
         const sameGuide = (message.guide?.input_sha256 ?? null) === (input.guide?.input_sha256 ?? null);
         const sameSupersedes = [...(message.supersedes ?? [])].sort().join("\n") === [...supersedes].sort().join("\n");
-        if (message.body !== body || message.reply_to !== replyTo || !sameName || !sameGuide || !sameSupersedes) {
+        const sameDone = [...(message.done ?? [])].sort().join("\n") === [...done].sort().join("\n");
+        if (message.body !== body || message.reply_to !== replyTo || !sameName || !sameGuide || !sameSupersedes || !sameDone) {
           throw new InboxError(
             "idempotency_key_reused",
             "This idempotency_key was already used for a different message.",
             { message_id: message.id },
           );
         }
-        return { message: this.wire(message), replayed: true, ...(message.thread_naming ? { naming: message.thread_naming } : {}) };
+        const markedDone = this.doneBy(message.id);
+        return {
+          message: this.wire(message),
+          replayed: true,
+          ...(message.thread_naming ? { naming: message.thread_naming } : {}),
+          ...(markedDone.length > 0 ? { done: markedDone } : {}),
+        };
       }
     }
 
@@ -2095,19 +2352,25 @@ export class InboxStore {
     const at = this.stamp();
     const id = inboxId("msg");
     const parsed = parseInboxQuestionBlocks(body);
+    // Action items (approval "inbox-next-actions"): `:::action` blocks, kept as
+    // question records of kind "action", numbered on their own (A1, A2…).
+    const actions = parseInboxActionBlocks(body);
     // Checked before anything is written: one id that names no open question
     // of this thread refuses the whole send.
-    const superseding = this.planSupersede(threadId, id, supersedes, parsed);
-    const agentSubject = input.subject?.trim() || null;
+    const superseding = this.planSupersede(threadId, id, supersedes, parsed, actions);
+    const doneIds = this.planDone(threadId, done, superseding, input.author);
+    const agentSubject = subjectCheck.subject;
     const message: InboxMessage = {
       id,
       project_id: projectId,
       thread_id: threadId ?? id,
       reply_to: replyTo,
       author: input.author,
-      subject: threadId ? null : (agentSubject || deriveInboxSubject(body, parsed)),
-      ...(threadId ? {} : { subject_question: !agentSubject && parsed[0] ? `${id}/${parsed[0].key}` : null }),
+      // A message that asks nothing but carries an action item is named by the action item: it is what waits on the person.
+      subject: threadId ? null : (agentSubject || deriveInboxSubject(body, parsed.length > 0 ? parsed : actions)),
+      ...(threadId ? {} : { subject_question: !agentSubject && (parsed[0] ?? actions[0]) ? `${id}/${(parsed[0] ?? actions[0])!.key}` : null }),
       ...(supersedes.length > 0 ? { supersedes } : {}),
+      ...(done.length > 0 ? { done } : {}),
       body,
       created_at: at,
       resolved_at: null,
@@ -2148,11 +2411,50 @@ export class InboxStore {
         at,
       );
     }
+    for (const action of actions) {
+      this.appendQuestion(
+        {
+          id: `${id}/${action.key}`,
+          project_id: projectId,
+          message_id: id,
+          key: action.key,
+          position: action.position,
+          kind: "action",
+          prompt: action.prompt,
+          parsed: { context: action.why, choices: [], aliases: [], recommendation: null, suggested_text: null, line: action.line },
+          stopped: action.stopped,
+          holds_up: action.holds_up,
+          asked_by_agent_id: input.author.session,
+          answer: null,
+          revision: 0,
+          sent_revision: 0,
+          picked_by: null,
+          picked_at: null,
+          sent_reply_id: null,
+          action: action.action,
+          action_result: null,
+        },
+        at,
+      );
+    }
     // The superseded questions last, so whoever reads them finds the message
     // that superseded them. A pick saved on one stays on it, never sent.
     for (const [questionId, by] of superseding) {
       const record = this.questions.get(questionId)!;
       this.appendQuestion({ ...record, superseded_by: by }, at);
+    }
+    // The action items the agent saw done: closed, nothing sent (a Done the person
+    // pressed inside its Undo window is never sent either).
+    for (const questionId of doneIds) {
+      const record = this.questions.get(questionId)!;
+      this.appendQuestion(
+        {
+          ...record,
+          revision: record.revision + 1,
+          action_result: { outcome: "done", note: null, at, by: "agent", message_id: id },
+        },
+        at,
+      );
     }
     // The name, last: the root written again with `thread_name` and
     // `named_by` (append-only; `apply` indexes a name it gains at that line,
@@ -2172,7 +2474,124 @@ export class InboxStore {
       );
     }
     // A reply from the agent reopens nothing: a resolved thread stays resolved.
-    return { message: this.wire(message), replayed: false, ...(naming ? { naming } : {}) };
+    return { message: this.wire(message), replayed: false, ...(naming ? { naming } : {}), ...(doneIds.length > 0 ? { done: doneIds } : {}) };
+  }
+
+  /** send_message's `done` as the store keeps it: trimmed, each once, in order. */
+  private normalizeDone(value: unknown): string[] {
+    if (value === undefined || value === null) return [];
+    const refuse = (message: string) => new InboxError("invalid_done", `done: ${message}`, { field: "done" });
+    if (!Array.isArray(value)) throw refuse("a list of ids, each `<message id>/<key>` of an action item (or `<message id>` for all its action items).");
+    if (value.length > INBOX_SUPERSEDES_MAX) throw refuse(`at most ${INBOX_SUPERSEDES_MAX} ids.`);
+    const out: string[] = [];
+    for (const entry of value) {
+      if (typeof entry !== "string" || entry.trim() === "") throw refuse("each id is a string, `<message id>/<key>` of an action item.");
+      const id = entry.trim();
+      if (!out.includes(id)) out.push(id);
+    }
+    return out;
+  }
+
+  /** The action items a message marked done by its `done` (`<message id>/<key>`), in thread order. */
+  doneBy(messageId: string): string[] {
+    const message = this.messages.get(messageId);
+    if (!message) return [];
+    const out: string[] = [];
+    for (const member of this.threadMessages(message.thread_id)) {
+      for (const record of this.questionRecords(member.id)) {
+        if (record.kind === "action" && record.action_result?.by === "agent" && record.action_result.message_id === messageId) out.push(record.id);
+      }
+    }
+    return out;
+  }
+
+  /** A thread's action items still waiting on the person (open, or marked inside the Undo window), with what to do. */
+  openActionsOf(threadId: string | null): { id: string; prompt: string }[] {
+    if (threadId === null) return [];
+    const out: { id: string; prompt: string }[] = [];
+    for (const message of this.threadMessages(threadId)) {
+      const closed = this.closedByArchive(message);
+      for (const record of this.questionRecords(message.id)) {
+        if (record.kind === "action" && isInboxQuestionSupersedable(inboxQuestionState(record, closed))) out.push({ id: record.id, prompt: record.prompt });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Which action items a new message marks done (send_message's `done`): each id
+   * must name an open action item (open, or marked inside its Undo window) of
+   * `threadId`, the thread the message lands in, else the whole send is
+   * refused with `invalid_done`, listing that thread's open action items. One this
+   * message also supersedes stays superseded.
+   */
+  private planDone(
+    threadId: string | null,
+    done: readonly string[],
+    superseding: ReadonlyMap<string, InboxSupersededBy>,
+    author: Extract<InboxAuthor, { kind: "agent" }>,
+  ): string[] {
+    if (done.length === 0) return [];
+    const out: string[] = [];
+    const problems: string[] = [];
+    for (const ref of done) {
+      const target = parseInboxDoneRef(ref);
+      if (!target) {
+        problems.push(`"${ref}" is not an action item's id: write <message id>/<key> (the key starts with a-; read_thread gives it).`);
+        continue;
+      }
+      const message = this.messages.get(target.message_id);
+      if (!message || message.author.kind !== "agent") {
+        problems.push(`${ref}: no agent message ${target.message_id}.`);
+        continue;
+      }
+      if (threadId === null || message.thread_id !== threadId) {
+        problems.push(`${ref} is in another thread (${message.thread_id}): send with reply_to ${target.message_id} to mark it done there.`);
+        continue;
+      }
+      // Only the session that wrote an action item marks it done (another agent's action item is not yours to close),
+      // or the session a still-waiting Re-ask note was sent to, for the ids that note lists (the asker ended; #2059).
+      const writer =
+        (message.author.session ?? null) === (author.session ?? null) && (message.author.host ?? null) === (author.host ?? null);
+      const granted = writer ? null : this.reaskGrants(threadId, author);
+      if (!writer && ![...granted!].some((id) => id === `${message.id}/${target.key}` || (target.key === null && id.startsWith(`${message.id}/`)))) {
+        problems.push(`${ref}: that action item is another session's; only the session that wrote an action item marks it done.`);
+        continue;
+      }
+      const records = this.questionRecords(message.id).filter(
+        (r) => r.kind === "action" && (target.key === null || r.key === target.key) && (granted === null || granted.has(r.id)),
+      );
+      if (records.length === 0) {
+        problems.push(target.key === null ? `${ref}: that message has no action item.` : `${ref}: message ${target.message_id} has no action item ${target.key}.`);
+        continue;
+      }
+      const resolved = this.closedByArchive(message);
+      // Open only: one the person already marked (Done or Can't do it, inside its Undo window) is theirs, and goes as they said.
+      const open = records.filter((r) => inboxQuestionState(r, resolved) === "open");
+      if (open.length === 0) {
+        const state = inboxQuestionState(records[0]!, resolved);
+        problems.push(
+          target.key === null
+            ? `${ref}: that message has no open action item.`
+            : state === "picked"
+              ? `${ref}: the person already marked it; their answer reaches you in a few seconds.`
+              : `${ref} is not open (it is ${state}).`,
+        );
+        continue;
+      }
+      for (const record of open) if (!superseding.has(record.id) && !out.includes(record.id)) out.push(record.id);
+    }
+    if (problems.length > 0) {
+      const open = this.openActionsOf(threadId);
+      const listing =
+        threadId === null
+          ? "This message would start a new thread, which has no action items yet."
+          : open.length > 0
+            ? `Open action items in this thread: ${open.map((a) => `${a.id} (${a.prompt})`).join("; ")}.`
+            : "This thread has no open action items.";
+      throw new InboxError("invalid_done", `done: ${problems.join(" ")} Nothing was sent. ${listing}`, { field: "done", open_actions: open });
+    }
+    return out;
   }
 
   /** send_message's `supersedes` as the store keeps it: trimmed, each once, in order. */
@@ -2228,21 +2647,39 @@ export class InboxStore {
     messageId: string,
     supersedes: readonly string[],
     parsed: readonly { key: string; replaces: string[] }[],
+    /**
+     * The new message's action items (`:::action`). A question is replaced only by a
+     * question and an action item only by an action item: `supersedes` names the new
+     * message's only question (or only action item) as the replacement of an old
+     * one of the same kind, and a block's `Replaces:` line reaches only
+     * records of its own kind.
+     */
+    actions: readonly { key: string; replaces: string[] }[] = [],
   ): Map<string, InboxSupersededBy> {
     const plan = new Map<string, InboxSupersededBy>();
-    const only = parsed.length === 1 ? parsed[0]!.key : null;
-    const requests: { ref: string; by: InboxSupersededBy; where: string }[] = [
-      ...supersedes.map((ref) => ({ ref, by: { message_id: messageId, key: only }, where: "supersedes" })),
+    const onlyQuestion = parsed.length === 1 ? parsed[0]!.key : null;
+    const onlyAction = actions.length === 1 ? actions[0]!.key : null;
+    type Family = "question" | "action" | null;
+    const requests: { ref: string; by: InboxSupersededBy; where: string; family: Family }[] = [
+      ...supersedes.map((ref) => ({ ref, by: { message_id: messageId, key: null }, where: "supersedes", family: null as Family })),
       ...parsed.flatMap((question) =>
-        question.replaces.map((ref) => ({ ref, by: { message_id: messageId, key: question.key }, where: "Replaces:" })),
+        question.replaces.map((ref) => ({ ref, by: { message_id: messageId, key: question.key }, where: "Replaces:", family: "question" as Family })),
+      ),
+      ...actions.flatMap((action) =>
+        action.replaces.map((ref) => ({ ref, by: { message_id: messageId, key: action.key }, where: "Replaces:", family: "action" as Family })),
       ),
     ];
+    const familyOf = (record: InboxQuestionRecord): "question" | "action" => (record.kind === "action" ? "action" : "question");
+    // `supersedes`: the new message's only block of the old record's kind replaces it, else "No longer applies".
+    const byFor = (request: { by: InboxSupersededBy; family: Family }, record: InboxQuestionRecord): InboxSupersededBy =>
+      request.family === null ? { message_id: messageId, key: familyOf(record) === "action" ? onlyAction : onlyQuestion } : request.by;
     if (requests.length === 0) return plan;
     const problems: string[] = [];
     // Which new block's Replaces: line claimed each old question: two blocks
     // cannot both replace one question.
     const claimedBy = new Map<string, string>();
-    for (const { ref, by, where } of requests) {
+    for (const request of requests) {
+      const { ref, by, where, family } = request;
       const target = parseInboxSupersedeRef(ref);
       if (!target) {
         problems.push(`${where} "${ref}" is not an id: write <message id>/<key> (read_thread gives the keys) or <message id>.`);
@@ -2259,18 +2696,30 @@ export class InboxStore {
         );
         continue;
       }
-      const records = this.questionRecords(message.id).filter((r) => target.key === null || r.key === target.key);
+      const records = this.questionRecords(message.id).filter(
+        (r) => (target.key === null || r.key === target.key) && (family === null || familyOf(r) === family),
+      );
       if (target.key !== null && records.length === 0) {
-        problems.push(`${where} ${ref}: message ${target.message_id} has no question ${target.key}.`);
+        const other = this.questionRecords(message.id).some((r) => r.key === target.key);
+        problems.push(
+          other
+            ? `${where} ${ref}: a ${family === "action" ? "action item" : "question"} replaces only a ${family === "action" ? "action item" : "question"}; use supersedes to withdraw it.`
+            : `${where} ${ref}: message ${target.message_id} has no question ${target.key}.`,
+        );
         continue;
       }
       const resolved = this.closedByArchive(message);
-      const open = records.filter((r) => isInboxQuestionSupersedable(inboxQuestionState(r, resolved)));
+      // An action item the person already marked (Done or Can't do it, inside its Undo window) is theirs: it is
+      // never superseded, so their answer goes as they said (a message-wide id leaves it out).
+      const personMarked = (r: InboxQuestionRecord) => r.kind === "action" && inboxQuestionState(r, resolved) === "picked";
+      const open = records.filter((r) => isInboxQuestionSupersedable(inboxQuestionState(r, resolved)) && !personMarked(r));
       if (open.length === 0) {
         problems.push(
-          target.key === null
-            ? `${where} ${ref}: that message has no open question.`
-            : `${where} ${ref} is not open (it is ${inboxQuestionState(records[0]!, resolved)}).`,
+          target.key !== null && personMarked(records[0]!)
+            ? `${where} ${ref}: the person already marked it; their answer reaches you in a few seconds.`
+            : target.key === null
+              ? `${where} ${ref}: that message has no open question.`
+              : `${where} ${ref} is not open (it is ${inboxQuestionState(records[0]!, resolved)}).`,
         );
         continue;
       }
@@ -2283,7 +2732,10 @@ export class InboxStore {
         }
         for (const record of open) claimedBy.set(record.id, by.key);
       }
-      for (const record of open) if (!plan.has(record.id) || by.key !== null) plan.set(record.id, by);
+      for (const record of open) {
+        const replacement = byFor(request, record);
+        if (!plan.has(record.id) || replacement.key !== null) plan.set(record.id, replacement);
+      }
     }
     if (problems.length > 0) {
       const open = this.openQuestionsOf(threadId);
@@ -2312,6 +2764,59 @@ export class InboxStore {
   }
 
   /**
+   * The message a Send's answer or skip is on: the reply's own (`raw`
+   * absent), or another message of the same thread written by the same agent
+   * session (one Send to one session is one reply, approval
+   * "inbox-explicit-skip"). Anything else is refused before anything is
+   * written; a message the archive closed refuses as the reply's own does.
+   */
+  private sendMessageOf(reply: InboxMessage, raw: string | undefined, field: string): InboxMessage {
+    if (raw === undefined || raw === reply.id) return reply;
+    const other = this.messages.get(raw);
+    const sameSession =
+      other !== undefined &&
+      other.thread_id === reply.thread_id &&
+      other.author.kind === "agent" &&
+      reply.author.kind === "agent" &&
+      !!reply.author.session &&
+      other.author.session === reply.author.session &&
+      (other.author.host ?? "") === (reply.author.host ?? "");
+    if (!sameSession) {
+      throw new InboxError("validation_error", `${field}: ${raw} is not a message of this thread from the session the reply goes to.`, { field });
+    }
+    if (this.closedByArchive(other!)) throw new InboxError("thread_resolved", "This thread is resolved; reopen it to answer.");
+    return other!;
+  }
+
+  /**
+   * A Send's `skip` list, checked: each entry a question key (the reply's own
+   * message) or `{ message_id?, key }`, on a message `sendMessageOf` accepts,
+   * and a question of that message (else refused). Returns the records as
+   * they are now; the caller keeps the open ones.
+   */
+  private planSkips(reply: InboxMessage, raw: unknown): InboxQuestionRecord[] {
+    if (raw === undefined || raw === null) return [];
+    if (!Array.isArray(raw)) throw new InboxError("validation_error", "skip: a list of question keys.", { field: "skip" });
+    const out = new Map<string, InboxQuestionRecord>();
+    raw.forEach((item, index) => {
+      const field = `skip[${index}]`;
+      const entry = typeof item === "string" ? { key: item } : item;
+      if (!entry || typeof entry !== "object" || typeof (entry as { key?: unknown }).key !== "string") {
+        throw new InboxError("validation_error", `${field}: a question key, or { message_id, key }.`, { field });
+      }
+      const messageId = (entry as { message_id?: unknown }).message_id;
+      if (messageId !== undefined && typeof messageId !== "string") throw new InboxError("validation_error", `${field}.message_id: a message id.`, { field: `${field}.message_id` });
+      const target = this.sendMessageOf(reply, messageId as string | undefined, `${field}.message_id`);
+      const key = (entry as { key: string }).key;
+      const record = this.questionRecords(target.id).find((r) => r.key === key);
+      if (!record) throw new InboxError("question_not_found", `No question ${key} on message ${target.id}.`, { key, message_id: target.id });
+      if (record.kind === "action") throw actionNotQuestion(field, key);
+      out.set(record.id, record);
+    });
+    return [...out.values()];
+  }
+
+  /**
    * Check every entry against the message's questions and plan the new
    * records. Nothing is written unless every entry passes.
    */
@@ -2319,11 +2824,14 @@ export class InboxStore {
     message: InboxMessage,
     entries: readonly InboxAnswerEntry[],
     mode: "pick" | "send",
+    /** Each entry's index in the request's `questions` (a Send's entries are planned per message). */
+    indices?: readonly number[],
   ): { record: InboxQuestionRecord; answer: QuestionAnswer | null | undefined }[] {
     const records = new Map(this.questionRecords(message.id).map((r) => [r.key, r]));
     const seen = new Set<string>();
     const plan: { record: InboxQuestionRecord; answer: QuestionAnswer | null | undefined }[] = [];
-    entries.forEach((entry, index) => {
+    entries.forEach((entry, position) => {
+      const index = indices?.[position] ?? position;
       const field = `questions[${index}]`;
       if (!entry || typeof entry !== "object" || typeof entry.key !== "string") {
         throw new InboxError("validation_error", `${field}.key: required.`, { field: `${field}.key` });
@@ -2334,7 +2842,8 @@ export class InboxStore {
         throw new InboxError("validation_error", `${field}.revision: a non-negative integer is required.`, { field: `${field}.revision` });
       }
       const record = records.get(entry.key);
-      if (!record) throw refusalError({ code: "question_not_found", key: entry.key });
+      if (!record) throw new InboxError("question_not_found", `No question ${entry.key} on message ${message.id}.`, { key: entry.key, message_id: message.id });
+      if (record.kind === "action") throw actionNotQuestion(`${field}.key`, entry.key);
       // A superseded question takes no pick and no Send: a pick saved on it stays, never sent.
       if (record.superseded_by) {
         const by = { message_id: record.superseded_by.message_id, key: record.superseded_by.key ?? null };
@@ -2417,32 +2926,46 @@ export class InboxStore {
     const entries = input.questions ?? [];
     if (!Array.isArray(entries)) throw new InboxError("validation_error", "questions: must be a list.", { field: "questions" });
     const words = typeof input.words === "string" ? input.words : "";
-    const plan = this.planAnswers(message, entries, "send");
+    // One Send to one session is one reply: the answers may be on any of the
+    // session's messages in this thread. Each is planned against its own
+    // message's questions (revisions included); nothing is written unless
+    // every entry passes.
+    const byMessage = new Map<string, { entry: InboxAnswerEntry; index: number }[]>();
+    entries.forEach((entry, index) => {
+      const field = `questions[${index}].message_id`;
+      const raw = entry && typeof entry === "object" ? (entry as InboxAnswerEntry).message_id : undefined;
+      if (raw !== undefined && typeof raw !== "string") throw new InboxError("validation_error", `${field}: a message id.`, { field });
+      const target = this.sendMessageOf(message, raw, field);
+      byMessage.set(target.id, [...(byMessage.get(target.id) ?? []), { entry, index }]);
+    });
+    const plan: { record: InboxQuestionRecord; answer: QuestionAnswer | null | undefined }[] = [];
+    for (const [id, list] of byMessage) {
+      const target = this.messages.get(id)!;
+      plan.push(...this.planAnswers(target, list.map((x) => x.entry), "send", list.map((x) => x.index)));
+    }
     const feedback = typeof input.feedback === "string" ? input.feedback.trim() : "";
     const carried = this.planSentAnnotations(message.thread_id, input.annotation_ids);
-    // A Send skips the message's questions it leaves unanswered (no pick),
-    // unless the person pressed Keep open. Superseded and closed ones are not open.
-    const planned = new Set(plan.map((p) => p.record.key));
-    const skips =
-      input.skip_unanswered === true
-        ? this.questionRecords(message.id).filter((r) => !planned.has(r.key) && inboxQuestionState(r, false) === "open")
-        : [];
+    // Skips only what the person listed ("Skip them"), and only while still open.
+    const planned = new Set(plan.map((p) => p.record.id));
+    const listed = this.planSkips(message, input.skip);
+    const skips = listed.filter((r) => !planned.has(r.id) && inboxQuestionState(r, false) === "open");
     const attachments = input.attachments ?? [];
     if (plan.length === 0 && skips.length === 0 && words.trim() === "" && feedback === "" && attachments.length === 0) {
-      // A target a Send meant only to skip, whose questions closed meanwhile
+      // A Send meant only to skip, whose questions closed meanwhile
       // (answered, replaced, a Mark read): nothing to write, not a refusal.
-      if (input.skip_unanswered === true) throw new InboxError("nothing_to_send", "Nothing is left to send on this message.");
+      if (listed.length > 0) throw new InboxError("nothing_to_send", "Nothing is left to send on this message.");
       throw new InboxError("validation_error", "words: write a reply or send at least one answer.", { field: "words" });
     }
 
     const replyId = inboxId("msg");
     const at = this.stamp();
-    const sentKeys = new Set([...plan.map((p) => p.record.key), ...skips.map((r) => r.key)]);
+    const sentIds = new Set([...plan.map((p) => p.record.id), ...skips.map((r) => r.id)]);
     const skipped = skips.map(
       (record) =>
         ({
           ...record,
-          answer: inboxSkipAnswer(record, { byReply: true }),
+          // planSkips refuses an action item: every skip is a question's.
+          answer: inboxSkipAnswer({ key: record.key, kind: record.kind as QuestionAnswer["kind"], prompt: record.prompt }, { byReply: true }),
           revision: record.revision + 1,
           sent_revision: record.revision + 1,
           sent_reply_id: replyId,
@@ -2463,14 +2986,24 @@ export class InboxStore {
       } satisfies InboxQuestionRecord;
     });
     const updated = [...answered, ...skipped];
-    const all = this.questionRecords(message.id);
-    const earlier = all
-      .filter((r) => !sentKeys.has(r.key) && r.answer !== null && r.sent_revision > 0 && r.sent_revision === r.revision)
-      .map((r) => r.answer as QuestionAnswer);
-    // A reply that answers nothing says which questions stay open: every one
-    // the replied-to message's session asked in this thread (it asked in one
-    // message and posted a plain update after it, and the words go to the
-    // update), never another session's.
+    // Every message the reply answers questions on (the reply's own first
+    // when it has none), in thread order, for the answers section.
+    const order = this.threadMessages(message.thread_id).map((m) => m.id);
+    const touched = new Set([message.id, ...updated.map((r) => r.message_id)]);
+    const groups = order
+      .filter((id) => touched.has(id))
+      .map((id) => {
+        const all = this.questionRecords(id);
+        const sent = updated.filter((r) => r.message_id === id).map((r) => r.answer as QuestionAnswer);
+        const earlier = all
+          .filter((r) => !sentIds.has(r.id) && r.answer !== null && r.sent_revision > 0 && r.sent_revision === r.revision)
+          .map((r) => r.answer as QuestionAnswer);
+        return { message_id: id, questions: all, sent, earlier };
+      });
+    // The reply says which questions stay open: every one the replied-to
+    // message's session asked in this thread (it asked in one message and
+    // posted a plain update after it, and the words go to the update), never
+    // another session's.
     const asker = message.author.kind === "agent" && message.author.session ? message.author : null;
     const stillOpen = asker
       ? this.threadMessages(message.thread_id)
@@ -2482,13 +3015,15 @@ export class InboxStore {
               !this.closedByArchive(m),
           )
           .flatMap((m) => this.questionRecords(m.id))
-      : all;
+      : this.questionRecords(message.id);
     // The picks first, then the annotations as Plannotator's feedback text.
     const body = [
       composeInboxReplyBody({
-        questions: all,
-        sent: updated.map((r) => r.answer as QuestionAnswer),
-        earlier,
+        questions: [],
+        sent: [],
+        earlier: [],
+        messages: groups,
+        replyTo: message.id,
         words,
         stillOpen,
       }),
@@ -2571,10 +3106,11 @@ export class InboxStore {
           : m.id === message.id,
       )
       .filter((m) => !this.closedByArchive(m))
+      // Open action items are asked again too (owner, #2059); one the person marked inside its Undo window is not open.
       .flatMap((m) => this.questionRecords(m.id));
     const picked = records.filter((r) => inboxQuestionState(r, false) === "picked" && r.answer !== null);
     const open = records.filter((r) => inboxQuestionState(r, false) === "open");
-    if (open.length === 0) throw new InboxError("nothing_to_reask", "No open question is left to ask again.");
+    if (open.length === 0) throw new InboxError("nothing_to_reask", "No open question or action item is left to ask again.");
 
     const replyId = inboxId("msg");
     const at = this.stamp();
@@ -2623,6 +3159,27 @@ export class InboxStore {
    * one of the questions it lists is still open. Another session's new
    * question, or the last listed one answered, superseded or closed, ends it.
    */
+  /**
+   * The ids a still-waiting Re-ask note sent to `author` (its `to`: the
+   * person redirected it because the asker ended) lists: that session may
+   * mark those action items done, as the asker could. A note stops granting
+   * once that session wrote in the thread after it.
+   */
+  private reaskGrants(threadId: string, author: Extract<InboxAuthor, { kind: "agent" }>): Set<string> {
+    const out = new Set<string>();
+    const messages = this.threadMessages(threadId);
+    const same = (to: { host?: string; session?: string } | null | undefined): boolean =>
+      !!to && (to.session ?? null) === (author.session ?? null) && (to.host ?? "") === (author.host ?? "");
+    messages.forEach((note, index) => {
+      if (note.author.kind !== "person" || (note.reask?.length ?? 0) === 0 || !same(note.to)) return;
+      const wrote = messages
+        .slice(index + 1)
+        .some((m) => m.author.kind === "agent" && same({ host: m.author.host ?? "", session: m.author.session ?? undefined }));
+      if (!wrote) for (const id of note.reask!) out.add(id);
+    });
+    return out;
+  }
+
   private reaskWaiting(messages: readonly InboxMessage[]): boolean {
     // Most threads have no Re-ask note: they cost nothing more.
     if (!messages.some((m) => m.author.kind === "person" && (m.reask?.length ?? 0) > 0)) return false;
@@ -3335,7 +3892,7 @@ export class InboxStore {
    * agent up to it (the Sent band's "Delivered to <agent>, <time>"). A tagged
    * session's delivery marks nothing for the owner. Idempotent per session.
    */
-  recordDelivery(replyId: string, by: { host: string; session: string }): InboxMessage {
+  recordDelivery(replyId: string, by: { host: string; session: string; intoTurn?: boolean }): InboxMessage {
     const reply = this.messages.get(replyId);
     if (!reply || reply.author.kind !== "person" || (!reply.reply_to && !reply.to)) throw new InboxError("message_not_found", `No reply ${replyId}.`);
     if (!this.isFor(reply, by.session)) {
@@ -3347,14 +3904,16 @@ export class InboxStore {
       const at = this.stamp();
       const delivered: InboxMessage = {
         ...reply,
-        tags: reply.tags!.map((t) => (t.session === by.session ? { ...t, delivery: { state: "delivered" as const, host: by.host, session: by.session, at } } : t)),
+        tags: reply.tags!.map((t) =>
+          t.session === by.session ? { ...t, delivery: { state: "delivered" as const, host: by.host, session: by.session, at, ...intoTurnOf(t.deliver_now_by, by.intoTurn) } } : t,
+        ),
       };
       this.appendMessage(delivered, at);
       return delivered;
     }
     if (reply.delivery) return reply;
     const at = this.stamp();
-    const delivered: InboxMessage = { ...reply, delivery: { state: "delivered", host: by.host, session: by.session, at } };
+    const delivered: InboxMessage = { ...reply, delivery: { state: "delivered", host: by.host, session: by.session, at, ...intoTurnOf(reply.deliver_now_by, by.intoTurn) } };
     this.appendMessage(delivered, at);
     this.markAgentChecked(reply.thread_id, this.messageSeq.get(reply.id) ?? 0, at);
     // A 👍 that reached the agent was seen: a later wait on every thread is not answered by it again.
@@ -3503,7 +4062,7 @@ export class InboxStore {
    * is the server's check, before this is called. `session` names one
    * recipient (a tagged session's own line); absent, the owner.
    */
-  requestDeliverNow(messageId: string, session?: string | null): InboxMessage {
+  requestDeliverNow(messageId: string, session?: string | null, by: InboxDeliverNowBy = "person"): InboxMessage {
     const message = this.messages.get(messageId);
     if (!message) throw new InboxError("message_not_found", `No message ${messageId}.`);
     const tag = session && !this.isOwner(message, session) ? tagOf(message, session) : null;
@@ -3514,7 +4073,7 @@ export class InboxStore {
       if (tag.delivery) throw new InboxError("already_delivered", "That session already took this.", { delivery: tag.delivery });
       if (tag.deliver_now_at) return message;
       const at = this.stamp();
-      const next: InboxMessage = { ...message, tags: message.tags!.map((t) => (t.session === tag.session ? { ...t, deliver_now_at: at } : t)) };
+      const next: InboxMessage = { ...message, tags: message.tags!.map((t) => (t.session === tag.session ? { ...t, deliver_now_at: at, deliver_now_by: by } : t)) };
       this.appendMessage(next, at);
       return next;
     }
@@ -3524,9 +4083,53 @@ export class InboxStore {
     if (message.delivery) throw new InboxError("already_delivered", "That session already took this.", { delivery: message.delivery });
     if (message.deliver_now_at) return message;
     const at = this.stamp();
-    const next: InboxMessage = { ...message, deliver_now_at: at };
+    const next: InboxMessage = { ...message, deliver_now_at: at, deliver_now_by: by };
     this.appendMessage(next, at);
     return next;
+  }
+
+  /**
+   * What goes into `session`'s running turn by itself now (owner approval
+   * "inbox-busy-agent-reply", 2026-10-21): every item the session is handed
+   * (`pendingReplies`: the person's replies, messages, Re-ask notes and, while
+   * `INBOX_AUTO_SEND_ACK_NOTES` holds, the note carrying a 👍) whose clock
+   * (`clockOf`: the server's, started the first time it saw this session busy
+   * with Send now possible while the item waited; null while not started) has
+   * run `afterMs`, and that was never asked to go now (no `deliver_now_by`, by
+   * the person or by an earlier automatic attempt, so it fires once). The
+   * Inbox's set-aside and reopened notes never do. Each is marked as a Send
+   * now with `deliver_now_by: "auto"` and `wait_started_at` (when it began to
+   * wait, `waitedSince`); the caller has checked that the session works now
+   * and its connection can take an item mid-turn. Returns the items it marked.
+   */
+  autoSendDue(
+    session: string,
+    options: {
+      afterMs: number;
+      tags?: boolean;
+      clockOf: (itemId: string) => { autoSince: number | null; since: number } | null;
+    },
+  ): InboxMessage[] {
+    const now = this.now().getTime();
+    const marked: InboxMessage[] = [];
+    for (const item of this.pendingReplies(session, { tags: options.tags })) {
+      if ((item.set_aside?.length ?? 0) > 0 || (item.reopened?.length ?? 0) > 0) continue;
+      if (!INBOX_AUTO_SEND_ACK_NOTES && item.ack_of) continue;
+      const clock = options.clockOf(item.id);
+      if (!clock || clock.autoSince === null || clock.autoSince + options.afterMs > now) continue;
+      const owner = this.isOwner(item, session);
+      const tag = owner ? null : tagOf(item, session);
+      const asked = owner ? item.deliver_now_at || item.deliver_now_by : !tag || tag.deliver_now_at || tag.deliver_now_by;
+      if (asked) continue;
+      const at = this.stamp();
+      const waited = new Date(clock.since).toISOString();
+      const next: InboxMessage = tag
+        ? { ...item, tags: item.tags!.map((t) => (t.session === session ? { ...t, deliver_now_at: at, deliver_now_by: "auto" as const, wait_started_at: waited } : t)) }
+        : { ...item, deliver_now_at: at, deliver_now_by: "auto", wait_started_at: waited };
+      this.appendMessage(next, at);
+      marked.push(next);
+    }
+    return marked;
   }
 
   /**
@@ -3716,7 +4319,9 @@ export class InboxStore {
     if (!to) throw new InboxError("session_not_live", "That session is not live any more: nothing was changed. Pick another live session.");
     if (message.to.session === to.session && message.to.host === to.host) return message;
     const at = this.stamp();
-    const next: InboxMessage = { ...message, to: { host: to.host, session: to.session } };
+    // Moved to another session: an earlier mark (the person's Send now or the Inbox's own) belonged to the
+    // old one, so it neither goes in at once nor stays blocked from going in by itself; its wait starts again.
+    const next: InboxMessage = { ...message, to: { host: to.host, session: to.session }, deliver_now_at: null, deliver_now_by: null, wait_started_at: null };
     this.appendMessage(next, at);
     return next;
   }

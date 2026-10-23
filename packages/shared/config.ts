@@ -25,6 +25,7 @@ import { execSync } from "child_process";
 import type { DefaultDiffType, DiffLineBgIntensity, DiffOptions, ThemeConfig } from '@plannotator/core/config-types';
 import { isFaviconStyle, type FaviconStyle } from './favicon';
 import { isAnnotateAgentTerminalSide, type AnnotateAgentTerminalSide } from './agent-terminal';
+import { parseAgentSwitchConfig, agentSwitchConfigValue, type AgentSwitchConfigValue } from './agent-switch';
 export type { DefaultDiffType, DiffLineBgIntensity, DiffOptions, ThemeConfig, FaviconStyle };
 
 /** Single conventional comment label entry stored in config.json */
@@ -143,6 +144,15 @@ export interface PlannotatorConfig {
    */
   agentTerminalDefaultAgent?: string;
   /**
+   * OpenCode: which agent the session switches to after a plan is approved or
+   * review feedback is sent: "disabled", an agent name, or
+   * `{ "switchTo": "custom", "customName": "<name>" }` (#1390). Written by
+   * the UI through POST /api/config, because some webviews (Glimpse) keep no
+   * cookies between runs. Unset: the surface's default (plan approval switches
+   * to "build", review feedback stays). See `@plannotator/core/agent-switch`.
+   */
+  agentSwitch?: AgentSwitchConfigValue;
+  /**
    * Enable `gh attestation verify` during CLI installation/upgrade.
    * Read by scripts/install.sh|ps1|cmd on every run (not by any runtime code).
    * When true, the installer runs build-provenance verification after the
@@ -239,7 +249,7 @@ export interface PlannotatorConfig {
    */
   autoUpdate?: boolean;
   /**
-   * Update notices: whether Plannotator asks GitHub (once a day per machine,
+   * Update notices: whether Plannotator asks GitHub (about once an hour per machine,
    * from the machine, never the browser) whether a newer stable release
    * exists, and tells you in the Inbox, the review windows and the terminal.
    * `false` makes no automatic request at all, which also stops auto-update;
@@ -752,6 +762,7 @@ export function getServerConfig(gitUser: string | null, agentToolIntegration?: s
   conventionalLabels?: CCLabelConfig[] | null;
   agentTerminalSide?: PlannotatorConfig["agentTerminalSide"];
   agentTerminalDefaultAgent?: string;
+  agentSwitch?: AgentSwitchConfigValue;
   autoUpdate: boolean;
   autoUpdateEnv?: boolean;
   updateCheck: boolean;
@@ -787,6 +798,7 @@ export function getServerConfig(gitUser: string | null, agentToolIntegration?: s
       cfg.agentTerminalDefaultAgent !== "" && {
         agentTerminalDefaultAgent: cfg.agentTerminalDefaultAgent,
       }),
+    ...agentSwitchAdvert(cfg.agentSwitch),
     // Always explicit (the config-file value, default false) so a stale
     // cookie can never show the toggle on while the config says off.
     // autoUpdateEnv carries PLANNOTATOR_AUTO_UPDATE when it overrides the file.
@@ -798,6 +810,29 @@ export function getServerConfig(gitUser: string | null, agentToolIntegration?: s
     ...(updateCheckEnv !== undefined && { updateCheckEnv }),
     ...agentToolAdvert(cfg, agentToolEnv, agentToolHost),
   };
+}
+
+/**
+ * The agent switch as getServerConfig advertises it: only a value that parses
+ * (a hand-edited typo is left out, so the client keeps its cookie or the
+ * surface default), re-serialized to its canonical shape.
+ */
+function agentSwitchAdvert(value: unknown): { agentSwitch?: AgentSwitchConfigValue } {
+  const choice = parseAgentSwitchConfig(value);
+  const canonical = choice && agentSwitchConfigValue(choice);
+  return canonical !== undefined ? { agentSwitch: canonical } : {};
+}
+
+/**
+ * The POST /api/config allowlist entry for the agent switch, shared by every
+ * plan, review and annotate server in both runtimes. Returns the value to
+ * save, `undefined` when the body leaves it out, or `null` when it is present
+ * and invalid (the route answers 400 and saves nothing).
+ */
+export function agentSwitchConfigToSave(body: { agentSwitch?: unknown }): AgentSwitchConfigValue | undefined | null {
+  if (body.agentSwitch === undefined) return undefined;
+  const choice = parseAgentSwitchConfig(body.agentSwitch);
+  return (choice && agentSwitchConfigValue(choice)) ?? null;
 }
 
 /**
@@ -1058,7 +1093,7 @@ export type AgentToolHost = "claude-code" | "pi" | "oh-my-pi" | "opencode";
  * name until used) and for Oh My Pi (owner's call 2026-10-12: OMP lists an
  * extension tool as one line in its system prompt, about 50 tokens, and loads
  * the schema only when the model reads it); off on Pi and OpenCode 2 (a full
- * tool definition, about 780 tokens, in every request). The mod's mirror
+ * tool definition, about 800 tokens, in every request). The mod's mirror
  * (`apps/hook/hooks/mod/enabled.ts`) is kept equal to the claude-code entry by
  * `enabled.test.ts`.
  */

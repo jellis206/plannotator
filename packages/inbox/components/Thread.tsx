@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Viewer, type ViewerHandle } from '@plannotator/ui/components/Viewer';
-import type { Annotation } from '@plannotator/ui/types';
+import type { Annotation, Block } from '@plannotator/ui/types';
 import { annotationOwnsHighlight } from '@plannotator/ui/utils/annotationOwnsHighlight';
 import { ImageLightbox } from '@plannotator/ui/components/ImageLightbox';
 import { parseMarkdownToBlocks } from '@plannotator/ui/utils/parser';
 import type { InboxListRow, InboxMessageWire, InboxProjectRepo, InboxQuestion, InboxSentRecipient, InboxThread, InboxUpload } from '@plannotator/core/inbox-types';
-import type { IndexedQuestion, QuestionAnswer, QuestionStatus } from '@plannotator/core/question-block';
-import { inboxAskingMessage, inboxDefaultSkip, isInboxNote, isInboxTextKind, readInboxAttachmentKind, type InboxAnnotationRecord, type InboxAttachment, type InboxAttachmentState, type InboxInlineImage, type InboxQuestionState } from '@plannotator/core/inbox-types';
+import { isQuestionAnswerEmpty, type IndexedQuestion, type QuestionAnswer, type QuestionStatus } from '@plannotator/core/question-block';
+import { INBOX_AUTO_SEND_ACK_NOTES, inboxAskingMessage, wholeMinutes, isInboxNote, isInboxTextKind, readInboxAttachmentKind, type InboxAnnotationRecord, type InboxAttachment, type InboxAttachmentState, type InboxInlineImage, type InboxQuestionState } from '@plannotator/core/inbox-types';
 import type { LocalLinkResolver } from '@plannotator/ui/components/LocalLinkContext';
 import { NOT_ATTACHED_TITLE, attachmentDeepLink, attachmentDisplayPath, attachmentForLink, openAttachmentTitle, useRefRepo } from '../links';
 import { InboxApiError, inboxApi, type AttachmentsModel } from '../api';
@@ -16,9 +16,11 @@ import { AttachmentTiles, AttachmentsCount, changedCount } from './AttachmentTil
 import { AttachmentPane, type AttachmentPaneHandle } from './AttachmentPane';
 import type { OpenInSurface } from './OpenIn';
 import { attachmentSequence } from '../stepping';
+import { fileViewFor, openingView, parseFileView, readFileViewChoice, writeFileViewChoice, type FileView } from '../fileView';
+import type { InboxToastModel } from './Toast';
 import { AnnotationsChip } from './AnnotationsChip';
 import { agentName, clockTime, dayWords, fullTime, plural, whenTime } from '../format';
-import { answerWords, foldSnippet, holdingsOf, isDelivered, isPersonReply, lastNonNote, lookBoundary, newSinceLook, planFolds, snippetText, type FoldSnippet, type Holding } from '../folding';
+import { foldSnippet, holdingsOf, isDelivered, isPersonLook, isPersonReply, lastNonNote, lookBoundary, newSinceLook, planFolds, snippetText, type FoldSnippet, type Holding } from '../folding';
 import { highlightSearchHits } from '../search/highlight';
 import { AuthorMark, Icon } from '../icons';
 import { PILL_BAND_PX, atEnd, followBy, lookThrough, measureFirstLines, unseenArrivals, useSeenOnSight } from '../seenOnSight';
@@ -29,8 +31,9 @@ import { useReplyDraft } from '../replyDraft';
 import { conflictText, DraftHead, DraftFootNote } from './DraftLabel';
 import { canToggleRead } from '../markRead';
 import { NewMessageButton, NewMessageComposer, NewMessagePopover, hostName, useLiveSessions, type NewMessageMode } from './NewMessage';
-import { deliveryLine, restartNote, type DeliveryLine, type RecipientConnection } from '../deliveryLine';
+import { autoAfterText, deliveryLine, restartNote, TURN_ENDED_TEXT, waitInputs, type DeliveryLine, type RecipientConnection } from '../deliveryLine';
 import { RestartLine } from './RestartNote';
+import { UndeliveredBand, UndeliveredText, useMinuteClock } from './Undelivered';
 import { SendToAnotherSession } from '../compose/SendToAnotherSession';
 import { ComposeFileTiles, attachedAnnouncement, useComposeFiles } from '../compose/ComposeFiles';
 import {
@@ -53,6 +56,7 @@ import { ReaskNote } from './ReaskNote';
 import { reaskedIn, reaskNoteAgent, reaskOffered, reaskTargets, reaskTooltip } from '../reask';
 import { ChangedNotice, ReplacedQuestionCard, ReplacesLine, StaleGuard, replacedBy, replacementOf, type JumpTarget } from './ReplacedQuestion';
 import { InboxComposerField } from './ComposerField';
+import { ReplyAnswers, draftAnswerWords, type DraftAnswer } from './ReplyAnswers';
 import { SkillsLine } from './SkillsLine';
 import { paintSkillReferences } from '../skillHighlight';
 import { paintTagReferences, type TagMarkPlace } from '../tagHighlight';
@@ -62,10 +66,15 @@ import type { MentionSource } from '@plannotator/ui/utils/mentions';
 import { TAG_TOKEN_CLASS } from './ComposerField';
 import { HostMark } from '../icons';
 import { INBOX_REPLY_SKILL_AUDIENCE, annotationSkillTexts, inboxSkillsBlock, withSkillsBlock } from '../skills';
+import { ActionChecklist, type ActionMark } from './ActionChecklist';
+import { actionForBlock } from '../actions';
 import { splitInboxSkillsBlock } from '@plannotator/core/skill-reference-block';
 import { Tip } from './Tip';
+import { OpenQuestionsButton } from './OpenQuestions';
+import { laidOutChildren, pillHitsButtons } from '../footFit';
+import { openQuestionsShown, placeOf, threadOpenQuestions, type OpenQuestionPlace } from '../openQuestions';
 import { selectionToolbarShowing } from '../selectionToolbar';
-import { routeSendAnnotations, sendTargetsOf, type SendTarget } from '../sendTargets';
+import { replyKeysToRenew, routeSendAnnotations, sendTargetAnswerIds, sendTargetsOf, type SendTarget, type SentContents } from '../sendTargets';
 
 export { routeSendAnnotations, sendTargetsOf, type SendTarget };
 
@@ -157,7 +166,7 @@ function HoldingChips({ holdings }: { holdings: Holding[] }) {
   return (
     <span className="ib-fl-chips" data-holdings="">
       {holdings.map((h) => (
-        <span key={h.kind} className={`ib-fl-chip${h.kind === 'open' ? ' ib-fl-open' : h.kind === 'picks' ? ' ib-fl-pick' : ''}`} data-holding={h.kind}>
+        <span key={h.kind} className={`ib-fl-chip${h.kind === 'open' || h.kind === 'todo' ? ' ib-fl-open' : h.kind === 'picks' ? ' ib-fl-pick' : ''}`} data-holding={h.kind}>
           {h.kind === 'answered' || h.kind === 'delivered' ? <Icon name="check" size={14} /> : null}
           {h.kind === 'files' ? <Icon name="clip" size={14} /> : null}
           {h.kind === 'annotations' ? <Icon name="doc" size={14} /> : null}
@@ -169,42 +178,8 @@ function HoldingChips({ holdings }: { holdings: Holding[] }) {
   );
 }
 
-/** The skip chip's state: the default, or the person's choice for this Send. */
-export type SkipChoice = 'auto' | 'skip' | 'keep';
-
-/**
- * Whether a Send skips the questions it leaves unanswered. By default only
- * when it answers at least one question: a reply of words (or annotations)
- * alone leaves them all open. The chip's choice wins either way.
- */
-export function skipsUnanswered(choice: SkipChoice, answersAny: boolean): boolean {
-  return choice === 'skip' || (choice === 'auto' && answersAny);
-}
-
 /** A wire message's question states, for the shared asking rule. */
 const questionStatesOf = (message: InboxMessageWire): InboxQuestionState[] => (message.questions ?? []).map((q) => q.state);
-
-/**
- * Whether a Send now would carry at least one answer: a saved pick not yet
- * sent, or one being saved (`pending`, keyed `<message id>/<key>`; null is a
- * pick being cleared).
- */
-export function sendAnswersAny(thread: InboxThread, pending: ReadonlyMap<string, QuestionAnswer | null> = new Map()): boolean {
-  // Nothing being saved: the shared default (core inbox-delivery), which the list row's delivery reads too.
-  if (pending.size === 0) return inboxDefaultSkip(thread.messages.filter((m) => m.author.kind === 'agent'), questionStatesOf);
-  for (const m of thread.messages) {
-    if (m.author.kind !== 'agent') continue;
-    for (const q of m.questions ?? []) {
-      const id = `${m.id}/${q.key}`;
-      if (pending.has(id)) {
-        if (pending.get(id) !== null && (q.state === 'open' || q.state === 'picked')) return true;
-      } else if (q.state === 'picked') {
-        return true;
-      }
-    }
-  }
-  return false;
-}
 
 /**
  * The session a Send reaches, when its message names one: the last target's
@@ -214,14 +189,31 @@ export function sendAnswersAny(thread: InboxThread, pending: ReadonlyMap<string,
  * carried words receives nothing, so its session is not asked about). With
  * nothing to send, the latest agent message's.
  */
-function askingSessionOf(thread: InboxThread, options: { skip: boolean; carries: boolean }): AskingSession | null {
-  // Nothing rides on the latest message: the shared rule the list row's delivery uses too (core inbox-delivery).
+function askingSessionOf(thread: InboxThread, options: { skip: ReadonlySet<string>; carries: boolean }): AskingSession | null {
+  // Nothing rides on the latest message: the shared rule the list row's delivery uses too (core
+  // inbox-delivery), plus the questions the person chose to skip, when any.
   const message = options.carries
     ? sendTargetsOf(thread, options.skip).at(-1)!.message
-    : inboxAskingMessage(thread.messages, questionStatesOf, options.skip);
+    : (lastSkipOrPick(thread, options.skip) ?? inboxAskingMessage(thread.messages, questionStatesOf, false));
   if (!message) return null;
   if (message.author.kind !== 'agent' || !message.author.session) return null;
   return { message, session: message.author.session, host: message.author.host ?? '', name: agentName(message.author) };
+}
+
+/** The last agent message a pick or a chosen skip answers (null when the person chose no skip: the shared rule decides). */
+function lastSkipOrPick(thread: InboxThread, skip: ReadonlySet<string>): InboxMessageWire | null {
+  if (skip.size === 0) return null;
+  let found: InboxMessageWire | null = null;
+  for (const m of thread.messages) {
+    if (m.author.kind !== 'agent') continue;
+    if ((m.questions ?? []).some((q) => q.state === 'picked' || (q.state === 'open' && skip.has(`${m.id}/${q.key}`)))) found = m;
+  }
+  return found;
+}
+
+/** The key a reply of a Send keeps across retries: one per session (a message with no session is its own). */
+function replyKeyOf(message: InboxMessageWire): string {
+  return message.author.kind === 'agent' && message.author.session ? `s:${message.author.host ?? ''}\u0000${message.author.session}` : `m:${message.id}`;
 }
 
 /** The sessions a comment tags with `@` (ui's `Annotation.mentions`): a tag there sends the whole reply to them. */
@@ -243,6 +235,7 @@ export function MessageBody({
   footerFor,
   renderReplacedCard,
   renderReplacesLine,
+  renderActions,
   comments,
 }: {
   message: InboxMessageWire;
@@ -262,6 +255,17 @@ export function MessageBody({
   renderReplacedCard?: (key: string, number: number) => React.ReactNode | undefined;
   /** The "Replaces …" line under a question's prompt, or null. */
   renderReplacesLine?: (key: string) => React.ReactNode;
+  /**
+   * Action items (approval "action-items-checklist"): each run of adjacent
+   * `:::action` blocks (blank lines between them only) is drawn as one card
+   * in place of the run's first block; the run's other blocks draw nothing.
+   * `recordFor` names the record a block draws (null: the block stays text
+   * and ends the run); `render` draws a run's records, in body order.
+   */
+  renderActions?: {
+    recordFor: (block: { startLine: number; content: string }) => InboxQuestion | null;
+    render: (records: InboxQuestion[]) => React.ReactNode;
+  };
   /**
    * Comments on the text (an agent's message that can still be answered;
    * approval "inbox-message-comments"): the person's comments on this message
@@ -441,6 +445,38 @@ export function MessageBody({
     (question: IndexedQuestion) => replacesRef.current?.(question.question.key) ?? null,
     [message.questions],
   );
+  // Action items: one checklist card per run of adjacent `:::action` blocks, in place of
+  // the run's first block; the run's other blocks draw nothing (inbox.css hides their empty
+  // wrapper). Prose between two blocks ends a run, so each stays where the agent put it.
+  const actionsRef = useRef(renderActions);
+  actionsRef.current = renderActions;
+  const actionRuns = useMemo(() => {
+    const runs = new Map<string, { first: boolean; records: InboxQuestion[] }>();
+    const draw = actionsRef.current;
+    if (!draw) return runs;
+    let run: InboxQuestion[] | null = null;
+    for (const block of blocks) {
+      const record = block.type === 'directive' && block.directiveKind === 'action' ? draw.recordFor(block) : null;
+      if (!record) {
+        run = null;
+        continue;
+      }
+      const first = run === null;
+      if (run === null) run = [];
+      run.push(record);
+      runs.set(block.id, { first, records: run });
+    }
+    return runs;
+  }, [blocks, message.actions, renderActions !== undefined]);
+  const directiveBlock = useCallback(
+    (block: Block) => {
+      if (block.directiveKind !== 'action') return undefined;
+      const run = actionRuns.get(block.id);
+      if (!run) return undefined;
+      return run.first ? actionsRef.current?.render(run.records) : null;
+    },
+    [actionRuns],
+  );
 
   // ── Comments on the text (approval "inbox-message-comments") ──────────────
   // The highlights are drawn once per mount for the comments already saved;
@@ -548,6 +584,7 @@ export function MessageBody({
         questionStatusLabel={statusLabel}
         renderQuestionCard={renderReplacedCard ? questionCard : undefined}
         renderQuestionBelowPrompt={renderReplacesLine ? belowPrompt : undefined}
+        renderDirectiveBlock={renderActions ? directiveBlock : undefined}
       />
       {skills && <SkillsLine split={skills} />}
       {tagLabels && (
@@ -581,10 +618,10 @@ export interface ThreadPaneProps {
   draftChanged?: number;
   onClose: () => void;
   /** The attachment open beside the thread (`#…&file=att_…`), its version, and an annotation to show. */
-  file: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null } | null;
+  file: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null; view?: 'full' | 'side' | null } | null;
   /** `replace`: swap the history entry (stepping between files), so Back returns to the thread in one press. */
   /** `back`: the browser's Back when the entry on screen was opened from `file` (a linked page's Back), else a new entry. */
-  onOpenFile: (file: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null } | null, options?: { replace?: boolean; back?: boolean }) => void;
+  onOpenFile: (file: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null; view?: 'full' | 'side' | null } | null, options?: { replace?: boolean; back?: boolean }) => void;
   /** Open the guided review a message carries (the record's 4.2). */
   onOpenGuide: (messageId: string) => void;
   /**
@@ -624,6 +661,13 @@ export interface ThreadPaneProps {
    * agent for the toast. Absent: no Looks good button.
    */
   onAck?: (messageId: string, on: boolean, agent: string) => void;
+  /**
+   * An action item's Done or Can't do it (`mark`), or its Undo (`null`), approval
+   * "inbox-next-actions": the window writes it and shows the toast with
+   * Undo. Resolves false when it was refused. Absent: the pane writes it
+   * itself and reads the thread again.
+   */
+  onAction?: (messageId: string, key: string, mark: ActionMark | null, info: { agent: string; prompt: string }) => Promise<boolean>;
   /** Archive (`true`) or Unarchive. Absent: the pane calls the resolve route itself. */
   onArchive?: (archived: boolean) => void;
   /** The thread whose reply box should open (the warning toast's Reply); the pane calls `onReplyOpened` once it has. */
@@ -655,6 +699,8 @@ export interface ThreadPaneProps {
    * list back and put focus on this thread's row. Absent: no such button.
    */
   onBackToList?: (fileName: string | null) => void;
+  /** The window's one toast: "Files open side by side now" with Undo, when a picked view becomes the remembered one. */
+  onToast?: (toast: Omit<InboxToastModel, 'id'>) => void;
   /**
    * A search result to land on (`#thread=…&msg=…`): the message is unfolded
    * if folded or hidden in the middle fold, scrolled to the centre, focused
@@ -721,8 +767,18 @@ export function ackPillLine(
   wakes: boolean,
   time: (iso: string) => string = whenTime,
   connection?: RecipientConnection | null,
+  now: number = Date.now(),
 ): { state: AckPillState; text: string } {
-  if (ack.delivered_at) return { state: 'delivered', text: `Delivered to ${agent}, ${time(ack.delivered_at)}` };
+  if (ack.delivered_at) {
+    // Marked by the Inbox to go in by itself: say how it went in (into the running turn, or when it ended).
+    const marked = ack.deliver_now_by === 'auto' && ack.deliver_now_at && ack.wait_started_at;
+    const auto = !marked
+      ? ''
+      : ack.delivered_into_turn === false
+        ? ` · ${TURN_ENDED_TEXT}`
+        : ` · ${autoAfterText(wholeMinutes(ack.wait_started_at!, ack.deliver_now_at!))}`;
+    return { state: 'delivered', text: `Delivered to ${agent}, ${time(ack.delivered_at)}${auto}` };
+  }
   // The window ended after the person replied, or the agent wrote again: it was not sent.
   if (ack.not_sent === 'replied') return { state: 'not-sent', text: 'not sent: you replied' };
   if (ack.not_sent === 'wrote_again') return { state: 'not-sent', text: `not sent: ${agent} wrote again` };
@@ -730,7 +786,18 @@ export function ackPillLine(
   if (ack.settled_seq == null) return { state: 'pending', text: `${you}goes to ${agent} in a few seconds` };
   // A 👍 settled before it was sent through (no note) never reaches a wake: it waits for a read.
   if (wakes && ack.note_id) {
-    const line = deliveryLine({ name: agent, deliveredAt: null, time, wakes: true, sendingNow: false, connection });
+    const line = deliveryLine({
+      name: agent,
+      deliveredAt: null,
+      time,
+      wakes: true,
+      sendingNow: !!ack.deliver_now_at,
+      connection,
+      // It waits on a busy session: "Undelivered N min"; a 👍 waits for the turn to end (INBOX_AUTO_SEND_ACK_NOTES), no countdown.
+      ...waitInputs(connection, ack.note_id, { wait_started_at: ack.wait_started_at, deliver_now_by: ack.deliver_now_by, deliver_now_at: ack.deliver_now_at }),
+      ...(INBOX_AUTO_SEND_ACK_NOTES ? {} : { autoSendAfterMs: null }),
+      now,
+    });
     return { state: line.state === 'sending' ? 'sending' : 'queued', text: `${you}${line.text}` };
   }
   return { state: 'saved', text: `${you}Saved for ${agent}. It sees it when it next reads this thread.` };
@@ -749,7 +816,9 @@ export function AckPill({
   /** How the agent's session is connected now (the sessions route's `asker.connection`); undefined while unknown. */
   connection?: RecipientConnection | null;
 }) {
-  const line = ackPillLine(ack, agent, wakes, whenTime, connection);
+  // The wait on a busy session is written in whole minutes: its own clock, while the 👍 waits.
+  const now = useMinuteClock(!ack.delivered_at && !!ack.note_id);
+  const line = ackPillLine(ack, agent, wakes, whenTime, connection, now);
   return (
     <p className="ib-ackpill" data-ack-pill={line.state}>
       <span className="ib-ackchip">
@@ -798,7 +867,7 @@ async function replyLanded(threadId: string, key: string): Promise<'yes' | 'no' 
 
 const THREAD_GONE_TEXT = 'This thread was deleted, so nothing was sent.';
 
-export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged = 0, onClose, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, onScreenChange, row, onMarkRead, onAck, onArchive, replyRequest, onReplyOpened, backLabel = 'Inbox', phone = false, stacked = false, fileStacked = false, remote = false, onBackToList, landing = null, onLanded }: ThreadPaneProps) {
+export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged = 0, onClose, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, onScreenChange, row, onMarkRead, onAck, onAction, onArchive, replyRequest, onReplyOpened, backLabel = 'Inbox', phone = false, stacked = false, fileStacked = false, remote = false, onBackToList, onToast, landing = null, onLanded }: ThreadPaneProps) {
   // "Open in" (OpenIn.tsx): apps on this computer; a new tab only through the tailnet or on a phone.
   const openIn: OpenInSurface | undefined = phone || remote === true ? 'tab' : remote === null ? undefined : 'apps';
   const root = thread.messages[0]!;
@@ -821,11 +890,25 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   // message, offered only while no question in the thread waits on the person
   // (open or picked) and the thread is not archived.
   const ackTarget = agentMessages.at(-1) ?? null;
-  const questionWaits = agentMessages.some((m) => (m.questions ?? []).some((q) => q.state === 'open' || q.state === 'picked'));
+  // An action item counts like a question here (approval "inbox-next-actions"): the store refuses a 👍 while one waits.
+  const questionWaits = agentMessages.some((m) => [...(m.questions ?? []), ...(m.actions ?? [])].some((q) => q.state === 'open' || q.state === 'picked'));
   // Nor once the person wrote back after it (their reply is the answer; its Sent / Delivered line stays).
   const personWroteLast = lastNonNote(thread.messages)?.author.kind === 'person';
   const ackOffered = onAck !== undefined && ackTarget !== null && !archived && !questionWaits && !personWroteLast;
   const ackOn = ackTarget?.ack != null;
+
+  // Action items: Done / Can't do it / Undo, through the window (its toast and Undo) or, without it, straight to the server.
+  const markAction = async (messageId: string, key: string, mark: ActionMark | null, agent: string, prompt: string): Promise<boolean> => {
+    if (onAction) return onAction(messageId, key, mark, { agent, prompt });
+    try {
+      await inboxApi.markAction(messageId, key, mark);
+      await onChanged();
+      return true;
+    } catch {
+      await onChanged();
+      return false;
+    }
+  };
 
   // Picks saved at once; shown before the server answers, then from the server.
   const [pending, setPending] = useState<ReadonlyMap<string, QuestionAnswer | null>>(new Map());
@@ -868,15 +951,13 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     replyFiles.reset();
   };
   /**
-   * What this Send does with the questions it leaves unanswered: `auto` skips
-   * them once the Send answers at least one question and keeps them open
-   * otherwise (a reply of words alone leaves every question open, approval
-   * "inbox-words-only-reply"); the chip's button picks `skip` or `keep`.
+   * The questions the person chose to skip with this Send ("Skip them" on the
+   * chip), as `<message id>/<key>`: the ones the chip counted when it was
+   * pressed, so a question that lands later is never skipped. Null, the
+   * default: a Send skips nothing (approval "inbox-explicit-skip",
+   * 2026-10-21). It holds for one Send.
    */
-  const [skipChoice, setSkipChoice] = useState<SkipChoice>('auto');
-  /** Keep open: this Send leaves the unanswered questions open instead of skipping them. */
-  const keepOpen = !skipsUnanswered(skipChoice, sendAnswersAny(thread, pending));
-  const toggleKeepOpen = () => setSkipChoice(keepOpen ? 'skip' : 'keep');
+  const [skipArmed, setSkipArmed] = useState<ReadonlySet<string> | null>(null);
   const [sending, setSending] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const sendKeys = useRef<Map<string, string> | null>(null);
@@ -886,7 +967,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
    * that carries them, so it is never answered as the earlier reply (which
    * may have gone through) and silently dropped.
    */
-  const sendContents = useRef<Map<string, string> | null>(null);
+  const sendContents = useRef<Map<string, SentContents> | null>(null);
   const textRef = useRef<HTMLTextAreaElement>(null);
   // The box is read-only while a Send is on its way (approval "inbox-reply-drafts"): the words it carries are
   // the words in the box, and nothing typed meanwhile can be saved as a draft the Send then clears.
@@ -938,7 +1019,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   // A reply the person sends during this visit is a look at everything before
   // it (the list's rule), so what it answers stops being new at once.
   const boundary = useMemo(
-    () => (opened === null ? null : Math.max(opened, ...thread.messages.filter(isPersonReply).map((m) => m.seq ?? 0))),
+    () => (opened === null ? null : Math.max(opened, ...thread.messages.filter(isPersonLook).map((m) => m.seq ?? 0))),
     [opened, thread.messages],
   );
   const fresh = useMemo(() => newSinceLook(thread.messages, boundary), [thread.messages, boundary]);
@@ -1047,6 +1128,9 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     });
     return true;
   }, []);
+
+  // Replaced-question cards link `#123` refs into the project's repo, as message bodies do.
+  const threadRefRepo = useRefRepo(thread.project.repo ?? null);
 
   /** Scroll to a card or a message, focus it, and ring it briefly; a folded message opens first. */
   const jumpTo = useCallback((target: JumpTarget) => {
@@ -1189,7 +1273,23 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   // the Send actually reaches: the latest agent message's when words or
   // annotations ride on it, else the last message a pick or a skip answers.
   // Only finished uploads count: a tile still uploading or refused is not what Send carries.
-  const asking = askingSessionOf(thread, { skip: !keepOpen, carries: boxWords !== '' || records.length > 0 || replyUploads.length > 0 });
+  // What a Send leaves unanswered: every question still open with no pick (one being saved counts as picked).
+  const unanswered = thread.messages.flatMap((m) =>
+    m.author.kind === 'agent'
+      ? (m.questions ?? []).filter((q) => {
+          if (q.state !== 'open') return false;
+          const id = `${m.id}/${q.key}`;
+          return !(pending.has(id) && pending.get(id) !== null);
+        }).map((q) => ({ id: `${m.id}/${q.key}`, question: q }))
+      : [],
+  );
+  /** What this Send skips: only what the person chose with "Skip them", while still unanswered. */
+  const skipIds = skipArmed ? new Set(unanswered.filter((u) => skipArmed.has(u.id)).map((u) => u.id)) : new Set<string>();
+  /** Keep open, the default: this Send leaves every unanswered question open. */
+  const keepOpen = skipIds.size === 0;
+  const toggleKeepOpen = () => setSkipArmed(keepOpen ? new Set(unanswered.map((u) => u.id)) : null);
+  const skipping = !keepOpen;
+  const asking = askingSessionOf(thread, { skip: skipIds, carries: boxWords !== '' || records.length > 0 || replyUploads.length > 0 });
   const askerToWatch = asking && askerCanEnd(asking) ? asking.session : null;
   // New message (record 5.x): the project's live sessions, and what the button opened.
   const { model: live, load: loadLive } = useLiveSessions(thread.thread_id, askerToWatch);
@@ -1301,21 +1401,69 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
    * Inbox does not follow plan review's shared hide-tools choice). A step
    * keeps it.
    */
-  const [full, setFull] = useState(false);
+  // The view rides the address (`view=full|side`; fileView.ts): a link without it opens by the remembered choice, else by kind.
+  const fileAttachment = file ? (allFiles.find((a) => a.id === file.id) ?? null) : null;
+  const viewOf = (narrow: boolean) =>
+    file ? fileViewFor(fileAttachment ?? { kind: 'file' }, { address: parseFileView(file.view), choice: readFileViewChoice(), narrow }) : 'side';
+  /** The view the file is in, as the address carries it (a phone's or a stacked window's room left out). */
+  const full = viewOf(false) === 'full';
+  /** What the window shows: full screen also wherever there is no room for the file beside the thread. */
+  const shownFull = viewOf(phone || fileStacked) === 'full';
+  /** The view the open file is in, carried by every route change that keeps the frame (a step, a version, a linked page). */
+  const currentView: FileView = full ? 'full' : 'side';
+  const fileRef = useRef(file);
+  fileRef.current = file;
+  /** Switch the open file's view in place (the same history entry). Escape's last rung, a Send: never saved. */
+  const setFull = (next: boolean) => {
+    const current = fileRef.current;
+    if (current) onOpenFile({ ...current, view: next ? 'full' : 'side' }, { replace: true });
+  };
+  /**
+   * The person picked a view with a button: it applies now and to every
+   * file opened next. A phone or a stacked window has no such button and
+   * saves nothing. `next` is the view on screen when the person pressed the
+   * switch's pressed half (it saves the choice, the frame stays). When the
+   * remembered choice changes, the window's toast says so once, with Undo:
+   * the old choice back and, if the press moved this file and it is still
+   * the one open, its old view; another file open by then keeps its frame.
+   */
+  const pickView = (next: FileView) => {
+    const pickedOn = fileRef.current?.id ?? null;
+    const viewBefore = currentView;
+    setFull(next === 'full');
+    if (phone || fileStacked) return;
+    const before = readFileViewChoice();
+    writeFileViewChoice(next);
+    if (before === next) return;
+    const lead = next === 'side' ? 'Files open side by side now' : 'Files open full screen now';
+    const detail = next === 'side' ? 'until you choose Full screen' : 'until you choose Side by side';
+    onToast?.({
+      icon: 'check',
+      lead,
+      detail,
+      speech: `${lead}, ${detail}.`,
+      onUndo: () => {
+        writeFileViewChoice(before);
+        if (viewBefore !== next && pickedOn !== null && fileRef.current?.id === pickedOn) setFull(viewBefore === 'full');
+      },
+    });
+  };
   /** Bumped when the person opens a file, so focus moves into its pane. */
   const [paneFocus, setPaneFocus] = useState(0);
   const paneRef = useRef<AttachmentPaneHandle>(null);
   /** Every attachment of the thread in thread order: what the pane steps through. */
   const steps = useMemo(() => attachmentSequence(thread.messages, attachments, inlineImages), [thread.messages, attachments, inlineImages]);
-  const openFile = (attachment: Pick<InboxAttachmentState, 'id' | 'kind' | 'ref'>, version: 'current' | 'sent' = 'current', focus: string | null = null) => {
-    // HTML opens full screen; so does an image from a message's text (approval "inbox-image-viewer"). Documents open beside the thread.
-    setFull(attachment.kind === 'html' || attachment.ref !== undefined);
-    onOpenFile({ id: attachment.id, version, focus });
+  const openFile = (attachment: Pick<InboxAttachmentState, 'id' | 'kind' | 'ref'>, version: 'current' | 'sent' = 'current', focus: string | null = null, view: FileView | null = null) => {
+    // A tile's ⋯ names a view for this file alone. The file already open keeps the view it is in (a comment
+    // card in the reply box, its tile again: a one-off view from the ⋯ stays). Else the remembered choice,
+    // else today's rule (fileView.ts).
+    const kept = file && file.id === attachment.id ? currentView : null;
+    onOpenFile({ id: attachment.id, version, focus, view: view ?? kept ?? openingView(attachment) });
   };
   /** A tile, or a link in a message: the file as it is now, focus in its pane (a typed comment in the open file asks first). */
-  const openFromMessage = (attachment: Pick<InboxAttachmentState, 'id' | 'kind' | 'ref'> & { name?: string }) => {
+  const openFromMessage = (attachment: Pick<InboxAttachmentState, 'id' | 'kind' | 'ref'> & { name?: string }, view: FileView | null = null) => {
     const go = () => {
-      openFile(attachment);
+      openFile(attachment, 'current', null, view);
       setPaneFocus((n) => n + 1);
     };
     const pane = paneRef.current;
@@ -1423,7 +1571,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     setStale([]);
     setGuard(false);
     setRoute(CLOSED_ROUTE);
-    setSkipChoice('auto');
+    setSkipArmed(null);
     sendKeys.current = null;
     sendContents.current = null;
     revisions.current.clear();
@@ -1466,7 +1614,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   const arrivalIds = useMemo(() => new Set(arrivals.map((m) => m.id)), [arrivals]);
   const candidates = arrivals.filter((m) => !sightedIds.has(m.id) && !fold.folded.has(m.id) && !hiddenNow.has(m.id)).map((m) => m.id);
   /** A file over the thread: full screen, or where it cannot sit beside it (a phone, a stacked window). */
-  const fileCovers = file !== null && (full || phone || fileStacked);
+  const fileCovers = file !== null && shownFull;
   const arrivalsRef = useRef(arrivals);
   arrivalsRef.current = arrivals;
   const sightedRef = useRef(sightedIds);
@@ -1776,8 +1924,8 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     if (!q) return null;
     if (q.state === 'sent') {
       const at = sentAt(q.sent_reply_id);
-      // A Send skipped it because the person left it unanswered.
-      if (q.answer?.skipped && q.answer.by_reply) return at ? `Skipped with your reply · ${whenTime(at)}` : 'Skipped with your reply';
+      // The person skipped it with "Skip them" on the Send (approval "inbox-explicit-skip").
+      if (q.answer?.skipped && q.answer.by_reply) return at ? `Skipped · ${whenTime(at)}` : 'Skipped';
       return at ? `Sent ${whenTime(at)}` : 'Sent';
     }
     if (q.state === 'closed' && q.set_aside_at) return `Closed unanswered when you marked it read · ${whenTime(q.set_aside_at)}`;
@@ -1814,26 +1962,29 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   const waiting = picksCount > 0 || records.length > 0;
   /** The box is closed and its words are kept as a draft (Cancel or Escape kept them): Edit draft brings them back. */
   const draftKept = !box.open && (replyDraft.draft !== null || replyDraft.conflict !== null);
-  // What a Send skips: every question still open with no pick (one being
-  // saved counts as picked), unless the person pressed Keep open.
-  const unanswered = thread.messages.flatMap((m) =>
-    m.author.kind === 'agent'
-      ? (m.questions ?? []).filter((q) => {
-          if (q.state !== 'open') return false;
-          const id = `${m.id}/${q.key}`;
-          return !(pending.has(id) && pending.get(id) !== null);
-        })
-      : [],
-  );
-  const skipping = !keepOpen && unanswered.length > 0;
 
-  const openBox = (withDraft: boolean) => {
+  // The answers this reply carries, as the cards show them now: a saved pick, or one being
+  // saved. The box lists them live (ReplyAnswers); they never go into the words, where a
+  // summary written once would go stale as the person picks on and reach the agent twice
+  // (the Send carries every answer under "Answers to your questions").
+  const draftAnswers: DraftAnswer[] = thread.messages.flatMap((m) =>
+    m.author.kind !== 'agent'
+      ? []
+      : (m.questions ?? []).flatMap((q) => {
+          if (q.state !== 'open' && q.state !== 'picked') return [];
+          const id = `${m.id}/${q.key}`;
+          const answer = pending.has(id) ? pending.get(id)! : q.answer;
+          if (!answer || isQuestionAnswerEmpty(answer)) return [];
+          return [{ id, messageId: m.id, key: q.key, number: q.position + 1, prompt: q.prompt, answer: draftAnswerWords(answer), messageName: `${agentName(m.author)}'s message, ${whenTime(m.created_at)}` }];
+        }),
+  );
+
+  const openBox = () => {
     setNewMessage(null);
     setRoute((current) => ({ ...current, open: false, error: null }));
-    const draft = withDraft ? picked.map((q) => (q.answer ? `${q.prompt.replace(/[?.!]\s*$/, '')}: ${answerWords(q.answer)}.` : '')).filter(Boolean).join(' ') : '';
-    // A draft's words come back as they were; picks only seed the box when there are none.
+    // A draft's words come back as they were; the picks are listed beside them, never written in.
     const kept = replyDraft.conflict ?? replyDraft.draft?.body ?? '';
-    setBox({ open: true, text: kept.trim() ? kept : draft });
+    setBox({ open: true, text: kept.trim() ? kept : '' });
     setError(null);
   };
 
@@ -1946,7 +2097,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     sendContents.current = null;
     unconfirmed.delete(threadRef.current.thread_id);
     setRoute(CLOSED_ROUTE);
-    setSkipChoice('auto');
+    setSkipArmed(null);
     const carried = new Set(carriedUploads);
     const sentFiles = new Set(replyFiles.current().filter((f) => f.upload && carried.has(f.upload.upload_id)).map((f) => f.key));
     const later = replyFiles.current().some((f) => !sentFiles.has(f.key));
@@ -2052,14 +2203,15 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
         draftSavedAs = kept?.updated_at ?? null;
       }
       sendWords = words;
-      // A pick saved just now, or still being saved when Send was pressed, counts as an answer.
-      const skip = skipsUnanswered(skipChoice, sendAnswersAny(current) || sendAnswersAny(thread, pending));
+      // Only the questions the person chose to skip, and only while still open (sendTargetsOf reads the
+      // thread as it is now): a pick saved meanwhile is sent instead, a question that landed is left open.
+      const skip = skipArmed ?? new Set<string>();
       const pendingAnnotations = records;
       const uploads = box.open ? replyUploads : [];
       const carries = words !== '' || pendingAnnotations.length > 0 || uploads.length > 0;
-      // The latest agent message rides last only to carry the words, the
+      // One reply per session. The latest agent message rides last only to carry the words, the
       // annotations and the pasted files; with none, a target with nothing to send is left out.
-      const plain = sendTargetsOf(current, skip).filter((t, index, all) => t.questions.length > 0 || t.skips || (carries && index === all.length - 1));
+      const plain = sendTargetsOf(current, skip).filter((t, index, all) => t.questions.length > 0 || t.skip.length > 0 || (carries && index === all.length - 1));
       // A comment on another session's message rides a reply to that message (routeSendAnnotations).
       const { targets, carried } = routeSendAnnotations(current, plain, pendingAnnotations);
       if (targets.length === 0) {
@@ -2075,20 +2227,25 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
         tagOpts,
       );
       if (!sendKeys.current) sendKeys.current = new Map();
-      for (const t of targets) if (!sendKeys.current.has(t.message.id)) sendKeys.current.set(t.message.id, crypto.randomUUID());
-      // A retry whose words, files or annotations changed: each reply carrying them is a new one.
-      const contents = new Map(
+      // One key per session's reply, kept for a retry.
+      for (const t of targets) if (!sendKeys.current.has(replyKeyOf(t.message))) sendKeys.current.set(replyKeyOf(t.message), crypto.randomUUID());
+      // A retry whose words, files or annotations changed, or that carries a pick or skip the last try did
+      // not: each reply carrying them is a new one (a replay of the old key would drop the new answer). A pick
+      // that went with the last try and is now sent only leaves the list, which keeps the key.
+      const contents = new Map<string, SentContents>(
         targets.map((t) => [
-          t.message.id,
-          JSON.stringify([
-            t.message.id === lastId ? [words, uploads, sendTags.get(lastId) ?? []] : [],
-            (carried.get(t.message.id) ?? []).map((r) => [r.id, r.updated_at]),
-          ]),
+          replyKeyOf(t.message),
+          {
+            value: JSON.stringify([
+              t.message.id,
+              t.message.id === lastId ? [words, uploads, sendTags.get(lastId) ?? []] : [],
+              (carried.get(t.message.id) ?? []).map((r) => [r.id, r.updated_at]),
+            ]),
+            answers: sendTargetAnswerIds(t),
+          },
         ]),
       );
-      if (sendContents.current) {
-        for (const [id, value] of contents) if (sendContents.current.has(id) && sendContents.current.get(id) !== value) sendKeys.current.set(id, crypto.randomUUID());
-      }
+      for (const id of replyKeysToRenew(sendContents.current, contents)) sendKeys.current.set(id, crypto.randomUUID());
       sendContents.current = contents;
       // The words and the annotations ride the last reply, after its picks;
       // a comment on another session's message rides the reply to it. The
@@ -2103,10 +2260,10 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
         // The agents tagged anywhere in this Send ride the last reply (a tag in a file comment sends the whole reply).
         const tags = sendTags.get(target.message.id) ?? [];
         requests.push({ messageId: target.message.id, input: {
-          idempotency_key: sendKeys.current.get(target.message.id) ?? crypto.randomUUID(),
+          idempotency_key: sendKeys.current.get(replyKeyOf(target.message)) ?? crypto.randomUUID(),
           words: last ? words : '',
           questions: target.questions,
-          skip_unanswered: skip,
+          ...(target.skip.length > 0 ? { skip: target.skip } : {}),
           ...(feedback ? { feedback } : {}),
           ...(own.length > 0 ? { annotation_ids: own.map((r) => r.id) } : {}),
           // The pasted files ride the reply that carries the words, as attachments.
@@ -2254,7 +2411,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   const { connections: tagConnections, load: loadTagConnections } = useTagConnections(thread.thread_id, waitingTags, waitingTags.length > 0);
   const tagLines = lastTags.map((tag) => {
     const name = tagName(tag, ownerHost, replySession);
-    return { tag, name, line: tagDeliveryLine(tag, name, tagConnections[tag.session], whenTime) };
+    return { tag, name, line: tagDeliveryLine(tag, name, tagConnections[tag.session], whenTime, last.id) };
   });
   const delivered: DeliveryLine | null =
     last.author.kind !== 'person'
@@ -2268,6 +2425,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
             sendingNow: !!last.deliver_now_at,
             connection: recipientConnection,
             undelivered: undelivered ? { host: hostName(lastTo.host) } : null,
+            ...waitInputs(recipientConnection, last.id, { ...last, into_turn: last.delivery?.into_turn ?? null }),
           })
         : deliveryLine({
             name: asker,
@@ -2278,11 +2436,18 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
             sendingNow: !!last.deliver_now_at,
             connection: recipientConnection,
             askerEnded: askerEnded && asking ? { name: asking.name } : null,
+            ...waitInputs(recipientConnection, last.id, { ...last, into_turn: last.delivery?.into_turn ?? null }),
           });
   // No Send now because that session runs an older plugin than a restart loads (the "Steps" line,
   // owner approval "restart-warning"): only while the reply waits for a working session.
   const restartName = lastTo ? hostName(lastTo.host) : repliedTo?.author.kind === 'agent' && repliedTo.author.host ? hostName(repliedTo.author.host) : asker;
   const restart = delivered?.state === 'queued' && !last.deliver_now_at ? restartNote(recipientConnection) : null;
+  // The name the waiting band uses ("Claude Code", "Claude Code (another session)").
+  const ownerLineName = lastTo
+    ? last.to
+      ? toName(last, last.to)
+      : hostName(lastTo.host)
+    : asker;
   const [sendNowState, setSendNowState] = useState<{ id: string; busy: boolean; error: string | null } | null>(null);
   const sendNow = async () => {
     setSendNowState({ id: last.id, busy: true, error: null });
@@ -2377,7 +2542,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
       // A session with only picks: a plain reply carries them, so the Re-ask strands none (owner's rule 2).
       for (const target of targets.filter((t) => t.kind === 'picks')) {
         for (const reply of target.replies) {
-          await inboxApi.reply(reply.message.id, { idempotency_key: keyFor(`picks:${reply.message.id}`), words: '', questions: reply.questions, skip_unanswered: false });
+          await inboxApi.reply(reply.message.id, { idempotency_key: keyFor(`picks:${reply.message.id}`), words: '', questions: reply.questions });
           went += 1;
         }
       }
@@ -2404,6 +2569,44 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
     }
   };
 
+  // Open questions in this thread (approval "inbox-thread-open-questions", option A): the "N open questions"
+  // button beside Re-ask lists them, and a row takes the person to the card (unfolding its message).
+  const openQ = resolved && !cameBack ? { questions: [], replaced: 0 } : threadOpenQuestions(thread.messages, liveMessage);
+  const isFolded = (messageId: string) => fold.folded.has(messageId) || hiddenNow.has(messageId);
+  const openQShown = openQuestionsShown(openQ.questions, { messageCount: thread.messages.length, folded: isFolded });
+  /** Where each listed card sits now: in a folded message, or above or below the middle of the thread's view. */
+  const measureOpenQuestions = (): ReadonlyMap<string, OpenQuestionPlace> => {
+    const places = new Map<string, OpenQuestionPlace>();
+    const body = bodyRef.current;
+    const current = foldRef.current;
+    const hidden = new Set(current.hidden.flatMap((ids, index) => (current.revealed.has(index) ? [] : ids)));
+    const view = body?.getBoundingClientRect() ?? { top: 0, bottom: 0 };
+    for (const q of openQ.questions) {
+      if (current.folded.has(q.messageId) || hidden.has(q.messageId)) {
+        places.set(q.id, 'folded');
+        continue;
+      }
+      const card =
+        body?.querySelector<HTMLElement>(`[data-message-id="${CSS.escape(q.messageId)}"] [data-question-key="${CSS.escape(q.key)}"]`) ??
+        body?.querySelector<HTMLElement>(`[data-message-article="${CSS.escape(q.messageId)}"]`) ??
+        null;
+      places.set(q.id, placeOf(card?.getBoundingClientRect() ?? null, view));
+    }
+    return places;
+  };
+
+  // The error after a failed Send (or Re-ask) sits ABOVE the button row it belongs to (approval
+  // "thread-foot-status-right"), in the two states that have one: the reply box and the closed foot.
+  const errorAbove = !resolved && !(guard && staleQuestions.length > 0) && newMessage?.kind !== 'compose' && !(route.open && asking);
+  const errorLine = (
+    <div className="ib-error" role="alert" data-foot-error={errorAbove ? 'above' : undefined}>
+      {error}
+    </div>
+  );
+  // The closed foot's status (draft note, skip chip) describes Send and Edit draft: read with them, though drawn at the row's end.
+  const draftNoteId = `ib-foot-draft-${thread.thread_id}`;
+  const skipNoteId = `ib-foot-skip-${thread.thread_id}`;
+  const footStatusIds = [draftNoteId, waiting && unanswered.length > 0 ? skipNoteId : null].filter(Boolean).join(' ');
   const routeChoice = asking ? (
     <RouteChoice
       kind={routeFor}
@@ -2421,8 +2624,34 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   ) : null;
 
   // While new messages are below the view: a pill that goes to them.
+  // On a phone the pill sits over the middle of the foot's row; when a button lies under that middle, above the foot.
+  const footRowRef = useRef<HTMLDivElement>(null);
+  const [pillAbove, setPillAbove] = useState(false);
+  const pillOnRow = showNew && phone && !waiting && !draftKept;
+  const placePill = useCallback(() => {
+    const row = footRowRef.current;
+    const pill = row?.querySelector<HTMLElement>('.ib-npill');
+    const buttons = row?.querySelector('[data-foot-buttons]');
+    if (!row || !pill || !buttons) return;
+    const box = row.getBoundingClientRect();
+    if (box.width <= 0) return;
+    const size = pill.getBoundingClientRect();
+    const hits = pillHitsButtons(box, size, laidOutChildren(buttons).map((el) => el.getBoundingClientRect()));
+    setPillAbove((current) => (current === hits ? current : hits));
+  }, []);
+  // Every render (a button came or went, the count changed) and whenever the row resizes.
+  useLayoutEffect(() => {
+    if (pillOnRow) placePill();
+  });
+  useEffect(() => {
+    const row = footRowRef.current;
+    if (!pillOnRow || !row || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => placePill());
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [pillOnRow, placePill]);
   const newPill = (
-    <div className="ib-npill-wrap">
+    <div className="ib-npill-wrap" data-above={phone && pillAbove ? '' : undefined}>
       <button
         type="button"
         className="ib-npill"
@@ -2442,7 +2671,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   useEffect(() => {
     if (replyRequest !== thread.thread_id) return;
     onReplyOpened?.();
-    openBox(picksCount > 0);
+    openBox();
     // openBox reads this render's picks.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [replyRequest, thread.thread_id]);
@@ -2461,7 +2690,6 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
   const backToList = () => {
     const name = openAttachment?.name ?? null;
     const go = () => {
-      setFull(false);
       onBackToList!(name);
     };
     if (paneRef.current) paneRef.current.leave(null, go);
@@ -2727,7 +2955,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
             const replacement = q ? replacementOf(thread.messages, q) : null;
             if (!q || !replacement) return undefined;
             const answer = pending.has(`${message.id}/${key}`) ? (pending.get(`${message.id}/${key}`) ?? null) : q.answer;
-            return <ReplacedQuestionCard question={q} number={number} total={questions.length} replacement={replacement} answer={answer} onJump={jumpTo} />;
+            return <ReplacedQuestionCard question={q} number={number} total={questions.length} replacement={replacement} answer={answer} onJump={jumpTo} refRepo={threadRefRepo} />;
           };
           const replacesLine = (key: string) => {
             const q = questions.find((x) => x.key === key);
@@ -2836,7 +3064,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                   </Tip>
                   {isAgent && liveMessage(message) && (
                     <Tip content="Reply">
-                      <button type="button" className="ib-mut" onClick={() => openBox(picksCount > 0)} aria-label="Reply">
+                      <button type="button" className="ib-mut" onClick={() => openBox()} aria-label="Reply">
                         <Icon name="reply" size={15} />
                       </button>
                     </Tip>
@@ -2852,6 +3080,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                           attachments={messageFiles}
                           annotationCounts={countsByPath}
                           onOpen={openFromMessage}
+                          onOpenAs={phone || fileStacked ? undefined : openFromMessage}
                           openId={file && !full && !phone && !fileStacked ? file.id : null}
                           placement="header"
                           openIn={openIn}
@@ -2880,6 +3109,21 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                   footerFor={footerFor(message)}
                   renderReplacedCard={replacedCard}
                   renderReplacesLine={replacesLine}
+                  renderActions={
+                    isAgent && (message.actions?.length ?? 0) > 0
+                      ? {
+                          recordFor: (block) => actionForBlock(message.body, message.actions, block),
+                          render: (records) => (
+                            <ActionChecklist
+                              actions={records}
+                              agent={name}
+                              readOnly={!liveMessage(message)}
+                              onMark={(action, mark) => markAction(message.id, action.key, mark, name, action.prompt)}
+                            />
+                          ),
+                        }
+                      : undefined
+                  }
                   comments={
                     isAgent && liveMessage(message)
                       ? {
@@ -2898,6 +3142,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                     attachments={attachments.filter((a) => a.message_id === message.id)}
                     annotationCounts={countsByPath}
                     onOpen={openFromMessage}
+                    onOpenAs={phone || fileStacked ? undefined : openFromMessage}
                     openId={file && !full && !phone && !fileStacked ? file.id : null}
                     openIn={openIn}
                   />
@@ -2928,7 +3173,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                   <ul className="ib-tg-dl" data-tag-lines="" tabIndex={-1}>
                     <li data-tag-line={replySession ?? ''} data-delivery={delivered.state} data-owner="">
                       <HostMark host={ownerHost} />
-                      <span className="ib-dl-text">{delivered.text}</span>
+                      {delivered.wait ? <UndeliveredText wait={delivered.wait} name={ownerLineName} /> : <span className="ib-dl-text">{delivered.text}</span>}
                       {delivered.sendNow && (
                         <button type="button" className="ib-sendnow" data-send-now="" disabled={sendNowState?.id === last.id && sendNowState.busy} onClick={() => void sendNow()}>
                           Send now
@@ -2938,7 +3183,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                     {tagLines.map(({ tag, name, line }) => (
                       <li key={tag.session} data-tag-line={tag.session} data-delivery={line.state}>
                         <HostMark host={tag.host} />
-                        <span className="ib-dl-text">{line.text}</span>
+                        {line.wait ? <UndeliveredText wait={line.wait} name={name} /> : <span className="ib-dl-text">{line.text}</span>}
                         {line.sendNow && (
                           <button
                             type="button"
@@ -2960,9 +3205,20 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                     {tagSendNow.error}
                   </p>
                 )}
-                {message === last && delivered && tagLines.length === 0 && (
+                {message === last && delivered?.wait && tagLines.length === 0 && (
+                  // Waiting on a busy agent (approval "inbox-busy-agent-reply"): the band, with its own minute clock.
+                  <UndeliveredBand
+                    wait={delivered.wait}
+                    name={ownerLineName}
+                    onSendNow={delivered.sendNow ? () => void sendNow() : null}
+                    sending={sendNowState?.id === last.id && sendNowState.busy}
+                    restart={restart}
+                    restartName={restartName}
+                  />
+                )}
+                {message === last && delivered && !delivered.wait && tagLines.length === 0 && (
                   // tabIndex -1: Send to another session puts focus here once it moved the message.
-                  <div className="ib-delivered" data-delivery={delivered.state} tabIndex={-1}>
+                  <div className="ib-delivered" data-delivery={delivered.state} data-auto={delivered.autoAfterMin !== undefined ? '' : undefined} tabIndex={-1}>
                     <span className="ib-dl-main">
                       <Icon
                         name={delivered.state === 'undelivered' ? 'warn' : delivered.ended || delivered.state === 'queued' ? 'clock' : delivered.state === 'sending' ? 'send' : 'check'}
@@ -3146,15 +3402,17 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                   />
                 </div>
               )}
-              {(picksCount > 0 || dropped.length > 0 || takesAnnotations || unanswered.length > 0) && (
+              {draftAnswers.length > 0 && <ReplyAnswers answers={draftAnswers} onJump={jumpTo} />}
+              {(draftAnswers.length > 0 || dropped.length > 0 || takesAnnotations || unanswered.length > 0) && (
                 <div className={`ib-rfoot${keepOpen ? ' ib-keep' : ''}`}>
-                  {picksCount > 0 && (
+                  {/* The answers the list above shows, a pick still being saved included, so the two numbers agree. */}
+                  {draftAnswers.length > 0 && (
                     <span className="ib-rchip" data-picks-chip="">
                       <Icon name="check" size={13} />
-                      {plural(picksCount, 'pick')}
+                      {plural(draftAnswers.length, 'pick')}
                     </span>
                   )}
-                  <SkipChip count={unanswered.length} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
+                  <SkipChip count={keepOpen ? unanswered.length : skipIds.size} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
                   {dropped.length > 0 && (
                     <Tip content="Replaced; this pick won't be sent">
                       <span className="ib-rchip ib-dropped" data-dropped-picks-chip="">
@@ -3177,11 +3435,13 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
               )}
             </div>
             <div className="ib-sr" role="status">
-              {skipping ? `${plural(unanswered.length, 'unanswered question')} will be skipped when you send.` : ''}
+              {skipping ? `${plural(skipIds.size, 'question')} will be skipped when you send.` : ''}
             </div>
             {route.open && asking ? (
               routeChoice
             ) : (
+              <>
+              {error && errorLine}
               <div className="ib-acts">
                 <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending}>
                   <Icon name="send" size={15} />
@@ -3194,65 +3454,91 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
                 {/* The in-thread New message button is off (approval "inbox-acknowledge"); its route and code stay. */}
                 {SHOW_NEW_MESSAGE_BUTTON && !archived && <NewMessageButton live={live} mode={newMessage} onClick={() => void pressNewMessage()} />}
               </div>
+              </>
             )}
           </>
         ) : route.open && asking ? (
           routeChoice
         ) : (
           <>
-          <div className="ib-acts">
-            {(waiting || draftKept) && <DraftFootNote unsent={{ reply: draftKept, picks: picksCount, comments: records.length }} />}
-            {(waiting || draftKept) && (
-              <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending}>
-                <Icon name="send" size={15} />
-                Send
-              </button>
-            )}
-            <button type="button" className="ib-btn" onClick={() => openBox(picksCount > 0)} data-edit-draft={waiting || draftKept ? '' : undefined}>
-              <Icon name={waiting || draftKept ? 'pen' : 'reply'} size={15} />
-              {waiting || draftKept ? 'Edit draft' : 'Reply'}
-            </button>
-            {/* Re-ask (approval "inbox-reask"): the open questions again, in one message per session. */}
-            {reaskShown && (
-              <Tip content={reaskTooltip(reaskList)}>
-                <button type="button" className="ib-btn" ref={reaskRef} data-reask="" disabled={reasking} onClick={() => void sendReask()}>
-                  <Icon name="refresh" size={15} />
-                  Re-ask
+          {error && errorLine}
+          {/* Buttons on the left in today's order, the draft status and the skip chip at the right end (approval
+              "thread-foot-status-right", option A). Too narrow for one line, the status takes its own line ABOVE the
+              buttons (wrap-reverse; one item per line aligns to the start), so it never wraps between them. */}
+          <div className="ib-acts ib-footrow" data-foot-row="" ref={footRowRef}>
+            <div className="ib-footbtns" data-foot-buttons="">
+              {(waiting || draftKept) && (
+                <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending} aria-describedby={footStatusIds}>
+                  <Icon name="send" size={15} />
+                  Send
                 </button>
-              </Tip>
-            )}
-            {/* 👍 Looks good beside Reply: sent to the agent after the Undo window; hidden while a question waits. */}
-            {ackOffered && !waiting && !draftKept && (
-              <Tip
-                content={
-                  ackOn
-                    ? 'Take back Looks good'
-                    : `Tells ${agentName(ackTarget!.author)} you read it and need nothing more. Moves to Quiet until it writes again.`
-                }
+              )}
+              <button
+                type="button"
+                className="ib-btn"
+                onClick={() => openBox()}
+                data-edit-draft={waiting || draftKept ? '' : undefined}
+                data-reply-button=""
+                aria-describedby={waiting || draftKept ? footStatusIds : undefined}
               >
-                <button type="button" className="ib-btn ib-ack" data-ack="" aria-pressed={ackOn} onClick={() => onAck!(ackTarget!.id, !ackOn, agentName(ackTarget!.author))}>
-                  <span className="ib-ack-emoji" aria-hidden="true">
-                    👍
+                <Icon name={waiting || draftKept ? 'pen' : 'reply'} size={15} />
+                {waiting || draftKept ? 'Edit draft' : 'Reply'}
+              </button>
+              {/* Re-ask (approval "inbox-reask"): the open questions again, in one message per session. */}
+              {reaskShown && (
+                <Tip content={reaskTooltip(reaskList)}>
+                  <button type="button" className="ib-btn" ref={reaskRef} data-reask="" disabled={reasking} onClick={() => void sendReask()}>
+                    <Icon name="refresh" size={15} />
+                    Re-ask
+                  </button>
+                </Tip>
+              )}
+              {/* The thread's open questions (approval "inbox-thread-open-questions"): a list that takes the person to each card. */}
+              {openQShown && (
+                <OpenQuestionsButton
+                  questions={openQ.questions}
+                  replaced={openQ.replaced}
+                  phone={phone}
+                  measure={measureOpenQuestions}
+                  onPick={(q) => jumpTo({ kind: 'question', messageId: q.messageId, key: q.key })}
+                />
+              )}
+              {/* 👍 Looks good beside Reply: sent to the agent after the Undo window; hidden while a question waits. */}
+              {ackOffered && !waiting && !draftKept && (
+                <Tip
+                  content={
+                    ackOn
+                      ? 'Take back Looks good'
+                      : `Tells ${agentName(ackTarget!.author)} you read it and need nothing more. Moves to Quiet until it writes again.`
+                  }
+                >
+                  <button type="button" className="ib-btn ib-ack" data-ack="" aria-pressed={ackOn} onClick={() => onAck!(ackTarget!.id, !ackOn, agentName(ackTarget!.author))}>
+                    <span className="ib-ack-emoji" aria-hidden="true">
+                      👍
+                    </span>
+                    Looks good
+                  </button>
+                </Tip>
+              )}
+              {/* The in-thread New message button is off (approval "inbox-acknowledge", 2026-10-15): Reply and compose cover it.
+                  Its route, door row and code stay; turn SHOW_NEW_MESSAGE_BUTTON on to bring it back. */}
+              {SHOW_NEW_MESSAGE_BUTTON && !archived && <NewMessageButton live={live} mode={newMessage} onClick={() => void pressNewMessage()} />}
+            </div>
+            {(waiting || draftKept) && (
+              <div className="ib-footstatus" data-foot-status="">
+                <DraftFootNote id={draftNoteId} unsent={{ reply: draftKept, picks: picksCount, comments: records.length }} />
+                {waiting && unanswered.length > 0 && (
+                  <span className={keepOpen ? 'ib-keep' : undefined}>
+                    <SkipChip id={skipNoteId} count={keepOpen ? unanswered.length : skipIds.size} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
                   </span>
-                  Looks good
-                </button>
-              </Tip>
-            )}
-            {/* The in-thread New message button is off (approval "inbox-acknowledge", 2026-10-15): Reply and compose cover it.
-                Its route, door row and code stay; turn SHOW_NEW_MESSAGE_BUTTON on to bring it back. */}
-            {SHOW_NEW_MESSAGE_BUTTON && !archived && <NewMessageButton live={live} mode={newMessage} onClick={() => void pressNewMessage()} />}
-            {waiting && unanswered.length > 0 && (
-              <>
-                <span className="ib-sp" />
-                <span className={keepOpen ? 'ib-keep' : undefined}>
-                  <SkipChip count={unanswered.length} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
-                </span>
-              </>
+                )}
+              </div>
             )}
             {/* A phone has no room to float the pill over the messages (it sat on a sender's row): it sits in this
                 row's empty middle, laid over it, so the foot and the thread's view keep their size and Reply stays put.
-                With Send waiting the row has no empty middle, and no pill. */}
-            {showNew && phone && !waiting && newPill}
+                When a button sits under that middle (Reply, Re-ask and the open questions), it floats just above the
+                foot instead, never over a button. With Send waiting (picks or kept words), no pill. */}
+            {showNew && phone && !waiting && !draftKept && newPill}
           </div>
           </>
         )}
@@ -3264,15 +3550,11 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
             live={live}
             mode={newMessage}
             onPick={(target) => setNewMessage({ kind: 'compose', target })}
-            onReplyInstead={() => openBox(picksCount > 0)}
+            onReplyInstead={() => openBox()}
             onClose={() => setNewMessage(null)}
           />
         )}
-        {error && (
-          <div className="ib-error" role="alert">
-            {error}
-          </div>
-        )}
+        {error && !errorAbove && errorLine}
       </div>
     </section>
     {openAttachment && (
@@ -3288,20 +3570,25 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
         projectRoot={thread.project.root}
         repo={thread.project.repo ?? null}
         version={file!.version}
-        onVersion={(version) => onOpenFile({ id: openAttachment.id, version, focus: null })}
-        full={full || phone || fileStacked}
+        onVersion={(version) => onOpenFile({ id: openAttachment.id, version, focus: null, view: currentView })}
+        full={shownFull}
         fullLocked={phone || fileStacked}
         phone={phone}
         openIn={openIn}
         steps={steps}
         // A step keeps the frame the person is in, and replaces the route.
-        onStep={(attachmentId, version) => onOpenFile({ id: attachmentId, version, focus: null }, { replace: true })}
+        onStep={(attachmentId, version) => onOpenFile({ id: attachmentId, version, focus: null, view: currentView }, { replace: true })}
         // A link in an attached HTML page to another file of the thread: a new entry, so Back returns to the page; the frame stays.
-        onOpenLinked={(attachmentId) => onOpenFile({ id: attachmentId, version: 'current', focus: null })}
+        onOpenLinked={(attachmentId) => onOpenFile({ id: attachmentId, version: 'current', focus: null, view: currentView })}
         // A page the attached page links to: in the route (`linked=`), so each one is a history entry and Back steps back through them.
         linked={file!.linked ?? null}
-        onLinked={(linked, options) => onOpenFile({ id: openAttachment.id, version: file!.version, focus: null, linked }, options)}
-        onToggleFull={() => setFull(!full)}
+        onLinked={(linked, options) => onOpenFile({ id: openAttachment.id, version: file!.version, focus: null, linked, view: currentView }, options)}
+        onToggleFull={(pick) => {
+          if (pick) pickView(full ? 'side' : 'full');
+          else setFull(!full);
+        }}
+        // The switch's pressed half: the view on screen becomes the choice; the frame stays.
+        onKeepView={() => pickView(currentView)}
         focusId={file!.focus}
         focusRequest={paneFocus}
         fromPerson={thread.messages.find((m) => m.id === openAttachment.message_id)?.author.kind === 'person'}
@@ -3312,9 +3599,8 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
         })()}
         onSaved={saveRecord}
         onRemoved={dropRecord}
-        onOpenAt={(attachmentId, version, focus) => onOpenFile({ id: attachmentId, version, focus }, { replace: true })}
+        onOpenAt={(attachmentId, version, focus) => onOpenFile({ id: attachmentId, version, focus, view: currentView }, { replace: true })}
         onClose={() => {
-          setFull(false);
           onOpenFile(null);
         }}
         strip={{
@@ -3322,7 +3608,7 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
           annotations: records.length,
           onWriteReply: () => {
             setFull(false);
-            openBox(picksCount > 0);
+            openBox();
           },
         }}
       />
@@ -3332,19 +3618,20 @@ export function ThreadPane({ thread, sent, onQuestions, onChanged, draftChanged 
 }
 
 /**
- * What a Send does with the questions left unanswered: "↷ 3 unanswered
- * questions will be skipped · Keep open", or, after Keep open, "3 unanswered
- * questions stay open · Skip them". Nothing when none is unanswered.
+ * What a Send does with the questions left unanswered (approval
+ * "inbox-explicit-skip", 2026-10-21): by default "3 questions stay open ·
+ * Skip them"; after Skip them, "↷ 3 questions will be skipped · Keep open",
+ * for that one Send. Nothing when none is unanswered.
  */
-function SkipChip({ count, keepOpen, onToggle }: { count: number; keepOpen: boolean; onToggle: () => void }) {
+function SkipChip({ count, keepOpen, onToggle, id }: { count: number; keepOpen: boolean; onToggle: () => void; id?: string }) {
   if (count === 0) return null;
   const them = count === 1 ? 'it' : 'them';
   return (
     <span className="ib-skipchip" data-skip-chip={keepOpen ? 'keep' : 'skip'}>
       {/* The icon and the sentence are one item, so where the chip wraps (a narrow reply box) the icon stays with its words. */}
-      <span className="ib-skip-s">
+      <span className="ib-skip-s" id={id}>
         {!keepOpen && <Icon name="forward" size={14} />}
-        {keepOpen ? `${plural(count, 'unanswered question')} ${count === 1 ? 'stays' : 'stay'} open` : `${plural(count, 'unanswered question')} will be skipped`}
+        {keepOpen ? `${plural(count, 'question')} ${count === 1 ? 'stays' : 'stay'} open` : `${plural(count, 'question')} will be skipped`}
       </span>
       <button type="button" onClick={onToggle} data-skip-toggle="">
         {keepOpen ? `Skip ${them}` : 'Keep open'}

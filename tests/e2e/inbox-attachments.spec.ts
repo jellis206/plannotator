@@ -7,8 +7,8 @@
  * and Chromium drives the window.
  *
  * Proves: the tiles at the foot of the thread; the markdown plan beside the
- * thread with Full screen, drawn in Plannotator's plan look (Grid by default,
- * Clean under the `plannotator-grid-enabled=false` cookie), a selection comment listed in the reply box's
+ * thread with Full screen, always drawn in the Clean look (plan review's Grid
+ * setting is not read), a selection comment listed in the reply box's
  * annotations chip; the HTML prototype full screen with its relative image
  * resolved, its iframe loading the sibling page (never the Inbox, #1554), the
  * frame unable to read the Inbox API, a marker pinned on "Retry all"; leaving
@@ -31,6 +31,7 @@ import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync, writeFileSync,
 import { join, resolve } from 'node:path';
 import { DEMO_MESSAGES, SimAgent, scratchProject } from '../../scripts/inbox-sim';
 import { inboxScratch, removeInboxScratch } from './inbox-scratch';
+import { forgetFileViewChoice } from './file-view';
 import { cutInHeadRow } from './head-row';
 
 const repo = resolve(__dirname, '../..');
@@ -242,6 +243,9 @@ test.beforeAll(async ({ browser }: { browser: Browser }) => {
   };
 });
 
+/** A view pressed in a test is remembered: forgotten after each, so the next opens by today's rule (file-view.ts). */
+test.afterEach(async () => forgetFileViewChoice(world?.page));
+
 test.afterAll(async () => {
   try {
     if (!world) return;
@@ -354,35 +358,30 @@ test('the thread shows its attachments at the foot; the plan opens beside the th
   expect(page.url()).toContain(`file=${world.attachments.plan}`);
 });
 
-test("the plan follows Plannotator's look: Grid (the default) is the card on the grid paper, Clean the document edge to edge", async () => {
+test('the plan is always the Clean look: the document edge to edge on the card colour, even with Grid chosen in plan review', async () => {
   const page = world.page;
   const pane = page.locator(`[data-attachment-pane="${world.attachments.plan}"]`);
   const scroll = pane.locator('.ib-docscroll');
   const article = scroll.locator('article');
-  // No choice made: the registry's default, Grid (the store writes the default back as the cookie on first read), drawn with plan review's classes.
-  const seeded = (await world.context.cookies()).find((c) => c.name === 'plannotator-grid-enabled');
-  expect(seeded?.value ?? 'true').toBe('true');
-  await expect(scroll).toHaveAttribute('data-look', 'grid');
-  await expect(scroll).toHaveClass(/\bbg-grid\b/);
-  await expect(article).toHaveClass(/\bshadow-xl\b/);
-  await expect(article).toHaveClass(/\bborder\b/);
-  await shot('2.1b-plan-look-grid');
+  const isClean = async () => {
+    await expect(scroll).toHaveAttribute('data-look', 'clean');
+    await expect(scroll).toHaveClass(/\bbg-card\b/);
+    await expect(scroll).not.toHaveClass(/\bbg-grid\b/);
+    await expect(article).not.toHaveClass(/\bshadow-xl\b/);
+    await expect(article).toContainText('Retry worker for Stripe 409s');
+    const [scrollBg, articleBg] = await Promise.all([scroll, article].map((l) => l.evaluate((el) => getComputedStyle(el).backgroundColor)));
+    expect(articleBg).toBe(scrollBg);
+  };
+  await isClean();
+  await shot('2.1b-plan-look-clean');
 
-  // The cookie Plannotator's Settings writes for "Clean": the same pane draws the flat document on the card colour.
-  await world.context.addCookies([{ name: 'plannotator-grid-enabled', value: 'false', url: world.url }]);
+  // The cookie plan review's Settings writes for "Grid" changes nothing here.
+  await world.context.addCookies([{ name: 'plannotator-grid-enabled', value: 'true', url: world.url }]);
   await page.reload();
-  await expect(scroll).toHaveAttribute('data-look', 'clean');
-  await expect(scroll).toHaveClass(/\bbg-card\b/);
-  await expect(article).not.toHaveClass(/\bshadow-xl\b/);
-  await expect(article).toContainText('Retry worker for Stripe 409s');
-  const [scrollBg, articleBg] = await Promise.all([scroll, article].map((l) => l.evaluate((el) => getComputedStyle(el).backgroundColor)));
-  expect(articleBg).toBe(scrollBg);
-  await shot('2.1c-plan-look-clean');
-
-  // Back to the default for the rest of the proof.
+  await isClean();
   await world.context.clearCookies({ name: 'plannotator-grid-enabled' });
   await page.reload();
-  await expect(scroll).toHaveAttribute('data-look', 'grid');
+  await expect(scroll).toBeVisible();
 });
 
 test('a selection comment on the plan is saved and listed in the reply box chip', async () => {
@@ -412,7 +411,7 @@ test('a selection comment on the plan is saved and listed in the reply box chip'
   await expect(pane).toHaveClass(/ib-full/);
   await expect(pane.locator('[data-strip-chip]')).toContainText('2 annotations ride your next Send');
   await shot('2.3-full-screen-annotation-mode');
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
 
   // The chip inside the reply box lists each annotation with its file, quote and comment.
@@ -438,9 +437,9 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
   await expect(pane).toBeVisible();
-  // HTML opens in the annotation mode by default: full screen, Exit full screen offered.
+  // HTML opens in the annotation mode by default: full screen, Side by side offered.
   await expect(pane).toHaveClass(/ib-full/);
-  await expect(pane.getByRole('button', { name: 'Exit full screen' })).toBeVisible();
+  await expect(pane.getByRole('button', { name: 'Side by side' })).toBeVisible();
   const frame = pageFrame(page);
   await expect(frame.locator('#retry-all')).toHaveText('Retry all (40)');
   // The relative image resolved against the file's own folder.
@@ -491,7 +490,7 @@ test('the HTML prototype opens full screen: its image and frame load from its fo
   expect(await tab.evaluate(() => [document.documentElement.getAttribute('data-ran'), document.documentElement.getAttribute('data-read')])).toEqual([null, null]);
   await tab.close();
 
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
   await pane.getByRole('button', { name: 'Close admin-view.html' }).click();
   await expect(pane).toHaveCount(0);
@@ -587,7 +586,7 @@ test("the reply box's chips wrap inside it beside a file, stacked and on a phone
   // The reply box is open (picks, the skip chip, 3 annotations) from the tests above.
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
-  await pane.getByRole('button', { name: 'Exit full screen' }).click();
+  await pane.getByRole('button', { name: 'Side by side' }).click();
   await expect(pane).not.toHaveClass(/ib-full/);
   // The 440 px thread column beside the file.
   await expect(page.locator('section.ib-pane .ib-rfoot [data-annotations-chip]')).toHaveText('3 annotations');
@@ -653,12 +652,12 @@ test('leaving full screen keeps the file beside the thread with ‹ Inbox leadin
   await page.getByRole('button', { name: 'Open admin-view.html' }).click();
   const pane = page.locator(`[data-attachment-pane="${world.attachments.html}"]`);
   await expect(pane).toHaveClass(/ib-full/);
-  const exit = pane.getByRole('button', { name: 'Exit full screen' });
+  const exit = pane.getByRole('button', { name: 'Side by side' });
   await exit.focus();
   await page.keyboard.press('Enter');
   await expect(pane).not.toHaveClass(/ib-full/);
-  // Focus stays on the toggle, now Full screen; the way back is in view at the top left, ahead of Mark read; Archive ends the header.
-  await expect(pane.getByRole('button', { name: 'Full screen' })).toBeFocused();
+  // Focus on the header switch's Side by side, now pressed; the way back is in view at the top left, ahead of Mark read; Archive ends the header.
+  await expect(pane.getByRole('button', { name: 'Side by side' })).toBeFocused();
   await expect(back).toBeVisible();
   await expect(back).toHaveAccessibleName('Back to Inbox');
   await expect(back).toHaveText('Inbox');

@@ -147,7 +147,7 @@ The install script also updates the Claude Code plugin when it is already instal
 
 ### Update check
 
-Once a day, the machine (never your browser) asks GitHub for the latest stable release and caches the answer. When a newer one exists:
+About once an hour, the machine (never your browser) asks GitHub for the latest stable release and caches the answer. When a newer one exists:
 
 - the Inbox shows an **Update** button above Settings, which opens a dialog with what's new and **Update now** (see [the Inbox](/docs/reference/inbox/#update));
 - plan review, annotate and code review show a short toast at most once every three days, with **Update** (or the command to copy, on Pi: `pi update --extensions`), and the Options menu shows the right update command for your agent;
@@ -433,7 +433,7 @@ To update it later, run `pi update --extensions` (a plain `pi update` updates on
 
 Start plan mode with `pi --plan`, or toggle mid-session with `/plannotator-plan-mode` or `Ctrl+Alt+P`. Plan review does not make the agent wait: the agent ends its turn, and your decision arrives later as a message. The extension provides file-based plan review, code review (`/plannotator-review`), markdown annotation (`/plannotator-annotate`), bash safety gating during planning, and progress tracking during execution.
 
-The agent can also open Plannotator itself with a `plannotator` tool, for example when you ask it to "open notes.md in Plannotator". The tool returns at once, and your feedback arrives later as a message. The agent can list the reviews it opened and close one it no longer needs; closing keeps your unsent comments as a draft. The tool is off by default on Pi, because Pi sends its full definition (about 780 tokens) with every request: turn it on with `PLANNOTATOR_AGENT_TOOL=1` or `{ "agentTool": true }` in `~/.plannotator/config.json` (applies to the next Pi session). In Oh My Pi it is on by default (see below).
+The agent can also open Plannotator itself with a `plannotator` tool, for example when you ask it to "open notes.md in Plannotator". The tool returns at once, and your feedback arrives later as a message. The agent can list the reviews it opened and close one it no longer needs; closing keeps your unsent comments as a draft. The tool is off by default on Pi, because Pi sends its full definition (about 800 tokens) with every request: turn it on with `PLANNOTATOR_AGENT_TOOL=1` or `{ "agentTool": true }` in `~/.plannotator/config.json` (applies to the next Pi session). In Oh My Pi it is on by default (see below).
 
 See [Plannotator Meets Pi](/blog/plannotator-meets-pi) for the full walkthrough.
 

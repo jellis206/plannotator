@@ -92,6 +92,9 @@ const bodyArb = fc.oneof(
     ([prompt, labels]) => [":::question", prompt, "", ...labels.map((l) => `- [ ] ${l}`), ":::"].join("\n"),
   ),
   promptArb.map((prompt) => [":::question-text", prompt, ":::"].join("\n")),
+  // An action item (approval "inbox-next-actions"), stopped or not, beside a question or alone.
+  fc.tuple(promptArb, fc.boolean()).map(([prompt, stopped]) => [":::action", prompt.replace(/\?$/, ""), "The why.", ...(stopped ? ["Stopped: it waits on you"] : []), ":::"].join("\n")),
+  fc.tuple(promptArb, promptArb).map(([todo, ask]) => [":::action", todo.replace(/\?$/, ""), ":::", "", ":::question-text", ask, ":::"].join("\n")),
 );
 
 type Op =
@@ -100,7 +103,9 @@ type Op =
   | { op: "reply"; target: number; body: string }
   | { op: "pick"; target: number; choice: number; question?: number }
   // The person's Send: the message's picks and words; `skip` is the Send that skips (false: Keep open).
-  | { op: "personSend"; target: number; key: string; words: string; skip?: boolean; tag?: string | null }
+  // `across` (approval "inbox-explicit-skip"): one reply to the target carries the picks (and, with `skip`,
+  // the open questions) of every message the target's session wrote in the thread, each named by `message_id`.
+  | { op: "personSend"; target: number; key: string; words: string; skip?: boolean; tag?: string | null; across?: boolean }
   | { op: "resolve"; target: number; resolved: boolean }
   // A tagged session's connection delivered what the person tagged it in, in the thread (bridge `delivered`).
   | { op: "tagDeliver"; target: number; session: string }
@@ -127,7 +132,12 @@ type Op =
   // Re-ask (POST /api/inbox/messages/:id/reask): a note asking the session that wrote it for its open questions again.
   | { op: "reask"; target: number; key: string }
   // The Board (approval "inbox-board"): an agent's card call, or the person's move, on a card linked to a thread.
-  | { op: "card"; target: number; card: CardOp };
+  | { op: "card"; target: number; card: CardOp }
+  // An action item (approval "inbox-next-actions"): the person's Done, Can't do it or Undo on the target's first action item;
+  // `settle` is the Undo window passing; `agentDone` the agent's own `done` for the target's action items.
+  | { op: "todo"; target: number; outcome: "done" | "cant" | "undo" }
+  | { op: "settle" }
+  | { op: "agentDone"; target: number };
 
 /** One card call: made from the target's thread, or a write to the n-th card (wrapping). */
 type CardOp = { kind: "create" } | { kind: "move"; n: number; column: string; person: boolean; you: boolean; reason: boolean } | { kind: "say"; n: number } | { kind: "restore"; n: number };
@@ -183,6 +193,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
     skip: fc.boolean(),
     // Tags (approval "inbox-tag-agents"): another session, or the owner itself (dropped).
     tag: fc.constantFrom(null, null, "ses_t1", "ses_t2", "ses_x"),
+    across: fc.boolean(),
   }),
   fc.record({ op: fc.constant("resolve" as const), target: fc.nat(), resolved: fc.boolean() }),
   fc.record({ op: fc.constant("tagDeliver" as const), target: fc.nat(), session: fc.constantFrom("ses_t1", "ses_t2") }),
@@ -202,6 +213,9 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
   fc.record({ op: fc.constant("deliver" as const), target: fc.nat() }),
   fc.record({ op: fc.constant("ack" as const), target: fc.nat(), on: fc.boolean() }),
   fc.record({ op: fc.constant("card" as const), target: fc.nat(), card: cardOpArb }),
+  fc.record({ op: fc.constant("todo" as const), target: fc.nat(), outcome: fc.constantFrom("done" as const, "cant" as const, "undo" as const) }),
+  fc.record({ op: fc.constant("settle" as const) }),
+  fc.record({ op: fc.constant("agentDone" as const), target: fc.nat() }),
 );
 
 /** The card ids the generic ops made, per store (a card op aims at them, not at messages). */
@@ -215,7 +229,7 @@ type Outcome = "ok" | "noop" | "replayed" | `refused:${string}`;
  * message an agent wrote or the person started a thread with, wrapping.
  */
 function targetOf(op: Op, messageIds: readonly string[]): string | undefined {
-  return op.op === "send" || op.op === "personStart" ? undefined : messageIds[op.target % Math.max(1, messageIds.length)];
+  return op.op === "send" || op.op === "personStart" || op.op === "settle" ? undefined : messageIds[op.target % Math.max(1, messageIds.length)];
 }
 
 /**
@@ -253,7 +267,8 @@ function run(store: InboxStore, op: Op, messageIds: string[]): Outcome {
       }
       case "pick": {
         if (!target) return "noop";
-        const questions = store.questionsOf(target);
+        // The window never picks an action item (it is marked on its card).
+        const questions = store.questionsOf(target).filter((q) => q.kind !== "action");
         const question = questions[(op.question ?? 0) % Math.max(1, questions.length)];
         if (!question) return "noop";
         const answer: QuestionAnswer =
@@ -265,12 +280,43 @@ function run(store: InboxStore, op: Op, messageIds: string[]): Outcome {
       }
       case "personSend": {
         if (!target) return "noop";
-        const picked = store.questionsOf(target).filter((q) => q.state === "picked");
+        // The messages one reply answers, as the window groups them (sendTargetsOf): the target, and with
+        // `across` every other message its session wrote in the thread with a question still waiting.
+        const own = store.message(target)!;
+        const session = own.author.kind === "agent" ? (own.author.session ?? null) : null;
+        const others =
+          op.across === true && session
+            ? store
+                .thread(own.thread_id)!
+                .messages.filter(
+                  (m) =>
+                    m.id !== target &&
+                    m.author.kind === "agent" &&
+                    m.author.session === session &&
+                    (m.questions ?? []).some((q) => q.state === "open" || q.state === "picked"),
+                )
+                .map((m) => m.id)
+            : [];
+        // The window never sends an action item with a Send (it is marked on its card).
+        const picked = [target, ...others].flatMap((id) =>
+          store
+            .questionsOf(id)
+            .filter((q) => q.state === "picked" && q.kind !== "action")
+            .map((q) => ({ ...(id === target ? {} : { message_id: id }), key: q.key, revision: q.revision })),
+        );
+        // "Skip them": the person chose to skip these messages' open questions (approval "inbox-explicit-skip").
+        // The window lists what the chip counted; the store skips only the ones still open.
+        const listed = [target, ...others].flatMap((id) =>
+          store
+            .questionsOf(id)
+            .filter((q) => q.kind !== "action")
+            .map((q) => (id === target ? { key: q.key } : { message_id: id, key: q.key })),
+        );
         const result = store.sendReply(target, {
           words: op.words,
           idempotency_key: op.key,
-          questions: picked.map((q) => ({ key: q.key, revision: q.revision })),
-          skip_unanswered: op.skip === true,
+          questions: picked,
+          ...(op.skip === true ? { skip: listed } : {}),
           ...(op.tag ? { tags: [{ host: "test", session: op.tag, wakes: op.tag !== "ses_t2" }] } : {}),
         });
         if (result.replayed) return "replayed";
@@ -353,6 +399,29 @@ function run(store: InboxStore, op: Op, messageIds: string[]): Outcome {
       case "reask": {
         if (!target) return "noop";
         return store.sendReask(target, { idempotency_key: op.key }).replayed ? "replayed" : "ok";
+      }
+      case "todo": {
+        if (!target) return "noop";
+        const action = store.questionsOf(target).find((q) => q.kind === "action");
+        if (!action) return "noop";
+        store.markAction(target, action.key, op.outcome === "undo" ? { outcome: null } : { outcome: op.outcome, note: op.outcome === "cant" ? "No access." : null });
+        return "ok";
+      }
+      case "settle":
+        return store.settleActions(0).length > 0 ? "ok" : "noop";
+      case "agentDone": {
+        if (!target) return "noop";
+        const message = store.message(target)!;
+        if (!store.questionsOf(target).some((q) => q.kind === "action")) return "noop";
+        const result = store.sendMessage({
+          project_id: message.project_id,
+          author: { kind: "agent", host: "test", session: "ses_x", name: null },
+          body: "Saw it done.",
+          reply_to: target,
+          done: [target],
+        });
+        messageIds.push(result.message.id);
+        return "ok";
       }
     }
   } catch (error) {
@@ -902,6 +971,23 @@ function stateOpArbOf(body: fc.Arbitrary<string>, agentKeys: boolean): fc.Arbitr
       }),
       weight: 3,
     },
+    // One reply across the session's messages (approval "inbox-explicit-skip"), in the property runs only:
+    // the generated trace fixtures were drawn from this arbitrary without it.
+    ...(agentKeys
+      ? [
+          {
+            arbitrary: fc.record({
+              op: fc.constant("personSend" as const),
+              target: fc.nat(),
+              key: fc.constantFrom("s1", "s2", "s3"),
+              words: fc.constantFrom("", "ok"),
+              skip: fc.boolean(),
+              across: fc.constant(true),
+            }),
+            weight: 3,
+          },
+        ]
+      : []),
     { arbitrary: fc.record({ op: fc.constant("seen" as const), target: fc.nat() }), weight: 2 },
     // The look capped at a message (`through_seq`), in the property runs only: the
     // generated trace fixtures were drawn from this arbitrary without it, and a
@@ -950,6 +1036,8 @@ type ModelAnswer = null | "pick" | "skip";
 
 interface ModelQuestion {
   id: string;
+  /** An action item (approval "inbox-next-actions"): counts like a question, never picked or skipped by a Send. */
+  action: boolean;
   stopped: boolean;
   holds: boolean;
   answer: ModelAnswer;
@@ -1181,6 +1269,7 @@ class ThreadStateModel {
       replyKeys: new Set(),
       questions: store.questionsOf(id).map((q) => ({
         id: `${id}/${q.key}`,
+        action: q.kind === "action",
         stopped: q.stopped !== null,
         holds: q.holds_up.length > 0,
         answer: null,
@@ -1282,8 +1371,9 @@ class ThreadStateModel {
         return "ok";
       }
       case "pick": {
-        if (message.questions.length === 0) return "noop";
-        const q = message.questions[(op.question ?? 0) % message.questions.length]!;
+        const pickable = message.questions.filter((q) => !q.action);
+        if (pickable.length === 0) return "noop";
+        const q = pickable[(op.question ?? 0) % pickable.length]!;
         if (this.closedByArchive(thread, message)) return "refused:thread_resolved";
         if (q.superseded) return "refused:question_superseded";
         if (q.setAside) return "refused:question_set_aside";
@@ -1294,10 +1384,26 @@ class ThreadStateModel {
       case "personSend": {
         if (message.replyKeys.has(op.key)) return "replayed";
         if (this.closedByArchive(thread, message)) return "refused:thread_resolved";
-        const picks = message.questions.filter((q) => this.recordState(q) === "picked");
-        const skips = op.skip ? message.questions.filter((q) => this.recordState(q) === "open") : [];
+        // One reply for the session: with `across`, its other messages in the thread that still wait.
+        const others =
+          op.across === true && message.author === "agent" && message.session
+            ? thread.messages.filter(
+                (m) =>
+                  m !== message &&
+                  m.author === "agent" &&
+                  m.session === message.session &&
+                  m.questions.some((q) => {
+                    const st = this.state(thread, m, q);
+                    return st === "open" || st === "picked";
+                  }),
+              )
+            : [];
+        const covered = [message, ...others];
+        const picks = covered.flatMap((m) => m.questions.filter((q) => this.recordState(q) === "picked"));
+        const skips = op.skip ? covered.flatMap((m) => m.questions.filter((q) => !q.action && this.recordState(q) === "open")) : [];
         if (picks.length === 0 && skips.length === 0 && op.words.trim() === "") {
-          return op.skip ? "refused:nothing_to_send" : "refused:validation_error";
+          // A listed skip whose questions closed meanwhile is a no-op; with nothing listed, nothing to send.
+          return op.skip && covered.some((m) => m.questions.some((q) => !q.action)) ? "refused:nothing_to_send" : "refused:validation_error";
         }
         for (const q of picks) q.sent = true;
         for (const q of skips) {
@@ -1457,6 +1563,7 @@ class ThreadStateModel {
         const group = thread.messages.filter(
           (m) => m.author === "agent" && (session !== null ? m.session === session : m === message) && !this.closedByArchive(thread, m),
         );
+        // Open action items are asked again with the questions (owner, #2059).
         const questions = group.flatMap((m) => m.questions);
         const asked = questions.filter((q) => this.recordState(q) === "open");
         if (asked.length === 0) return "refused:nothing_to_reask";
@@ -2184,6 +2291,8 @@ function traceEventOf(op: Op, world: StateWorld, labels: TraceLabels): TraceEven
         : { type: "pick", message: labels.label(target), key: q.key, choice: q.choices[op.choice % q.choices.length]!.label };
     }
     case "personSend":
+      // A reply across messages runs in the property runs only: the trace fixtures were drawn without it.
+      if (op.across === true) return null;
       return { type: "send", message: labels.label(target), words: op.words, skip_unanswered: op.skip === true };
     case "seen":
       return op.through === undefined ? { type: "seen", thread } : { type: "seen", thread, through: labels.label(world.ids[op.through % world.ids.length]!) };

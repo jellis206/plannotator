@@ -48,6 +48,7 @@ import type { SemanticDiffAdvert } from '@plannotator/shared/semantic-diff-types
 import type { CallFlowAdvert, CallFlowNode } from '@plannotator/shared/call-flow-types';
 import { configStore, useConfigValue, setReviewPanelView } from '@plannotator/ui/config';
 import { loadDiffFont } from '@plannotator/ui/utils/diffFonts';
+import { monoFontStack, normalizeCssFontSize } from '@plannotator/ui/utils/cssFontFamily';
 import { getAgentSwitchSettings, getEffectiveAgentName } from '@plannotator/ui/utils/agentSwitch';
 import { adoptServerSession, noteServerSessionMismatch, withServerSession, withServerSessionQuery } from '@plannotator/ui/utils/serverSession';
 import { ServerSessionReplacedBanner } from '@plannotator/ui/components/ServerSessionReplacedBanner';
@@ -87,6 +88,8 @@ import { useResizablePanel } from '@plannotator/ui/hooks/useResizablePanel';
 import { useCodeAnnotationDraft, type CodeDraftMergeItems, type CodeDraftTargetState } from '@plannotator/ui/hooks/useCodeAnnotationDraft';
 import { useGitAdd } from './hooks/useGitAdd';
 import { generateId } from './utils/generateId';
+import { parseDiagramEngineUrls } from './utils/diagramEngine';
+import type { DiagramEngineUrls } from './utils/diagramEngineContract';
 import type { SuggestionHunk } from './edit/deriveSuggestions';
 import type { EditSelectionComment } from './edit/useEditSession';
 import { useAIChat } from './hooks/useAIChat';
@@ -508,14 +511,16 @@ const ReviewApp: React.FC = () => {
 
   // Load custom diff font and override --font-mono for surrounding review elements
   useEffect(() => {
-    if (diffFontFamily) {
+    const diffFontStack = monoFontStack(diffFontFamily);
+    if (diffFontStack) {
       loadDiffFont(diffFontFamily);
-      document.documentElement.style.setProperty('--diff-font-override', `'${diffFontFamily}', monospace`);
+      document.documentElement.style.setProperty('--diff-font-override', diffFontStack);
     } else {
       document.documentElement.style.removeProperty('--diff-font-override');
     }
-    if (diffFontSize) {
-      document.documentElement.style.setProperty('--diff-font-size-override', diffFontSize);
+    const diffFontSizeValue = normalizeCssFontSize(diffFontSize);
+    if (diffFontSizeValue) {
+      document.documentElement.style.setProperty('--diff-font-size-override', diffFontSizeValue);
     } else {
       document.documentElement.style.removeProperty('--diff-font-size-override');
     }
@@ -700,6 +705,10 @@ const ReviewApp: React.FC = () => {
   // file in full (and serve a Markdown file's own images). Absent (old
   // server, demo) reads as false: no preview UI at all.
   const [markdownPreviewSupported, setMarkdownPreviewSupported] = useState(false);
+  // Session-constant advert from `/api/diff`: where the review server serves
+  // the diagram engine (see utils/diagramEngine). Absent (an older server, a
+  // host that ships no engine, the demo): diagram fences show as code.
+  const [diagramEngine, setDiagramEngine] = useState<DiagramEngineUrls | null>(null);
   // Session-constant capability advert from `/api/diff`: 'patch' means the
   // diff is caller-supplied bytes (`plannotator review --patch-file`) with no
   // repository behind it. ABSENT reads as 'vcs', so an old server keeps every
@@ -1324,6 +1333,7 @@ const ReviewApp: React.FC = () => {
     ask: askAI,
     abort: abortAI,
     resetSession: resetAISession,
+    newChat: startNewAIChat,
     sessionId: aiSessionId,
   } = aiChat;
 
@@ -2305,6 +2315,7 @@ const ReviewApp: React.FC = () => {
         serverSession?: string;
         imagePreviewSupported?: boolean;
         markdownPreviewSupported?: boolean;
+        diagramEngine?: unknown;
         sourceKind?: ReviewSourceKind;
         repoInfo?: { display: string; branch?: string };
         prMetadata?: PRMetadata;
@@ -2385,6 +2396,7 @@ const ReviewApp: React.FC = () => {
         adoptServerSession(data.serverSession);
         setImagePreviewSupported(data.imagePreviewSupported === true);
         setMarkdownPreviewSupported(data.markdownPreviewSupported === true);
+        setDiagramEngine(parseDiagramEngineUrls(data.diagramEngine));
         // Session-constant: a static patch session has no diff-type switch to
         // re-advertise it on, so `/api/diff` is the only place it can arrive.
         setSourceKind(data.sourceKind === 'patch' ? 'patch' : 'vcs');
@@ -2852,6 +2864,17 @@ const ReviewApp: React.FC = () => {
       return next;
     });
   }, [persistViewed]);
+  // Guided Review (#1786): ticking a section "Reviewed" marks its files viewed.
+  // It is the reviewer's own gesture, so it does what the per-file Viewed
+  // checkbox does for each newly viewed file: persist it, lift any auto-view
+  // suppression, and sync the platform's Viewed state in PR mode.
+  const handleGuideMarkFilesViewed = useCallback((paths: string[]) => {
+    const newlyViewed = paths.filter(path => !viewedFilesRef.current.has(path));
+    if (newlyViewed.length === 0) return;
+    markFilesViewed(newlyViewed);
+    for (const path of newlyViewed) applyAutoViewSuppression(path, true);
+    syncPlatformViewed(newlyViewed, true);
+  }, [markFilesViewed, applyAutoViewSuppression, syncPlatformViewed]);
   const handleAutoView = useCallback(() => {
     // The notice fires the first time auto-view demonstrates itself. Deferred
     // (not lost) behind the guide takeover or a first-run dialog — the file
@@ -3912,6 +3935,7 @@ const ReviewApp: React.FC = () => {
     // focus claim at the source instead of threading `guideOpen` through every
     // dock panel. Guide-side DiffViewers arbitrate focus among themselves.
     focusedFilePath: guideOpen ? null : (files[activeFileIndex]?.path ?? null),
+    isDiffPanelActive: !guideOpen && isDiffPanelActive,
     diffStyle: effectiveDiffStyle,
     onDiffStyleChange: handleDiffStyleChange,
     isCompactTouchLayout,
@@ -3942,6 +3966,7 @@ const ReviewApp: React.FC = () => {
     imagePreviewAvailable: imagePreviewSupported && !isStaticPatch,
     snapshotId,
     markdownPreview,
+    diagramEngine,
     onAddMarkdownPreviewComment: handleAddMarkdownPreviewComment,
     onAskAIForMarkdownPreview: aiAvailable ? handleAskAIForMarkdownPreview : undefined,
     // Outdated comments (#1590) carry line numbers from an earlier version of
@@ -4054,9 +4079,9 @@ const ReviewApp: React.FC = () => {
     codeNavIsLoading: codeNav.isLoading,
     codeNavActiveSymbol: codeNav.activeSymbol,
   }), [
-    files, diffData?.rawPatch, activeFileIndex, guideOpen, effectiveDiffStyle, handleDiffStyleChange, isCompactTouchLayout, diffOverflow, diffIndicators,
+    files, diffData?.rawPatch, activeFileIndex, guideOpen, isDiffPanelActive, effectiveDiffStyle, handleDiffStyleChange, isCompactTouchLayout, diffOverflow, diffIndicators,
     diffLineDiffType, diffShowLineNumbers, diffShowBackground,
-    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions, isStaticPatch, imagePreviewSupported, snapshotId, markdownPreview, handleAddMarkdownPreviewComment, handleAskAIForMarkdownPreview,
+    diffExpandUnchanged, diffFontFamily, diffFontSize, activeDiffBase, committedBase, feedbackDiffContext, prReviewScopeLabel, prDiffScope, agentCwd, canUseLiveWorkspaceActions, isStaticPatch, imagePreviewSupported, snapshotId, markdownPreview, diagramEngine, handleAddMarkdownPreviewComment, handleAskAIForMarkdownPreview,
     diffAnnotations, externalAnnotations,
     visibleDescriptionAnnotations, selectedDescriptionAnnotationId, handleAddDescriptionAnnotation,
     handleSelectDescriptionAnnotation, handleDeleteDescriptionAnnotation, handleAskAIForDescription,
@@ -4943,7 +4968,7 @@ const ReviewApp: React.FC = () => {
 
   return (
     <ThemeProvider defaultTheme="dark" manageFavicon>
-      <TooltipProvider delayDuration={200} skipDelayDuration={100}>
+      <TooltipProvider>
       <ReviewStateProvider value={reviewStateValue}>
       <JobLogsProvider value={jobLogsValue}>
       {isSwitchingPRScope && <PRSwitchOverlay />}
@@ -5724,6 +5749,7 @@ const ReviewApp: React.FC = () => {
                 onClose={() => setGuideOpen(false)}
                 onOpenFixedGuide={handleOpenGuide}
                 onOpenSavedGuide={handleOpenGuide}
+                onMarkFilesViewed={handleGuideMarkFilesViewed}
               />
             </div>
           )}
@@ -5885,6 +5911,7 @@ const ReviewApp: React.FC = () => {
                 aiConfig={aiConfig}
                 onAIConfigChange={handleAIConfigChange}
                 hasAISession={!!aiSessionId}
+                onAINewChat={startNewAIChat}
                 {...(hasSessionBridge && {
                   onSessionAskAction: handleSessionAskAction,
                 })}

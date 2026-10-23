@@ -28,7 +28,7 @@ import * as z from "zod";
 import { parseDiffToFiles } from "@plannotator/core/diff-files";
 import { GUIDE_REVIEW_PROMPT, GUIDE_SCHEMA_JSON } from "@plannotator/core/guide-prompt";
 import { parseGuideSnapshot, parseGuideSnapshotJson, type GuideSnapshot } from "@plannotator/core/guide-format";
-import type { InboxGuideRef } from "@plannotator/core/inbox-types";
+import { displayInboxSubject, type InboxGuideRef } from "@plannotator/core/inbox-types";
 import { checkServerSession, INBOX_SERVER_SESSION_MISMATCH_ERROR, serverSessionMismatchBody } from "@plannotator/core/server-session";
 import { readFileSync } from "node:fs";
 import { inboxBlobPath, writeBlob } from "@plannotator/shared/inbox/attachments";
@@ -72,7 +72,7 @@ export const GET_GUIDE_BRIEF_DESCRIPTION =
   "Get what you need to write a guided review of a code change for the person: Plannotator's method, the JSON shape of the guide, how to read the diff, the rules, and a worked submit_guide call. Read the diff in your checkout, write the guide on your own model, then call submit_guide with the guide and that exact patch.";
 
 export const SUBMIT_GUIDE_DESCRIPTION =
-  "Send the person a guided review of a code change. It lands in the Plannotator Inbox as a message with a \"Guided review\" card that opens in Plannotator's guide viewer. Pass `guide` (the shape get_guide_brief gives) and `patch` (the exact unified diff it describes), or `snapshot` (a complete Plannotator guide snapshot). Every file a section names must be in the patch, in one section only; a refusal names the file. Files you leave out show under \"Everything else\". `body` is your note above the card (default: the guide's intent). thread, reply_to, supersedes and idempotency_key work as in send_message; the person's answer comes back through wait_for_reply.\n\nExample: get_guide_brief's `example` is a call that works as it is.";
+  "Send the person a guided review of a code change. It lands in the Plannotator Inbox as a message with a \"Guided review\" card that opens in Plannotator's guide viewer. Pass `guide` (the shape get_guide_brief gives) and `patch` (the exact unified diff it describes), or `snapshot` (a complete Plannotator guide snapshot). Every file a section names must be in the patch, in one section only; a refusal names the file. Files you leave out show under \"Everything else\". `body` is your note above the card (default: the guide's intent). thread, reply_to, supersedes, done and idempotency_key work as in send_message; the person's answer comes back through wait_for_reply.\n\nExample: get_guide_brief's `example` is a call that works as it is.";
 
 export type InboxGuideCheck = { ok: true; snapshot: GuideSnapshot } | { ok: false; error: string };
 
@@ -239,7 +239,10 @@ export function registerInboxGuideTools(server: McpServer, context: InboxMcpCont
         const described = describeInboxGuide(checked.snapshot, inboxGuideInputHash(input));
         const body = input.body?.trim() ? input.body : checked.snapshot.guide.intent;
         // A reply never gets the default: its only subject is one the agent gives (it may name a thread the person started).
-        const subject = input.subject ?? (input.body?.trim() || input.reply_to ? undefined : `Guided review: ${described.ref.title}`);
+        // The default is made one line here (displayInboxSubject), so the guide's own title can never fail the subject check.
+        const subject =
+          input.subject ??
+          (input.body?.trim() || input.reply_to ? undefined : (displayInboxSubject(`Guided review: ${described.ref.title}`) ?? undefined));
         const sent = await sendAgentMessage(context, project, { ...input, body, subject }, described.ref, callerWakes(ctx));
         // The blob is written once the message has landed, in the same turn (nothing can ask for it
         // in between); a refused send writes none, and a retry answers the first message's guide.

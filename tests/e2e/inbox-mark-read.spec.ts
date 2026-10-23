@@ -7,12 +7,12 @@
  * compiled binary, with agents writing through `plannotator inbox mcp`
  * (scripts/inbox-sim.ts):
  *
- *  - a words-only reply defaults to Keep open (approval
- *    "inbox-words-only-reply"); switched to skip, it skips the questions of a
+ *  - a reply defaults to Keep open (approval "inbox-explicit-skip": a Send
+ *    never skips on its own); after Skip them, it skips the questions of a
  *    Waiting thread: the row does not move while the thread stays open, and
  *    sits in Sent, below New, once the person leaves it;
  *  - in a thread ONE session wrote (it asked, then posted a later update), a
- *    words-only Send switched to skip is one reply: one new person message,
+ *    words-only Send after Skip it is one reply: one new person message,
  *    carrying the skip and the words, to the message that asked;
  *  - a words-only reply left as it is keeps every question open, and the
  *    agent's wait_for_reply gets the words plus the still-open line;
@@ -186,7 +186,7 @@ test('the list before: Stopped, Waiting, then New', async () => {
   await shot('01-list-before', ['light', 'dark']);
 });
 
-test('a words-only reply keeps the questions open by default; switched to skip, it skips them; the row keeps its place while the thread is open, then sits in Sent below New', async () => {
+test('a words-only reply keeps the questions open by default; after Skip them, it skips them; the row keeps its place while the thread is open, then sits in Sent below New', async () => {
   const { page, threads } = world;
   await page.locator(`.ib-lbody [data-thread-id="${threads.invoices}"]`).click();
   const pane = page.locator('section.ib-pane');
@@ -194,16 +194,16 @@ test('a words-only reply keeps the questions open by default; switched to skip, 
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
   await page.locator('.ib-rtext').fill('Redo the design. Use the dense table from the payouts page, not cards; we can talk sort order after.');
   const chip = page.locator('[data-skip-chip]');
-  // No pick in this Send: Keep open is the default (approval "inbox-words-only-reply").
+  // Keep open is the default (approval "inbox-explicit-skip").
   await expect(chip).toHaveAttribute('data-skip-chip', 'keep');
-  await expect(chip).toContainText('3 unanswered questions stay open');
+  await expect(chip).toContainText('3 questions stay open');
   await shot('02a-reply-keeps-open');
   await chip.getByRole('button', { name: 'Skip them' }).click();
-  await expect(chip).toContainText('3 unanswered questions will be skipped');
+  await expect(chip).toContainText('3 questions will be skipped');
   await shot('02-reply-skips');
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
   await expect(page.locator('.ib-rtext')).toHaveCount(0);
-  await expect(pane.getByText(/^Skipped with your reply · /).first()).toBeVisible();
+  await expect(pane.getByText(/^Skipped · \d{1,2}:\d{2} [AP]M$/).first()).toBeVisible();
   // Not on top any more, but the visible list does not move while the person is in the thread.
   await expect(page.locator(`.ib-lbody [data-thread-id="${threads.invoices}"]`)).toHaveAttribute('data-section', 'sent');
   expect(await sectionOf(page, threads.invoices)).toBe('waiting');
@@ -233,13 +233,13 @@ test('one session asked, then posted an update: a words-only Send writes exactly
   const pane = page.locator('section.ib-pane');
   await expect(pane.getByRole('heading', { name: 'Status page: which index?' })).toBeVisible();
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
-  await expect(page.locator('[data-skip-chip]')).toContainText('1 unanswered question stays open');
+  await expect(page.locator('[data-skip-chip]')).toContainText('1 question stays open');
   await page.locator('[data-skip-chip]').getByRole('button', { name: 'Skip it' }).click();
-  await expect(page.locator('[data-skip-chip]')).toContainText('1 unanswered question will be skipped');
+  await expect(page.locator('[data-skip-chip]')).toContainText('1 question will be skipped');
   await page.locator('.ib-rtext').fill('Ship it as it is.');
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
   await expect(page.locator('.ib-rtext')).toHaveCount(0);
-  await expect(pane.getByText(/^Skipped with your reply · /).first()).toBeVisible();
+  await expect(pane.getByText(/^Skipped · \d{1,2}:\d{2} [AP]M$/).first()).toBeVisible();
   // Give a second reply every chance to land before counting.
   await page.waitForTimeout(500);
   const mine = await persons();
@@ -265,7 +265,7 @@ test('a words-only reply left as it is: the questions stay open, and the agent g
   await page.locator('.ib-pfoot').getByRole('button', { name: 'Send' }).click();
   await expect(page.locator('.ib-rtext')).toHaveCount(0);
   // The cards still take answers: nothing was skipped.
-  await expect(pane.getByText(/^Skipped with your reply/)).toHaveCount(0);
+  await expect(pane.getByText(/^Skipped · \d{1,2}:\d{2} [AP]M$/)).toHaveCount(0);
   await shot('04c-words-only-keeps-open');
   const waited = await agents.codex.waitForReply(threadId, 5);
   expect((waited.reply as { body: string }).body).toBe(
@@ -275,6 +275,46 @@ test('a words-only reply left as it is: the questions stay open, and the agent g
   const model = (await (await fetch(new URL(`/api/inbox/threads/${threadId}`, world.url))).json()) as Model;
   expect(model.thread.messages.flatMap((m) => m.questions ?? []).map((q) => q.state)).toEqual(['open', 'open', 'open']);
   await page.keyboard.press('Escape');
+  await expect(pane).toHaveCount(0);
+});
+
+test('the foot after a pick: the buttons on the left, the draft status at the row\'s right end; too narrow, the status on its own line above the buttons', async () => {
+  const { page, agents, project } = world;
+  const asked = await agents.pi.send({ project_path: project, subject: 'Refunds page: a few calls', thread: 'refunds', body: INVOICES.replace('invoice list', 'refunds page') });
+  await page.goto(`${world.url}#thread=${asked.thread_id as string}`);
+  const pane = page.locator('section.ib-pane');
+  await expect(pane.getByRole('heading', { name: 'Refunds page: a few calls' })).toBeVisible();
+  await pane.locator('fieldset[data-question-key]').first().locator('[data-question-option]').filter({ hasText: 'A dense table' }).click();
+  const row = page.locator('.ib-pfoot [data-foot-row]');
+  const status = row.locator('[data-foot-status]');
+  await expect(status.locator('[data-draft-foot]')).toContainText('1 pick');
+  await expect(status.locator('[data-skip-chip]')).toContainText('2 questions stay open');
+  const box = async (sel: string) => (await page.locator(sel).first().boundingBox())!;
+  const send = async () => box('.ib-pfoot [data-foot-buttons] .ib-btn.ib-pri');
+  const reask = async () => box('.ib-pfoot [data-foot-buttons] [data-reask]');
+  // Wide: one line. Send first, the status after Re-ask, ending at the row's end. Since the "N open questions"
+  // button joined the row (approval "inbox-thread-open-questions"), one line needs a window this wide; at 1440 the
+  // status sits on its own line above, as the approved mock draws it.
+  await page.setViewportSize({ width: 1920, height: 1000 });
+  await expect.poll(async () => Math.round((await box('.ib-pfoot [data-foot-status]')).y - (await send()).y)).toBeLessThan(10);
+  const wide = { row: await box('.ib-pfoot [data-foot-row]'), status: await box('.ib-pfoot [data-foot-status]'), send: await send(), reask: await reask() };
+  expect(Math.abs(wide.status.y + wide.status.height / 2 - (wide.send.y + wide.send.height / 2))).toBeLessThan(2);
+  expect(wide.status.x).toBeGreaterThan(wide.reask.x + wide.reask.width);
+  expect(Math.abs(wide.status.x + wide.status.width - (wide.row.x + wide.row.width))).toBeLessThan(2);
+  await shot('04d-foot-status-right');
+  // A phone: the status takes its own line above the buttons, and every button stays on one line below it.
+  await page.setViewportSize({ width: 390, height: 844 });
+  // Read in one frame (the layout moves while the window settles into the phone's).
+  const narrow = () =>
+    page.evaluate(() => {
+      const r = (sel: string) => document.querySelector(sel)!.getBoundingClientRect();
+      const [row, status, send, reask] = ['[data-foot-row]', '[data-foot-status]', '[data-foot-buttons] .ib-btn.ib-pri', '[data-foot-buttons] [data-reask]'].map((s) => r(`.ib-pfoot ${s}`));
+      return { above: status!.bottom <= send!.top, start: Math.abs(status!.left - row!.left) < 2, oneLine: Math.abs(reask!.top - send!.top) < 2 };
+    });
+  await expect.poll(narrow).toEqual({ above: true, start: true, oneLine: true });
+  await shot('04e-foot-status-above');
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await page.goto(world.url);
   await expect(pane).toHaveCount(0);
 });
 

@@ -83,7 +83,8 @@ import {
 } from "@plannotator/shared/config";
 import { getPlannotatorDataDir } from "@plannotator/shared/data-dir";
 import { normalizeStableVersion, readUpdateState } from "@plannotator/shared/update-check";
-import { isLoopbackHostHeader } from "@plannotator/shared/loopback-host";
+import { isLoopbackHostHeader, isLoopbackForwardedFor } from "@plannotator/shared/loopback-host";
+import { prepareAppHtml, prewarmAppHtml } from "@plannotator/shared/app-html";
 import type { InboxSearchIndex, InboxSearchIndexOptions } from "@plannotator/shared/inbox/search";
 import { createInboxSearchRoutes } from "./inbox-search";
 import { inboxSkillsRoute } from "./inbox-skills";
@@ -96,6 +97,7 @@ import {
   INBOX_BRIDGE_EVENT_PATH,
   INBOX_BRIDGE_POLL_MAX_MS,
   INBOX_BRIDGE_POLL_PATH,
+  inboxReaskItemsOf,
   INBOX_MAX_REQUEST_BYTES,
   INBOX_SEND_NOW_POLL_FIELD,
   INBOX_TAGS_POLL_FIELD,
@@ -154,8 +156,10 @@ import {
 } from "./inbox-agents";
 import { addInboxNote, INBOX_NOTE_BLOCK, inboxNotesDisabled, markNotesAsked, noteCandidateIds, notesAsked, noteStatus, removeInboxNote } from "./inbox-agent-notes";
 import {
+  displayInboxSubject,
   INBOX_AGENT_IDS,
   INBOX_AGENT_LABELS,
+  INBOX_AUTO_SEND_AFTER_MS,
   INBOX_NOTE_AGENT_IDS,
   type InboxAgentId,
   type InboxConnectReport,
@@ -165,8 +169,8 @@ import {
 /** Where a request came in: the window's loopback port, or the tailnet-only listener `tailscale serve` points at. */
 type RequestVia = "local" | "tailnet";
 
-/** Headers `tailscale serve` sets on every proxied request (X-Forwarded-For always; the identity for a user's device). */
-const SERVE_HEADERS = ["tailscale-headers-info", "tailscale-user-login", "x-forwarded-for"] as const;
+/** Headers `tailscale serve` sets on every proxied request (the identity headers for a user's device). */
+const SERVE_IDENTITY_HEADERS = ["tailscale-headers-info", "tailscale-user-login"] as const;
 
 const LOOPBACK = "127.0.0.1";
 /** A palette id as packages/ui/themes names them (`plannotator`, `tokyo-night`). */
@@ -179,6 +183,12 @@ const DEFAULT_HEALTH_TICK_MS = 60_000;
 const INBOX_RESTART_WATCH_MS = 5_000;
 /** How often the live sessions' delivery signature is compared while a window listens (`event: deliveries`). */
 const INBOX_DELIVERY_WATCH_MS = 1_000;
+/**
+ * How often the Inbox looks for replies that waited `INBOX_AUTO_SEND_AFTER_MS`
+ * on a busy session (approval "inbox-busy-agent-reply"): a few seconds late at
+ * most, and every poll of a busy session looks too.
+ */
+export const INBOX_AUTO_SEND_SWEEP_MS = 5_000;
 /**
  * How often the Inbox checks that `inbox.json` is still there and still its
  * own (`probeInboxData`); two misses in a row end it, so an Inbox whose data
@@ -286,6 +296,15 @@ export interface InboxServerOptions {
    */
   setAsideDelayMs?: number;
   /**
+   * How long a reply (a message, a Re-ask note; never a 👍 note) waits on a busy session before
+   * it goes into the running turn by itself, where that session's connection
+   * can take it mid-turn. Default `INBOX_AUTO_SEND_AFTER_MS` (5 minutes).
+   * Tests shorten it.
+   */
+  autoSendAfterMs?: number;
+  /** Tests: how often the Inbox looks for replies due to go in by itself. Default `INBOX_AUTO_SEND_SWEEP_MS`. */
+  autoSendSweepMs?: number;
+  /**
    * Where the agents the Inbox connects itself to live (home, environment,
    * PATH, running their CLIs; inbox-agents.ts). Default: this process's.
    * Tests give temp folders and fake CLIs.
@@ -363,6 +382,10 @@ const ERROR_STATUS: Record<string, number> = {
   ack_after_reply: 409,
   question_open: 409,
   idempotency_key_reused: 409,
+  // Action items (approval "inbox-next-actions"): a Done already sent (no Undo), an action item no longer open, an agent's `done` that names no open action item.
+  action_already_sent: 409,
+  action_closed: 409,
+  invalid_done: 422,
   // The project menu: a batch_id already answered another project or action.
   batch_id_reused: 409,
   config_not_saved: 500,
@@ -448,6 +471,57 @@ const WINDOW_CSP = [
 /** `/` before the window is built (a source run, the server tests). */
 const NOT_BUILT_PAGE =
   '<!doctype html><meta charset="utf-8"><title>Plannotator Inbox</title><p data-inbox-not-built>The Inbox window is not built: run <code>bun run build:hook</code>.</p>';
+
+/** The window page's security headers, on every answer for `/`. */
+const WINDOW_PAGE_HEADERS = {
+  "X-Content-Type-Options": "nosniff",
+  "X-Frame-Options": "DENY",
+  "Referrer-Policy": "no-referrer",
+  "Content-Security-Policy": WINDOW_CSP,
+} as const;
+
+/** One tag per page body, computed once (the page is ~22 MB; it changes only with the binary). */
+let windowPageTag: { page: string; etag: string } | null = null;
+function windowPageEtag(page: string): string {
+  if (windowPageTag?.page !== page) windowPageTag = { page, etag: `W/"${Bun.hash(page).toString(36)}"` };
+  return windowPageTag.etag;
+}
+
+function etagMatches(header: string | null, etag: string): boolean {
+  if (!header) return false;
+  const bare = etag.replace(/^W\//, "");
+  return header.split(",").some((tag) => {
+    const t = tag.trim();
+    return t === "*" || t.replace(/^W\//, "") === bare;
+  });
+}
+
+/**
+ * `/` through the tailnet listener (#2032): the page compressed as remote-mode
+ * and `--tailscale` sessions serve theirs (#1617, `packages/shared/app-html.ts`),
+ * brotli in practice since serve is HTTPS. The window's own loopback port keeps
+ * the uncompressed `no-store` answer: on loopback the transfer is free and the
+ * one-time compression pass only delays the first load.
+ *
+ * Cache: `private, no-cache` with a weak ETag, not `no-store`. The page is the
+ * same bytes until a restart to update swaps the binary, and a phone on cellular
+ * opens it many times a day, so a revalidation that answers 304 saves the ~5 MB
+ * body; `no-cache` still asks every time, so a new build is never missed. The tag
+ * is weak because the br, gzip and identity bodies are one page (one tag fits all
+ * three under `Vary: Accept-Encoding`). The data routes stay `no-store`.
+ * The listener's checks (owner login, served Host, Sec-Fetch-Site) ran before this.
+ */
+async function tailnetWindowPage(req: Request, page: string): Promise<Response> {
+  const etag = windowPageEtag(page);
+  const cacheHeaders = { "Cache-Control": "private, no-cache", ETag: etag, Vary: "Accept-Encoding" };
+  if (etagMatches(req.headers.get("if-none-match"), etag)) {
+    return new Response(null, { status: 304, headers: { ...WINDOW_PAGE_HEADERS, ...cacheHeaders } });
+  }
+  const prepared = await prepareAppHtml(page, req.headers.get("accept-encoding"), true);
+  const headers = { ...prepared.headers, ...WINDOW_PAGE_HEADERS, ...cacheHeaders, "Content-Type": "text/html; charset=utf-8" };
+  // A Buffer is a valid fetch body; the lib types lag.
+  return new Response(req.method === "HEAD" ? null : (prepared.body as BodyInit), { headers });
+}
 
 function errorResponse(error: unknown): Response {
   if (error instanceof InboxError) {
@@ -557,6 +631,22 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     (timer as { unref?: () => void }).unref?.();
     setAsideTimers.add(timer);
   };
+  // Action items (approval "inbox-next-actions"): the person's Done or Can't do it goes to the agent once the same Undo window has passed.
+  const settleActions = () => {
+    try {
+      store.settleActions(setAsideDelayMs);
+    } catch (error) {
+      process.stderr.write(`Inbox: an action item's Done was not sent: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
+  const scheduleActionSettle = () => {
+    const timer = setTimeout(() => {
+      setAsideTimers.delete(timer);
+      settleActions();
+    }, setAsideDelayMs + 50);
+    (timer as { unref?: () => void }).unref?.();
+    setAsideTimers.add(timer);
+  };
   const token = createInboxToken();
   // Read once per start: the phone surface stays hidden until the iPhone app ships.
   const phonesOn = options.phones ?? resolveInboxPhones(loadConfig());
@@ -570,8 +660,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const draftListeners = new Set<(threadId: string) => void>();
   // The Inbox windows open now and whether any can show a notification (inbox-windows.ts).
   const windows = createInboxWindows({ graceMs: options.windowGraceMs });
+  /** Event streams open now (health's `event_streams`): Inbox tabs of one origin share one. */
+  let openEventStreams = 0;
   const binaryPath = options.binaryPath !== undefined ? options.binaryPath : version !== "dev" ? process.execPath : null;
-  // The sidebar's Update button (packages/server/inbox-updates.ts): the daily
+  // The sidebar's Update button (packages/server/inbox-updates.ts): the hourly
   // release check, the binary on disk, Update now, Remind me tomorrow.
   const updates = createInboxUpdates({
     dataDir,
@@ -674,6 +766,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     pid: process.pid,
     update: updates.current(),
     notify_reach: windows.reach(notificationsState().enabled),
+    // Additive: event streams open now (windows' and the phone door's). Inbox tabs of one origin share one.
+    event_streams: openEventStreams,
   });
 
   /**
@@ -1319,6 +1413,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     return inboxToolState();
   };
 
+  // A message line as served: its subject as shown (one line, no leaked tool-call text), never as stored.
+  const shownSubject = (record: InboxMessage): InboxMessage =>
+    record.subject ? { ...record, subject: displayInboxSubject(record.subject) } : record;
+
   const eventPayload = (line: InboxLine) => {
     switch (line.kind) {
       case "project":
@@ -1326,7 +1424,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return { seq: line.seq, kind: line.kind, id: line.id, project: { ...line.record, name: store.project(line.id)?.name ?? line.record.name } };
       case "message":
         // `first` (additive): this line is the message's first, not a later rewrite (a look, a resolve, an Unarchive).
-        return { seq: line.seq, kind: line.kind, id: line.id, first: store.messageCursor(line.id) === line.seq, message: line.record };
+        return { seq: line.seq, kind: line.kind, id: line.id, first: store.messageCursor(line.id) === line.seq, message: shownSubject(line.record) };
       case "question":
         // The store's one question state: a question an agent asked after the archive line is live (notifications, the sound).
         return { seq: line.seq, kind: line.kind, id: line.id, question: store.questionWire(line.record) };
@@ -1352,6 +1450,16 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       return Number.isSafeInteger(value) ? value : null;
     };
     const cursor = seqOf(req.headers.get("last-event-id")) ?? seqOf(url.searchParams.get("cursor"));
+    // `once=1` (additive): the hello and the replay after the cursor, then the response ends. A tab that
+    // listens to another tab's stream (packages/inbox/sharedEvents.ts) fetches what it missed (it slept,
+    // or the new leader started past it) without holding a connection open. Not counted as a stream.
+    if (url.searchParams.get("once") === "1") {
+      let text = `event: hello\ndata: ${JSON.stringify({ serverSession, cursor: store.cursor() })}\n\n`;
+      if (cursor !== null) for (const line of store.changesSince(cursor)) text += `id: ${line.seq}\nevent: record\ndata: ${JSON.stringify(eventPayload(line))}\n\n`;
+      return new Response(text, {
+        headers: { "Content-Type": "text/event-stream; charset=utf-8", "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff" },
+      });
+    }
     const encoder = new TextEncoder();
     let cleanup = () => {};
     const stream = new ReadableStream<Uint8Array>({
@@ -1363,6 +1471,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
             cleanup();
           }
         };
+        openEventStreams += 1;
+        let counted = true;
         const sendLine = (line: InboxLine) => send(`id: ${line.seq}\nevent: record\ndata: ${JSON.stringify(eventPayload(line))}\n\n`);
         send(`retry: 2000\nevent: hello\ndata: ${JSON.stringify({ serverSession, cursor: store.cursor() })}\n\n`);
         if (cursor !== null) for (const line of store.changesSince(cursor)) sendLine(line);
@@ -1394,6 +1504,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (windowId) deliveryListeners.add(sendDeliveries);
         const heartbeat = setInterval(() => send(": ping\n\n"), SSE_HEARTBEAT_MS);
         cleanup = () => {
+          if (counted) {
+            counted = false;
+            openEventStreams -= 1;
+          }
           clearInterval(heartbeat);
           unsubscribe();
           statusListeners.delete(onStatus);
@@ -1510,6 +1624,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       ...(reply.ack_of ? { ack_of: reply.ack_of } : {}),
       // The person's Re-ask (approval "inbox-reask"): the wake takes INBOX_REASK_INSTRUCTION.
       ...((reply.reask?.length ?? 0) > 0 ? { reask: true } : {}),
+      // What the note lists (#2059): the wake names action items only when it lists some.
+      ...(inboxReaskItemsOf(reply.reask) ? { reask_items: inboxReaskItemsOf(reply.reask) } : {}),
     };
   };
 
@@ -1530,6 +1646,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     const sendNow = body[INBOX_SEND_NOW_POLL_FIELD] === true;
     // Tags: what this session was only tagged in goes to a connection that words it truthfully.
     const tags = body[INBOX_TAGS_POLL_FIELD] === true;
+    // A busy session that can take an item mid-turn: what has waited long enough goes in now.
+    const steer = live.deliveryConnectionOf(session);
+    if (sendNow && steer?.busy === true && steer.send_now) autoSendFor(session, tags);
     const commands = () => store.pendingReplies(session, { tags }).map((reply) => replyCommand(reply, sendNow, session));
     const now = commands();
     if (now.length > 0 || waitMs === 0) {
@@ -1578,7 +1697,15 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     if (body.type !== "delivered" || typeof body.id !== "string") {
       throw new InboxError("validation_error", 'type: "delivered" with the reply id, or "state" with busy.', { field: "type" });
     }
-    const reply = store.recordDelivery(body.id, { host, session });
+    // An item the Inbox marked to go in by itself: whether it went into the running turn, or waited for the
+    // turn to end (the session was seen idle after the mark: its own Ask question held the turn).
+    const marked = store.message(body.id);
+    const markedAt = marked
+      ? marked.tags?.find((tag) => tag.session === session && tag.deliver_now_by === "auto")?.deliver_now_at ??
+        (marked.deliver_now_by === "auto" ? marked.deliver_now_at : null)
+      : null;
+    const intoTurn = markedAt ? live.deliveredIntoTurn(session, markedAt) : undefined;
+    const reply = store.recordDelivery(body.id, { host, session, ...(intoTurn !== undefined ? { intoTurn } : {}) });
     return json({ ok: true, delivery: reply.delivery });
   };
 
@@ -1620,7 +1747,38 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     },
     displayFolder: (path) => displayPath(path, agentEnvironment) ?? path,
     restartCommandOf: (host, folder, session) => (host === "claude-code" ? claudeRestartCommand(folder, session) : null),
+    autoSendAfterMs: options.autoSendAfterMs ?? INBOX_AUTO_SEND_AFTER_MS,
   });
+
+  // A reply that waited 5 minutes on a busy session goes into its running turn by itself, as if the person
+  // pressed Send now (owner approval "inbox-busy-agent-reply", 2026-10-21). Only where that session's
+  // connection can take it mid-turn (`send_now`). The wait is the live sessions' clock, started the first
+  // time that session was seen busy and able to take it while the item waited (never the item's
+  // `created_at`); a restart or the session going away starts it again. The store marks it once
+  // (`deliver_now_by: "auto"`); the mark is a store line, which answers the session's held poll with `now: true`.
+  const autoSendFor = (session: string, tags: boolean) => {
+    try {
+      store.autoSendDue(session, { afterMs: live.autoSendAfterMs, tags, clockOf: (id) => live.waitClockOf(session, id) });
+    } catch (error) {
+      process.stderr.write(`Inbox: a reply did not go in by itself: ${error instanceof Error ? error.message : String(error)}\n`);
+    }
+  };
+  const autoSendSweep = () => {
+    live.trackWaits();
+    for (const { session, tags } of live.steerableSessions()) autoSendFor(session, tags);
+  };
+  // A person's item written while its session is already busy starts its clock at once, not at the next sweep.
+  let waitsQueued = false;
+  const unsubscribeWaits = store.subscribe((line) => {
+    if (line.kind !== "message" || line.record.author.kind !== "person" || waitsQueued) return;
+    waitsQueued = true;
+    queueMicrotask(() => {
+      waitsQueued = false;
+      live.trackWaits();
+    });
+  });
+  const autoSendWatch = setInterval(autoSendSweep, options.autoSendSweepMs ?? INBOX_AUTO_SEND_SWEEP_MS);
+  (autoSendWatch as { unref?: () => void }).unref?.();
   // The sidebar's "Reload Claude Code N" is pushed as it changes (a session restarts, goes away, or an update lands).
   let lastRestartCount = 0;
   const restartWatch = setInterval(() => {
@@ -1632,7 +1790,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   (restartWatch as { unref?: () => void }).unref?.();
 
   // The list rows' delivery (approval "inbox-row-delivery"): the store reads the live sessions for it.
-  store.setDeliveryPresence({ connection: live.deliveryConnectionOf, askerLive: live.askerLive });
+  store.setDeliveryPresence({
+    connection: live.deliveryConnectionOf,
+    askerLive: live.askerLive,
+    autoSendAfterMs: live.autoSendAfterMs,
+    waitOf: live.waitOf,
+  });
   // A session's turn starting or ending, its connection going away, or an asker grace running out moves a
   // row's delivery without writing a store line. The sessions' delivery signature is compared on a short
   // timer, only while a window listens, and `event: deliveries` tells the windows to read the list again.
@@ -1813,17 +1976,34 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       if (path === "/api/inbox/threads" && req.method === "GET") return json(listModel(projectFilterOf(url), archivedModeOf(url)));
       if (path === "/api/inbox/threads/archived" && req.method === "GET") return json(archivedModel(url));
       if (path === "/api/inbox/projects" && req.method === "GET") return json({ serverSession, cursor: store.cursor(), projects: projectFolders() });
-      if (path === "/api/inbox/events" && req.method === "GET") return eventStream(req, url, via);
+      if (path === "/api/inbox/events" && req.method === "GET") {
+      // Another site's page must not hold (or time) a stream of everything the Inbox holds:
+      // refused like the other read routes. The phone's door and agents send no fetch metadata.
+      if (!isSameOriginOrNoOrigin(origin, req.headers.get("host") ?? "", req.headers.get("sec-fetch-site"))) {
+        return json({ error: "Cross-origin requests are not accepted.", code: "cross_origin" }, 403);
+      }
+      return eventStream(req, url, via);
+    }
       // A window's report: its browser's notification permission for its own origin changed (inbox-windows.ts).
       if (path === "/api/inbox/window") {
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         const body = await readBody(req);
         if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
         const windowId = parseWindowId(body.window);
-        const permission = parseWindowPermission(body.permission);
         if (!windowId) throw new InboxError("validation_error", "window: 8 to 64 letters, digits, - or _.", { field: "window" });
+        // The tab closed (its pagehide beacon, or the tab that holds the shared stream saw it go): it stops counting.
+        if (body.gone === true) {
+          windows.leave(windowId);
+          return json({ notify_reach: windows.reach(notificationsState().enabled) });
+        }
+        const permission = parseWindowPermission(body.permission);
         if (!permission) throw new InboxError("validation_error", "permission: granted, default, denied or unsupported.", { field: "permission" });
-        windows.report(windowId, { permission, origin: parseWindowOrigin(body.origin), via });
+        // `served_by` (additive): the tab whose event stream this tab listens to (tabs share one stream).
+        const servedBy = body.served_by === undefined || body.served_by === null ? null : parseWindowId(body.served_by);
+        if (body.served_by !== undefined && body.served_by !== null && !servedBy) {
+          throw new InboxError("validation_error", "served_by: 8 to 64 letters, digits, - or _.", { field: "served_by" });
+        }
+        windows.report(windowId, { permission, origin: parseWindowOrigin(body.origin), via, servedBy });
         return json({ notify_reach: windows.reach(notificationsState().enabled) });
       }
       if (path === "/api/inbox/restart") {
@@ -2067,6 +2247,19 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json(result);
       }
 
+      // An action item (approval "inbox-next-actions"): the person's Done (with an
+      // optional note) or Can't do it (with a reason), sent to the agent once
+      // the Undo window passes; `{ outcome: null }` is the Undo.
+      const actionMatch = /^\/api\/inbox\/messages\/([A-Za-z0-9_]+)\/actions\/(a-[0-9a-f]{8}(?:-\d{1,3})?)$/.exec(path);
+      if (actionMatch) {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        const questions = store.markAction(actionMatch[1]!, actionMatch[2]!, { outcome: body.outcome, note: body.note });
+        if (body.outcome !== null) scheduleActionSettle();
+        return json({ questions });
+      }
+
       // The project menu (design record "inbox-project-menu"): Mark all as
       // read and Archive all on one project, and their Undo. Loops over the
       // single actions (packages/shared/inbox/project-batch.ts); the same
@@ -2124,6 +2317,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
             const result = unarchiveProject(store, projectId, undo);
             // Unarchived: a Mark read's set-aside note an archive held back is due again (as for the single Unarchive).
             for (const id of undo.resolved) if (result.done.includes(id)) scheduleSetAside(id);
+            // An action item's Done an archive held back is sent once the thread is open again.
+            if (result.done.length > 0) {
+              settleActions();
+              if (store.actionsPending() > 0) scheduleActionSettle();
+            }
             answer = { project: folder(), threads: rows(result.done), skipped: result.skipped };
           }
         }
@@ -2180,12 +2378,14 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
                 idempotency_key: body.idempotency_key as string,
                 feedback: typeof body.feedback === "string" ? body.feedback : undefined,
                 annotation_ids: body.annotation_ids as never,
-                skip_unanswered: body.skip_unanswered === true,
+                // The questions the person chose to skip ("Skip them"): only these. The old
+                // `skip_unanswered` flag is ignored (approval "inbox-explicit-skip", 2026-10-21).
+                skip: body.skip,
               });
             } catch (error) {
               removeInboxAttachmentFiles(store.dir, attachments);
-              // A skip-only target whose questions closed meanwhile: a no-op, so
-              // the rest of a multi-message Send still goes.
+              // A skip-only Send whose questions closed meanwhile: a no-op, so
+              // the rest of a Send to several sessions still goes.
               if (error instanceof InboxError && error.code === "nothing_to_send") {
                 return json({ message_id: messageId, questions: store.questionsOf(messageId), reply: null, replayed: false, nothing_to_send: true });
               }
@@ -2231,7 +2431,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
             }
             const thread = store.resolveThread(messageId, body.resolved !== false);
             // Unarchived: a Mark read's set-aside note an archive held back is due again.
-            if (body.resolved === false) scheduleSetAside(thread.thread_id);
+            if (body.resolved === false) {
+              scheduleSetAside(thread.thread_id);
+              // An action item's Done an archive held back (archived inside its Undo window) is sent now, or when its window passes.
+              settleActions();
+              if (store.actionsPending() > 0) scheduleActionSettle();
+            }
             return json({ thread });
           }
         }
@@ -2242,15 +2447,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const canonical = inboxCanonicalRedirect(req, url, port, via);
         if (canonical) return canonical;
         const page = options.htmlContent ?? NOT_BUILT_PAGE;
+        if (via === "tailnet") return tailnetWindowPage(req, page);
         return new Response(req.method === "HEAD" ? null : page, {
-          headers: {
-            "Content-Type": "text/html; charset=utf-8",
-            "Cache-Control": "no-store",
-            "X-Content-Type-Options": "nosniff",
-            "X-Frame-Options": "DENY",
-            "Referrer-Policy": "no-referrer",
-            "Content-Security-Policy": WINDOW_CSP,
-          },
+          headers: { ...WINDOW_PAGE_HEADERS, "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
         });
       }
       if (path === "/favicon.png" && req.method === "GET") return handleFavicon();
@@ -2295,9 +2494,18 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
    * Such a mapping hands the tailnet the whole Inbox, `/mcp` included (serve
    * passes a peer's own Host through), so the request is refused and Settings
    * offers the owner-only address instead.
+   *
+   * Note on X-Forwarded-For (#1867): a local reverse proxy (e.g. nginx, Caddy,
+   * portless) also adds X-Forwarded-For with loopback IP(s). That is NOT tailscale
+   * serve exposure. Tailscale serve forwards the peer's tailnet/remote IP. We only
+   * treat X-Forwarded-For as tailnet exposure if it contains a non-loopback address.
    */
   const fetch = (req: Request): Promise<Response> => {
-    if (SERVE_HEADERS.some((name) => req.headers.has(name))) {
+    const hasTailscaleHeader = SERVE_IDENTITY_HEADERS.some((name) => req.headers.has(name));
+    const forwardedFor = req.headers.get("x-forwarded-for");
+    const hasExternalForwardedFor = forwardedFor !== null && !isLoopbackForwardedFor(forwardedFor);
+
+    if (hasTailscaleHeader || hasExternalForwardedFor) {
       tailscale.noteServedRequest();
       return Promise.resolve(localOnly());
     }
@@ -2331,6 +2539,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     port: () => port,
     registry: () => registry,
     dispatch: (req) => handle(req, "tailnet"),
+    // Compress the page for the tailnet before the first phone asks (#2032).
+    onListen: () => prewarmAppHtml(options.htmlContent ?? NOT_BUILT_PAGE, "br"),
     tailscale: options.tailscale,
     flag: options.publishTailnet === true,
     maxRequestBodySize: INBOX_MAX_REQUEST_BYTES,
@@ -2401,6 +2611,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // An ack a stop interrupted inside its Undo window.
     settleAcks();
     if (store.acksPending() > 0) scheduleAckSettle();
+    // An action item's Done a stop interrupted inside its Undo window.
+    settleActions();
+    if (store.actionsPending() > 0) scheduleActionSettle();
   }, 0);
 
   let stopped = false;
@@ -2421,6 +2634,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     clearInterval(uploadSweep);
     clearInterval(restartWatch);
     clearInterval(deliveryWatch);
+    clearInterval(autoSendWatch);
+    unsubscribeWaits();
     void mcp.close().catch(() => {});
     server.stop(true);
     // The tailnet mapping and the door listener, the Wi-Fi listener and its

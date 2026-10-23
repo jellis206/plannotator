@@ -27,6 +27,7 @@ import { annotateDraftFilePath, createAnnotateDraftSession } from "@plannotator/
 import { isPathAllowed } from "@plannotator/shared/doc-resolve";
 import { getPlanVersion, getVersionCount, listVersions } from "@plannotator/shared/storage";
 import { computeAnnotateHistory, deriveAnnotateHistorySlug, persistAnnotateSubmission, type AnnotateHistoryResult } from "@plannotator/shared/annotate-history";
+import { ANNOTATE_LIVE_VERSION_PATH, annotateLiveVersionFilePath, saveAnnotateLiveVersion } from "@plannotator/shared/annotate-live-version";
 import { htmlDiff } from "@plannotator/shared/html-diff";
 import {
   disabledSourceSave,
@@ -56,7 +57,7 @@ import {
   type AnnotateClientLeaseStreamSession,
 } from "@plannotator/shared/annotate-client-lease";
 import { createAnnotateDecisionSettler, isNothingToSendFeedbackBody } from "@plannotator/shared/annotate-decision";
-import { agentToolSaveFailed, saveConfig, detectGitUser, getServerConfig, isAgentTerminalSide, loadConfig, resolveAIEnabled, resolveAnnotateHistory, resolveFeedbackHistory } from "./config";
+import { agentSwitchConfigToSave, agentToolSaveFailed, saveConfig, detectGitUser, getServerConfig, isAgentTerminalSide, loadConfig, resolveAIEnabled, resolveAnnotateHistory, resolveFeedbackHistory } from "./config";
 import { getAutoUpdateAdvert, getUpdateAdvert, handleUpdateRoute } from "./auto-update";
 import { appendFeedbackRecord, type FeedbackDecision, type FeedbackSurface } from "@plannotator/shared/feedback-archive";
 import { isFaviconStyle, type FaviconStyle } from "@plannotator/shared/favicon";
@@ -692,6 +693,13 @@ export async function startAnnotateServer(
       ? initialSingleFileSourceSave.path
       : resolveUserPath(filePath)
     : null;
+  // The file a live version save (#2037) reads and keys history by: the same
+  // resolved path the open-time save used, so both land in one history.
+  const liveVersionFilePath = annotateLiveVersionFilePath({
+    sourceSaveEligible: singleFileSourceSaveEligible && singleFileLocalAnnotate,
+    resolvedFilePath: resolvePath(filePath),
+    realFilePath: initialSingleFileSourcePath,
+  });
   // A review of several files: Edit Mode may write exactly the bundle's own
   // files (real paths, captured now, as a single-file session captures its
   // one file), never a document they link to.
@@ -980,6 +988,9 @@ export async function startAnnotateServer(
                     diffCurrent: servedIsSnapshot || !servedHtml ? annotateHistory.diffCurrent : servedHtml,
                   }
                 : {}),
+              // The editor may save a disk change as a version (#2037); absent
+              // when history is off or the file is not Markdown/text.
+              ...(liveVersionFilePath && annotateHistoryEnabled ? { liveVersions: true } : {}),
               sharingEnabled,
               shareBaseUrl,
               pasteApiUrl,
@@ -1081,6 +1092,32 @@ export async function startAnnotateServer(
             });
           }
 
+          // API: save the file as it is on disk now as a version (#2037).
+          // The editor posts here once an agent's edit to the open file has
+          // settled, naming the source hash of the text it shows; the server
+          // reads the file itself and saves it only when the bytes still have
+          // that hash. Single local Markdown/text sessions only, and never
+          // with PLANNOTATOR_ANNOTATE_HISTORY=0 (annotate-live-version.ts).
+          if (url.pathname === ANNOTATE_LIVE_VERSION_PATH && req.method === "POST") {
+            // A body that is not JSON reads as {} (Pi's parseBody does the
+            // same), so both runtimes answer it with one 400.
+            let body: unknown;
+            try {
+              body = await req.json();
+            } catch {
+              body = {};
+            }
+            const outcome = saveAnnotateLiveVersion(body, {
+              serverSession,
+              historyEnabled: annotateHistoryEnabled,
+              resolvedFilePath: liveVersionFilePath,
+              project: annotateProjectName,
+            });
+            // Later /api/plan reads (a tab reload) describe the new version.
+            if (outcome.status === 200) annotateHistory = outcome.history;
+            return Response.json(outcome.body, { status: outcome.status });
+          }
+
           if (url.pathname === "/api/share-html" && req.method === "GET") {
             return loadShareHtml(url.searchParams.get("path"));
           }
@@ -1122,8 +1159,12 @@ export async function startAnnotateServer(
               return Response.json({ error: "Cross-origin config writes are not allowed" }, { status: 403 });
             }
             try {
-              const body = (await req.json()) as { displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; updateCheck?: unknown; agentTool?: unknown; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
+              const body = (await req.json()) as { agentSwitch?: unknown; displayName?: string; diffOptions?: Record<string, unknown>; theme?: Record<string, unknown>; favicon?: FaviconStyle; autoUpdate?: unknown; updateCheck?: unknown; agentTool?: unknown; conventionalComments?: boolean; conventionalLabels?: unknown[] | null; agentTerminalSide?: unknown; agentTerminalDefaultAgent?: unknown };
               const toSave: Record<string, unknown> = {};
+              // OpenCode's agent switch (#1390): a known shape or nothing is saved.
+              const agentSwitch = agentSwitchConfigToSave(body);
+              if (agentSwitch === null) return Response.json({ error: "Invalid agentSwitch" }, { status: 400 });
+              if (agentSwitch !== undefined) toSave.agentSwitch = agentSwitch;
               if (body.displayName !== undefined) toSave.displayName = body.displayName;
               if (body.diffOptions !== undefined) toSave.diffOptions = body.diffOptions;
               if (body.theme !== undefined) toSave.theme = body.theme;

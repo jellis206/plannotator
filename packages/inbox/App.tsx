@@ -10,9 +10,10 @@
  * Decisions page (`#decisions=…`) opens the list.
  */
 
+import type { ActionMark } from './components/ActionChecklist';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { ThemeProvider } from '@plannotator/ui/components/ThemeProvider';
-import { TooltipProvider } from '@plannotator/ui/components/Tooltip';
+import { TooltipProvider, TOOLTIP_SKIP_DELAY_MS } from '@plannotator/ui/components/Tooltip';
 import { TIP_DELAY_MS } from './components/Tip';
 import { configurePlannotatorUI } from '@plannotator/ui/configure';
 import { selectionToolbarShowing } from './selectionToolbar';
@@ -30,6 +31,7 @@ import {
   type UpdateDetails,
   type WhatsNewModel,
 } from './api';
+import { discardPreparedInboxEvents, prepareInboxEvents } from './sharedEvents';
 import { addOwnThreads, adoptKeepingOpen, filterSections, heldNotice, markHeldRowArchived, refreshHeldRows, settleOwn, settleThread, showBroughtIn, waitingCount, type OpenThread } from './held';
 import { hasMovingDelivery } from './rowDelivery';
 import {
@@ -59,6 +61,7 @@ import { useShortcutScope } from '@plannotator/ui/shortcuts';
 import { inboxThreadShortcuts } from './shortcuts/thread.shortcuts';
 import { isComposingKey, isEditableTarget, isRepeatKey } from './shortcuts/guards';
 import { EmptyState } from './components/EmptyState';
+import { ThreadWait } from './components/ThreadWait';
 import { AgentNoteDialog } from './components/AgentNoteDialog';
 import { cardReport, noteQuestionRows } from './agents';
 import type { InboxAgentRow, InboxAgentsModel, InboxConnectReport } from '@plannotator/core/inbox-types';
@@ -83,6 +86,7 @@ import { installPasteFollowsField } from './pasteTarget';
 import { installPlainTextPaste } from '@plannotator/ui/utils/pasteInsert';
 import { LIST_MIN_WIDTH, THREAD_BESIDE_FILE_WIDTH, paneGutters, useStack } from './stack';
 import { backTo, pushScreen } from './history';
+import { parseFileView, sameScreenAnyView } from './fileView';
 import { adoptSavedTheme, inboxThemeSync } from './theme';
 import { adoptSavedTextSize, applyRememberedTextSize } from './textSize';
 import { parseSettingsHash, settingsHash, type SettingsSection } from './settingsRoute';
@@ -107,6 +111,8 @@ configurePlannotatorUI({
   // ui's own hover text (annotation panel and toolbar, question cards, links to attachments) as ui's Tooltip,
   // never a native title (the owner, 2026-10-17).
   componentTooltips: true,
+  // A digit-only #186379 in a message is a PR or issue of the project's repo, not a colour (#1932).
+  digitHexIssueRefs: true,
   // Images in a message load from the Inbox's per-message route (#1813).
   imageSrcResolver: inboxImageSrcResolver,
   webmcp: { enabled: false, namePrefix: 'plannotator.' },
@@ -129,7 +135,7 @@ configurePlannotatorUI({
 });
 
 const SIDEBAR_OPEN_COOKIE = 'plannotator-inbox-sidebar-open';
-/** The session the person last sent a new message to (compose preselects it while it is live). */
+/** The session the person last sent a new message to: first in the To picker and the palette's "Message <host>" while it is live; never put in To by itself. */
 const COMPOSE_LAST_COOKIE = 'plannotator-inbox-compose-last';
 /** How often the Drafts page reads its drafts again, so each chip follows its session. */
 const DRAFTS_REFRESH_MS = 10_000;
@@ -143,6 +149,24 @@ const SEEN_RETRY_MS = 1000;
 /** The What's new page asks again this often while the server fetches the notes (its request gives up after 10 s). */
 const WHATS_NEW_RETRIES = 15;
 const WHATS_NEW_RETRY_MS = 1000;
+/**
+ * Opening a thread whose read failed (a dropped connection, a 5xx; not a 404): read it again after
+ * these waits, then every last one, while it stays open. Before this the pane stayed blank until some
+ * agent wrote anywhere in the Inbox (the event stream re-reads the open thread), seconds or forever.
+ */
+export const THREAD_READ_RETRY_MS = [250, 1000, 2000, 4000, 5000] as const;
+/**
+ * A read of the open thread with no answer by then (a connection held behind
+ * the browser's six per host, a stalled server) fails and is read again, as
+ * a dropped one is; before this it waited for good.
+ */
+export const THREAD_READ_TIMEOUT_MS = 8000;
+/** Why the open thread is not on screen yet: its read failed (read again soon), or the server has no such thread. */
+interface ThreadLoad {
+  threadId: string;
+  state: 'failed' | 'missing';
+  error: string;
+}
 
 interface Route {
   page: 'inbox' | 'settings' | 'whats-new' | 'drafts';
@@ -152,9 +176,10 @@ interface Route {
   thread: string | null;
   /**
    * An attachment open beside the thread: `file=att_…`, `v=sent` for the version the agent sent, `at=` an annotation to show,
-   * `linked=` a page the attached HTML page links to, shown read-only over it (its path in the page's folder, `#fragment` kept).
+   * `linked=` a page the attached HTML page links to, shown read-only over it (its path in the page's folder, `#fragment` kept),
+   * `view=full|side` the view it is shown in (fileView.ts; absent: the remembered choice, then the rule by kind).
    */
-  file?: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null } | null;
+  file?: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null; view?: 'full' | 'side' | null } | null;
   /** The message whose guided review is open over the window (`#thread=…&guide=msg_…`). */
   guide?: string | null;
   /**
@@ -186,7 +211,7 @@ function routeOf(fullHash: string): Route {
     page: 'inbox',
     project: params.get('project'),
     thread,
-    file: fileId ? { id: fileId, version: params.get('v') === 'sent' ? 'sent' : 'current', focus: params.get('at'), linked: params.get('linked') } : null,
+    file: fileId ? { id: fileId, version: params.get('v') === 'sent' ? 'sent' : 'current', focus: params.get('at'), linked: params.get('linked'), view: parseFileView(params.get('view')) } : null,
     guide: thread ? params.get('guide') : null,
     msg: thread ? params.get('msg') : null,
   };
@@ -208,6 +233,8 @@ function hashOf(route: Route): string {
       if (route.file.version === 'sent') params.set('v', 'sent');
       if (route.file.focus) params.set('at', route.file.focus);
       if (route.file.linked) params.set('linked', route.file.linked);
+      // The view rides the address (fileView.ts), so a reload or a shared link opens the same way.
+      if (route.file.view) params.set('view', route.file.view);
     }
     if (route.thread && route.guide) params.set('guide', route.guide);
     hash = params.toString();
@@ -373,6 +400,27 @@ function Inbox() {
   const [thread, setThread] = useState<InboxThread | null>(null);
   /** The open thread's own list row, from its read: an archived thread has none in the list. */
   const [threadRow, setThreadRow] = useState<InboxListRow | null>(null);
+  /** The open thread's read when it has not landed: failed (read again soon) or missing (a 404). */
+  const [threadLoad, setThreadLoadState] = useState<ThreadLoad | null>(null);
+  const threadLoadRef = useRef<ThreadLoad | null>(null);
+  const setThreadLoad = useCallback((next: ThreadLoad | null) => {
+    const current = threadLoadRef.current;
+    // The same failure again (a retry): nothing changes on screen, so nothing is said again.
+    if (current && next && current.threadId === next.threadId && current.state === next.state && current.error === next.error) return;
+    threadLoadRef.current = next;
+    setThreadLoadState(next);
+  }, []);
+  /** Each read of a thread is numbered; an older one never overwrites a newer one that landed (A, then B, then A again). */
+  const threadReadSeq = useRef(0);
+  const threadReadApplied = useRef(0);
+  /** The open thread as last read, for the open effect when another read (the event stream's) landed first. */
+  const threadLoaded = useRef<InboxThread | null>(null);
+  /** Wakes the open effect's wait between retries when another read lands the thread. */
+  const wakeThreadRetry = useRef<(() => void) | null>(null);
+  /** Focus was in the thread's place when it gave way to the thread: it goes to the thread's subject. */
+  const focusThreadSubject = useRef(false);
+  /** Try again on the placeholder: the open effect reads the thread at once. */
+  const [threadRetry, setThreadRetry] = useState(0);
   /**
    * The open thread's "new since you looked" boundary (folding.ts), from
    * before this look, and `through`: what the window's looks this visit cover
@@ -683,21 +731,30 @@ function Inbox() {
   );
 
   const refreshThread = useCallback(async (threadId: string) => {
+    const mine = ++threadReadSeq.current;
     try {
-      const next = await inboxApi.thread(threadId);
-      if (routeRef.current.thread === threadId) {
+      const next = await inboxApi.thread(threadId, THREAD_READ_TIMEOUT_MS);
+      if (routeRef.current.thread === threadId && mine > threadReadApplied.current) {
+        threadReadApplied.current = mine;
+        threadLoaded.current = next.thread;
+        wakeThreadRetry.current?.();
         setThread(next.thread);
         setThreadRow(next.row ?? null);
+        setThreadLoad(null);
         // What is new since the last look, from the first read of this thread:
         // it lands before the window records the look, and is kept until the person leaves the thread.
         setLook((current) => (current?.threadId === threadId ? current : { threadId, seq: lookBoundary(next.thread), through: latestAgentSeq(next.thread) }));
       }
       return next.thread;
     } catch (cause) {
-      if (cause instanceof InboxApiError && cause.status === 404 && routeRef.current.thread === threadId) setThread(null);
+      if (routeRef.current.thread === threadId && mine > threadReadApplied.current) {
+        const missing = cause instanceof InboxApiError && cause.status === 404;
+        if (missing) setThread(null);
+        setThreadLoad({ threadId, state: missing ? 'missing' : 'failed', error: cause instanceof Error ? cause.message : String(cause) });
+      }
       return null;
     }
-  }, []);
+  }, [setThreadLoad]);
 
   const refreshSettings = useCallback(async () => {
     try {
@@ -786,10 +843,16 @@ function Inbox() {
     let deliveriesTimer: ReturnType<typeof setTimeout> | null = null;
     let draftsTimer: ReturnType<typeof setTimeout> | null = null;
     let cancelled = false;
+    // Listen to the tabs' shared stream before the first read, so nothing passed on between the read and the subscription is lost (sharedEvents.ts).
+    prepareInboxEvents();
     void (async () => {
       const first = await refreshList(true);
       void refreshSettings();
-      if (cancelled || !first) return;
+      if (cancelled || !first) {
+        // No subscription follows (the effect ended, or the first read failed): close the early channel.
+        discardPreparedInboxEvents();
+        return;
+      }
       // The threads already here: a later line of one of their roots is never a new thread (notify.ts).
       flushNotifications(first);
       unsubscribe = subscribeInboxEvents(first.cursor, {
@@ -835,6 +898,7 @@ function Inbox() {
     })();
     return () => {
       cancelled = true;
+      discardPreparedInboxEvents();
       unsubscribe();
       if (timer) clearTimeout(timer);
       if (deliveriesTimer) clearTimeout(deliveriesTimer);
@@ -853,12 +917,36 @@ function Inbox() {
       setThread(null);
       setThreadRow(null);
       setLook(null);
+      setThreadLoad(null);
       return;
     }
     let cancelled = false;
+    let retry: ReturnType<typeof setTimeout> | null = null;
+    threadLoaded.current = null;
+    // The thread's place, if it held focus, gives it to this thread's subject (ThreadWait's onFocusLeaving).
+    focusThreadSubject.current = false;
+    /** Another read (the event stream's) already put this thread on screen. */
+    const landed = () => (threadLoaded.current?.thread_id === threadId ? threadLoaded.current : null);
     void (async () => {
-      const opened = await refreshThread(threadId);
-      if (cancelled || !opened) return;
+      let opened: InboxThread | null = null;
+      // A read that fails (or has no answer in THREAD_READ_TIMEOUT_MS) is read again (THREAD_READ_RETRY_MS)
+      // while the thread stays open; a 404 is not.
+      for (let attempt = 0; !opened; attempt++) {
+        opened = (await refreshThread(threadId)) ?? landed();
+        if (cancelled) return;
+        if (opened) break;
+        // Another thread opened meanwhile, or the server said this one is not there.
+        if (routeRef.current.thread !== threadId || (threadLoadRef.current?.threadId === threadId && threadLoadRef.current.state === 'missing')) return;
+        const waitMs = THREAD_READ_RETRY_MS[Math.min(attempt, THREAD_READ_RETRY_MS.length - 1)]!;
+        await new Promise<void>((done) => {
+          retry = setTimeout(done, waitMs);
+          wakeThreadRetry.current = done;
+        });
+        retry = null;
+        wakeThreadRetry.current = null;
+        if (cancelled) return;
+        opened = landed();
+      }
       closing.current = null;
       if (listCovered() && COVERED_LIST_SETTLES === 'while-covered') settleList('own', false);
       // The look covers what this read showed, not a message that lands before the server takes it.
@@ -867,8 +955,16 @@ function Inbox() {
     })();
     return () => {
       cancelled = true;
+      if (retry) clearTimeout(retry);
+      wakeThreadRetry.current = null;
     };
-  }, [route.thread, refreshThread, refreshList, settleList]);
+  }, [route.thread, threadRetry, refreshThread, refreshList, settleList]);
+  // The thread landed while focus was in its place: focus goes to its subject, never to the page.
+  useLayoutEffect(() => {
+    if (!focusThreadSubject.current || !thread || thread.thread_id !== route.thread) return;
+    focusThreadSubject.current = false;
+    rootRef.current?.querySelector<HTMLElement>(`section.ib-pane[data-thread-id="${CSS.escape(thread.thread_id)}"] .ib-subject`)?.focus();
+  }, [thread, route.thread]);
 
   // When the list on screen catches up as the route changes (settle.ts).
   // Another page or folder: the list there is drawn as it is now. A thread
@@ -1389,6 +1485,24 @@ function Inbox() {
   }, []);
 
   /**
+   * Send now from a list row (approval "inbox-busy-agent-reply"): the reply
+   * waiting on a busy agent goes into its running turn now, as the thread's
+   * Send now does. No toast: the row's tick and badge say it.
+   */
+  const sendNowFromRow = async (row: InboxListRow) => {
+    const id = row.delivery?.message_id;
+    if (!id) return;
+    try {
+      await inboxApi.sendNow(id);
+    } catch (cause) {
+      showError(cause);
+      return;
+    }
+    await afterWrite();
+    say('Sending it now.');
+  };
+
+  /**
    * Mark read, or move it back (the pressed button, `E` again, Undo). The
    * thread leaves the top for Quiet with its waiting questions closed; Undo
    * reopens them as they were. An agent stopped or held up on it makes the
@@ -1463,6 +1577,35 @@ function Inbox() {
       detail: `Goes to ${agent} in 10 s · Moves to Quiet`,
       onUndo: () => void acknowledge(threadId, messageId, false, agent),
     });
+  };
+
+  /**
+   * An action item's Done or Can't do it (approval "inbox-next-actions"): written at
+   * once, sent to the agent once the 10 s Undo window passes, as 👍 Looks
+   * good. `null` is the Undo. Resolves false when it was refused.
+   */
+  const markAction = async (threadId: string, messageId: string, key: string, mark: ActionMark | null, info: { agent: string; prompt: string }): Promise<boolean> => {
+    try {
+      await inboxApi.markAction(messageId, key, mark);
+    } catch (cause) {
+      showError(cause);
+      await afterWrite();
+      return false;
+    }
+    await afterWrite();
+    if (!mark) {
+      dismissToast();
+      say('Action item moved back. Nothing was sent.');
+      return true;
+    }
+    showToast({
+      icon: mark.outcome === 'done' ? 'check' : 'warn',
+      lead: mark.outcome === 'done' ? 'Done' : "Can't do it",
+      // Short enough for one line at 520 px with Undo and its Z (a toast's words always show whole).
+      detail: `Goes to ${info.agent} in 10 s`,
+      onUndo: () => void markAction(threadId, messageId, key, null, info),
+    });
+    return true;
   };
 
   /** Archive (the MCP's resolve) or Unarchive, with Undo. */
@@ -2190,6 +2333,7 @@ function Inbox() {
           }}
           onOpen={openRow}
           onMarkRead={(row) => void markRead(row.thread_id, true)}
+          onSendNow={(row) => void sendNowFromRow(row)}
           onRowAction={rowAction}
           onSearch={(opener) => openSearch(opener)}
           onCompose={(opener) => openCompose({}, opener)}
@@ -2205,6 +2349,19 @@ function Inbox() {
           }
         />
         )}
+        {/* Beside the list, the thread's place says it is opening (or why not) until its read lands; a phone
+            and a stacked window keep the list until there is a thread to show. */}
+        {route.thread && !(thread && thread.thread_id === route.thread) && !phone && !stack.thread && (
+          <ThreadWait
+            key={route.thread}
+            load={threadLoad?.threadId === route.thread ? threadLoad : null}
+            onFocusLeaving={() => {
+              focusThreadSubject.current = true;
+            }}
+            onRetry={() => setThreadRetry((n) => n + 1)}
+            onClose={() => close({ ...route, thread: null, file: null })}
+          />
+        )}
         {route.thread && thread && thread.thread_id === route.thread && (
           <ThreadPane
             thread={thread}
@@ -2212,6 +2369,7 @@ function Inbox() {
             row={openThreadRow}
             onMarkRead={(read) => void markRead(thread.thread_id, read)}
             onAck={(messageId, on, agent) => void acknowledge(thread.thread_id, messageId, on, agent)}
+            onAction={(messageId, key, mark, info) => markAction(thread.thread_id, messageId, key, mark, info)}
             onArchive={(next) => void archive(thread.thread_id, thread.messages[0]!.id, next)}
             replyRequest={replyFor}
             draftChanged={draftChanged}
@@ -2222,9 +2380,32 @@ function Inbox() {
             file={route.file ?? null}
             onOpenFile={(file, options) => {
               if (!file) return closeTo({ ...routeRef.current, file });
-              const next = { ...routeRef.current, file };
-              // Back through a linked page's stack: the browser's Back when this entry was opened from there.
-              if (options?.back && backTo(hashOf(next))) return;
+              // A call that names no view keeps the one in the address (the pane names it for a step, a version, a linked page).
+              const keepView = file.view === undefined ? (routeRef.current.file?.view ?? null) : file.view;
+              const next = { ...routeRef.current, file: { ...file, view: keepView } };
+              // Back through a linked page's stack: the browser's Back when this entry was opened from there,
+              // whatever view that entry names (the switch replaced only the entry on screen); once it lands,
+              // the view the person is in now replaces the one it named.
+              if (options?.back && backTo(hashOf(next), window.history, sameScreenAnyView)) {
+                const view = next.file.view;
+                if (view) {
+                  // Where the traversal lands (popstate, or only hashchange in some engines), once; a Back that never lands drops it.
+                  const landed = () => {
+                    stop();
+                    const now = readRoute();
+                    if (now.file && now.file.view !== view) writeRoute({ ...now, file: { ...now.file, view } }, { replace: true });
+                  };
+                  const stop = () => {
+                    clearTimeout(timer);
+                    window.removeEventListener('popstate', landed);
+                    window.removeEventListener('hashchange', landed);
+                  };
+                  const timer = setTimeout(stop, 1000);
+                  window.addEventListener('popstate', landed);
+                  window.addEventListener('hashchange', landed);
+                }
+                return;
+              }
               writeRoute(next, options);
             }}
             onOpenGuide={(messageId) => go({ ...route, guide: messageId })}
@@ -2250,6 +2431,7 @@ function Inbox() {
             stacked={stack.thread}
             fileStacked={stack.file}
             remote={settings ? (settings.via ?? 'local') === 'tailnet' : null}
+            onToast={(t) => showToast(t)}
             onBackToList={(fileName) => {
               // The file's own close (its ×), then focus on this thread's row and one line for a screen reader.
               const root = rootRef.current;
@@ -2431,7 +2613,7 @@ export function InboxApp() {
   return (
     <ThemeProvider defaultTheme="system">
       {/* Every tooltip in the window (Tip): 150 ms to open, and the next one at once within 400 ms. */}
-      <TooltipProvider delayDuration={TIP_DELAY_MS} skipDelayDuration={400} disableHoverableContent>
+      <TooltipProvider delayDuration={TIP_DELAY_MS} skipDelayDuration={TOOLTIP_SKIP_DELAY_MS} disableHoverableContent>
         <Inbox />
       </TooltipProvider>
     </ThemeProvider>

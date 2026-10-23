@@ -201,6 +201,7 @@ import {
 import { findCopilotPlanContent, findCopilotSessionByAncestorPids, findCopilotSessionForCwd, getRecentCopilotMessages } from "./copilot-session";
 import { resolveLatestVibePlan } from "./vibe-plan";
 import { resolveClaudePlan } from "./claude-plan";
+import { takeModPlanApproval } from "./mod-plan-approval";
 import {
   formatInteractiveNoArgClarification,
   formatSubcommandHelp,
@@ -251,6 +252,9 @@ const reviewHtmlContent = reviewHtml as unknown as string;
 // @ts-ignore - Bun import attribute for text
 import inboxHtml from "../dist/inbox.html" with { type: "text" };
 const inboxHtmlContent = inboxHtml as unknown as string;
+
+// Code review's diagram engine: embedded too, read on first need.
+import { loadEmbeddedDiagramEngine } from "./diagram-engine";
 
 // The optional T3 Code hook (`t3-hook` with no arguments) runs on EVERY Bash
 // call of a Claude session that loads it. Only an Agent SDK session can be a
@@ -1425,6 +1429,7 @@ if (args[0] === "sessions") {
     // this CLI's origins may see approve-carrying menu items (spec §6.4).
     approvalNotesSupported: supportsReviewApprovalNotes(detectedOrigin),
     htmlContent: reviewHtmlContent,
+    diagramEngine: loadEmbeddedDiagramEngine,
     tailnetPublished: tailscaleFlag,
     onCleanup: worktreeCleanup,
     onReady: async (url, isRemote, port) => {
@@ -2112,6 +2117,9 @@ if (args[0] === "sessions") {
   const server = await startPlannotatorServer({
     plan: planContent,
     origin: "opencode",
+    // The plugin's submit_plan executor turns an approval's feedback into the
+    // approved-with-notes prompt (every plugin version that calls this).
+    approvalNotesSupported: true,
     sharingEnabled: bridgeSharingEnabled,
     shareBaseUrl: bridgeShareBaseUrl,
     pasteApiUrl: bridgePasteApiUrl,
@@ -2354,6 +2362,7 @@ if (args[0] === "sessions") {
     approvalNotesSupported:
       supportsReviewApprovalNotes("opencode") && input.supportsApprovalNotes === true,
     htmlContent: reviewHtmlContent,
+    diagramEngine: loadEmbeddedDiagramEngine,
     opencodeClient: makeOpenCodeBridgeClient(input.agents),
     onReady: (url, isRemote, port) => {
       handleReviewServerReady(url, isRemote, port);
@@ -2718,6 +2727,10 @@ if (args[0] === "sessions") {
     planFilePath: input.planFilePath,
     permissionMode: input.permissionMode,
     planRevisions: true,
+    // The mod delivers an approval's notes (planHostResult composes the
+    // approved-with-notes prompt). The classic PermissionRequest hook below
+    // cannot: its allow decision carries no message.
+    approvalNotesSupported: true,
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
@@ -2950,6 +2963,17 @@ if (args[0] === "sessions") {
     process.exit(0);
   }
 
+  // Claude Code with the mod: an ExitPlanMode the mod already approved, whose
+  // classic.PermissionRequest hook was skipped (an organization's plugin guard
+  // seated above it, #2007). Answer the approval; never open a second review.
+  const modApproval = takeModPlanApproval(event, { dataDir: getPlannotatorDataDir(), now: Date.now() });
+  if (modApproval) {
+    console.log(
+      JSON.stringify({ hookSpecificOutput: { hookEventName: "PermissionRequest", decision: modApproval } })
+    );
+    process.exit(0);
+  }
+
   let planContent = "";
   let permissionMode = "default";
   let isGemini = false;
@@ -2983,6 +3007,9 @@ if (args[0] === "sessions") {
   const server = await startPlannotatorServer({
     plan: planContent,
     origin: isGemini ? "gemini-cli" : detectedOrigin,
+    // No approvalNotesSupported: Claude Code's PermissionRequest allow carries
+    // no message, and Gemini CLI shows a systemMessage to the person, not the
+    // model, so notes sent with an approval would be lost.
     // Claude Code writes the plan to disk before the hook fires.
     planFilePath: isGemini ? undefined : event.tool_input?.planFilePath,
     permissionMode,

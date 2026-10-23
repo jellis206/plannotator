@@ -266,6 +266,15 @@ for (const scheme of ['light', 'dark'] as const) {
       const lightbox = page.locator('[data-image-lightbox]');
       await expect(lightbox).toBeVisible();
       await expect.poll(() => lightbox.locator('img').evaluate((img: HTMLImageElement) => img.naturalWidth)).toBe(480);
+      // Shown at its own size in the middle of the screen (the zoom stage fills the overlay, #2067).
+      await expect
+        .poll(() =>
+          lightbox.locator('img').evaluate((img: HTMLImageElement) => {
+            const r = img.getBoundingClientRect();
+            return [Math.round(r.width), Math.round(r.left + r.width / 2 - innerWidth / 2), Math.round(r.top + r.height / 2 - innerHeight / 2)];
+          }),
+        )
+        .toEqual([480, 0, 0]);
       await shot(page, `3-unattached-image-lightbox-${scheme}`);
       await page.keyboard.press('Escape');
       await expect(lightbox).toHaveCount(0);
@@ -326,8 +335,8 @@ test('beside the thread: a sibling page opens over the page, Escape and the brow
   const context = await browser.newContext();
   try {
     const page = await context.newPage();
-    // A deep link opens the page beside the thread (only a tile opens it full screen).
-    await page.goto(`${url}#thread=${thread}&file=${ids['SHEET.html']}`);
+    // A deep link that names side by side opens the page beside the thread (one without `view` opens HTML full screen).
+    await page.goto(`${url}#thread=${thread}&file=${ids['SHEET.html']}&view=side`);
     const pane = page.locator(`[data-attachment-pane="${ids['SHEET.html']}"]`);
     await expect(pane).toBeVisible();
     await expect(pane).not.toHaveAttribute('data-full-view', '');

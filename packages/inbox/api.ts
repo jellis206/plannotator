@@ -5,6 +5,7 @@
  * writing into a store it did not read.
  */
 
+import { isActionRecord, questionsOnly, splitThreadActions } from './actions';
 import type {
   InboxGuideRef,
   InboxHealth,
@@ -37,6 +38,8 @@ import type {
   InboxNotifyReach,
   InboxWindowPermission,
 } from '@plannotator/core/inbox-types';
+
+import { browserSharedEventsEnv, sharedInboxEventsSupported, subscribeSharedInboxEvents } from './sharedEvents';
 
 export type AgentToolHost = 'claude-code' | 'pi' | 'opencode';
 
@@ -383,8 +386,33 @@ async function readJson<T>(response: Response): Promise<T> {
   return body as T;
 }
 
-async function get<T>(path: string): Promise<T> {
-  return readJson<T>(await fetch(path, { headers: { Accept: 'application/json' }, cache: 'no-store' }));
+async function get<T>(path: string, signal?: AbortSignal): Promise<T> {
+  return readJson<T>(await fetch(path, { headers: { Accept: 'application/json' }, cache: 'no-store', signal }));
+}
+
+/** A read that gives no answer in `timeoutMs` (a held connection, a stalled server) fails with this. */
+export class InboxReadTimeout extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`no answer in ${Math.round(timeoutMs / 1000)} s`);
+    this.name = 'InboxReadTimeout';
+  }
+}
+
+/** `get`, given up after `timeoutMs`: the fetch is aborted and the read fails with InboxReadTimeout. */
+async function getWithin<T>(path: string, timeoutMs: number): Promise<T> {
+  const controller = new AbortController();
+  let timedOut = false;
+  const timer = setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+  try {
+    return await get<T>(path, controller.signal);
+  } catch (cause) {
+    throw timedOut ? new InboxReadTimeout(timeoutMs) : cause;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 /** The serverSession every POST carries; set from the first list read. */
@@ -530,7 +558,13 @@ export const inboxApi = {
     const qs = query.toString();
     return get<ArchivedModel>(`/api/inbox/threads/archived${qs ? `?${qs}` : ''}`);
   },
-  thread: (threadId: string) => get<ThreadModel>(`/api/inbox/threads/${encodeURIComponent(threadId)}`),
+  /** One thread; with `timeoutMs`, a read with no answer by then fails (InboxReadTimeout) instead of waiting for good. */
+  // A thread's action items move out of `questions` into `actions` here (actions.ts), so nothing that picks or sends answers meets one.
+  thread: (threadId: string, timeoutMs?: number) =>
+    (timeoutMs === undefined
+      ? get<ThreadModel>(`/api/inbox/threads/${encodeURIComponent(threadId)}`)
+      : getWithin<ThreadModel>(`/api/inbox/threads/${encodeURIComponent(threadId)}`, timeoutMs)
+    ).then((model) => ({ ...model, thread: splitThreadActions(model.thread) })),
   settings: () => get<SettingsModel>('/api/inbox/settings'),
   /**
    * The person looked at the thread. `throughSeq`: the seq of the newest
@@ -563,19 +597,33 @@ export const inboxApi = {
   pick: (messageId: string, key: string, revision: number, answer: QuestionAnswer | null) =>
     post<{ questions: InboxQuestion[] }>(`/api/inbox/messages/${encodeURIComponent(messageId)}/picks`, {
       questions: [{ key, revision, answer }],
-    }),
+    }).then((result) => ({ ...result, questions: questionsOnly(result.questions) })),
+  /**
+   * An action item's Done (with an optional note) or Can't do it (with the reason),
+   * or its Undo (`null`): sent to the agent once the Undo window passes.
+   * Answers the message's action items.
+   */
+  markAction: (messageId: string, key: string, mark: { outcome: 'done' | 'cant'; note?: string | null } | null) =>
+    post<{ questions: InboxQuestion[] }>(
+      `/api/inbox/messages/${encodeURIComponent(messageId)}/actions/${encodeURIComponent(key)}`,
+      mark ? { outcome: mark.outcome, ...(mark.note ? { note: mark.note } : {}) } : { outcome: null },
+    ).then((result) => ({ actions: result.questions.filter(isActionRecord) })),
   reply: (
     messageId: string,
     input: {
       idempotency_key: string;
       words: string;
-      questions: { key: string; revision: number }[];
+      /** The picks this reply sends; one on another message of the same session names it (`message_id`). */
+      questions: { message_id?: string; key: string; revision: number }[];
       feedback?: string;
       annotation_ids?: string[];
       /** Another live session takes the reply: the session that asked has ended. */
       to?: { host: string; session: string };
-      /** Skip this message's questions the Send leaves unanswered (false: Keep open). */
-      skip_unanswered?: boolean;
+      /**
+       * The open questions the person chose to skip ("Skip them"), on this message or (with
+       * `message_id`) another of the same session. A Send never skips anything else.
+       */
+      skip?: { message_id?: string; key: string }[];
       /** Files pasted into the reply box (upload ids): attachments on this reply. */
       uploads?: string[];
       /** The sessions the person tagged with `@` (approval "inbox-tag-agents"): each one gets this reply too. */
@@ -586,14 +634,21 @@ export const inboxApi = {
        */
       clear_draft?: string;
     },
-  ) => post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reply`, input),
+  ) =>
+    post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reply`, input).then((result) => ({
+      ...result,
+      questions: questionsOnly(result.questions),
+    })),
   /**
    * Re-ask (approval "inbox-reask"): a note asking the session that wrote this
    * message for its open questions again, in one message. `to`: another live
    * session, because the one that asked has ended.
    */
   reask: (messageId: string, input: { idempotency_key: string; to?: { host: string; session: string } }) =>
-    post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reask`, input),
+    post<ReplyResult>(`/api/inbox/messages/${encodeURIComponent(messageId)}/reask`, input).then((result) => ({
+      ...result,
+      questions: questionsOnly(result.questions),
+    })),
   resolve: (messageId: string, resolved: boolean) =>
     post<unknown>(`/api/inbox/messages/${encodeURIComponent(messageId)}/resolve`, { resolved }),
   health: () => get<InboxHealth>('/api/inbox/health'),
@@ -629,7 +684,7 @@ export const inboxApi = {
    * restarted under this tab (whose serverSession is new) so the count of
    * windows that may notify is right again.
    */
-  reportWindow: async (report: { window: string; permission: Exclude<InboxWindowPermission, 'unknown'>; origin: string }) =>
+  reportWindow: async (report: { window: string; permission: Exclude<InboxWindowPermission, 'unknown'>; origin: string; served_by?: string | null }) =>
     readJson<{ notify_reach: InboxNotifyReach }>(
       await fetch('/api/inbox/window', {
         method: 'POST',
@@ -775,40 +830,58 @@ export interface LinkedPageView {
   url: string | null;
 }
 
+/** What `subscribeInboxEvents` calls (the server's frames, read). */
+export interface InboxEventHandlers {
+  onRecord: (event: InboxEvent | null) => void;
+  /**
+   * `updated` is undefined from an Inbox older than the field (the "What's new in X" link stays as the list said);
+   * `restartClaudeCode` too (the sidebar's "Reload Claude Code N" stays as the list said).
+   */
+  onStatus: (update: InboxHealth['update'], updated?: string | null, restartClaudeCode?: number) => void;
+  /** Whether a notification can reach the person now (inbox-windows.ts); never called by an older Inbox. */
+  onReach?: (reach: InboxNotifyReach) => void;
+  /**
+   * A row's delivery may have moved with the live sessions (a turn started or
+   * ended, a session went away): no store line, so the list is read again.
+   * Never called by an older Inbox.
+   */
+  onDeliveries?: () => void;
+  /**
+   * The stream (re)connected: the server's `hello`. A reconnect carries the
+   * URL it was first opened with, so its `permission=` may be stale (a grant
+   * since, a restarted Inbox that forgot the window): report again here.
+   * With a shared stream (sharedEvents.ts) also called when the tab whose
+   * stream serves this one changes, so the report names it (`served_by`).
+   */
+  onConnect?: () => void;
+  /** A reply draft was saved or discarded (`event: drafts`, approval "inbox-reply-drafts"); never called by an older Inbox. */
+  onDrafts?: (threadId: string) => void;
+}
+
+/** This window, as its event stream (or its report) names it to the server (inbox-windows.ts). */
+export interface InboxEventWindow {
+  id: string;
+  permission: InboxWindowPermission;
+  origin: string;
+}
+
+/** The event stream's named frames, as they arrive (and as the tab that holds the shared stream passes them on). */
+export const INBOX_EVENT_FRAMES = ['hello', 'record', 'status', 'reach', 'deliveries', 'drafts'] as const;
+export type InboxEventFrameName = (typeof INBOX_EVENT_FRAMES)[number];
+export interface InboxEventFrame {
+  name: InboxEventFrameName;
+  /** The frame's `data`, unparsed. */
+  data: string;
+  /** The frame's `id` (a record's seq), or null. */
+  id: string | null;
+}
+
 /**
- * The server's event stream: `onRecord` for every store line after the
- * cursor (the line, for the notifications), `onStatus` for restart-to-update. EventSource reconnects on its
- * own and resumes from the last event id.
+ * Open the server's event stream for this tab: every named frame, unparsed,
+ * after `cursor`. EventSource reconnects on its own and resumes from the last
+ * event id. Answers the close.
  */
-export function subscribeInboxEvents(
-  cursor: number,
-  handlers: {
-    onRecord: (event: InboxEvent | null) => void;
-    /**
-     * `updated` is undefined from an Inbox older than the field (the "What's new in X" link stays as the list said);
-     * `restartClaudeCode` too (the sidebar's "Reload Claude Code N" stays as the list said).
-     */
-    onStatus: (update: InboxHealth['update'], updated?: string | null, restartClaudeCode?: number) => void;
-    /** Whether a notification can reach the person now (inbox-windows.ts); never called by an older Inbox. */
-    onReach?: (reach: InboxNotifyReach) => void;
-    /**
-     * A row's delivery may have moved with the live sessions (a turn started or
-     * ended, a session went away): no store line, so the list is read again.
-     * Never called by an older Inbox.
-     */
-    onDeliveries?: () => void;
-    /**
-     * The stream (re)connected: the server's `hello`. A reconnect carries the
-     * URL it was first opened with, so its `permission=` may be stale (a grant
-     * since, a restarted Inbox that forgot the window): report again here.
-     */
-    onConnect?: () => void;
-    /** A reply draft was saved or discarded (`event: drafts`, approval "inbox-reply-drafts"); never called by an older Inbox. */
-    onDrafts?: (threadId: string) => void;
-  },
-  /** This window, so the server counts it (and what its browser allows) while the stream is open. */
-  win?: { id: string; permission: InboxWindowPermission; origin: string },
-): () => void {
+export function openInboxEventFrames(cursor: number, onFrame: (frame: InboxEventFrame) => void, win?: InboxEventWindow): () => void {
   const query = new URLSearchParams({ cursor: String(cursor) });
   if (win) {
     query.set('window', win.id);
@@ -816,43 +889,83 @@ export function subscribeInboxEvents(
     query.set('origin', win.origin);
   }
   const source = new EventSource(`/api/inbox/events?${query}`);
-  source.addEventListener('hello', () => handlers.onConnect?.());
-  source.addEventListener('reach', (event) => {
-    try {
-      handlers.onReach?.(JSON.parse((event as MessageEvent<string>).data) as InboxNotifyReach);
-    } catch {
-      // A malformed frame changes nothing.
-    }
-  });
-  source.addEventListener('drafts', (event) => {
-    try {
-      const data = JSON.parse((event as MessageEvent<string>).data) as { thread_id?: unknown };
-      if (typeof data.thread_id === 'string') handlers.onDrafts?.(data.thread_id);
-    } catch {
-      // A malformed frame changes nothing.
-    }
-  });
-  source.addEventListener('deliveries', () => handlers.onDeliveries?.());
-  source.addEventListener('record', (event) => {
-    let parsed: InboxEvent | null = null;
-    try {
-      parsed = JSON.parse((event as MessageEvent<string>).data) as InboxEvent;
-    } catch {
-      // A malformed frame still refreshes the list.
-    }
-    handlers.onRecord(parsed);
-  });
-  source.addEventListener('status', (event) => {
-    try {
-      const data = JSON.parse((event as MessageEvent<string>).data) as { update: InboxHealth['update']; updated?: string | null; restart_claude_code?: unknown };
-      handlers.onStatus(
-        data.update,
-        'updated' in data ? (data.updated ?? null) : undefined,
-        typeof data.restart_claude_code === 'number' ? data.restart_claude_code : undefined,
-      );
-    } catch {
-      // A malformed frame changes nothing.
-    }
-  });
+  for (const name of INBOX_EVENT_FRAMES) {
+    source.addEventListener(name, (event) => {
+      const message = event as MessageEvent<string>;
+      onFrame({ name, data: typeof message.data === 'string' ? message.data : '', id: message.lastEventId || null });
+    });
+  }
   return () => source.close();
+}
+
+/** One frame to the handlers: what each named event means. */
+export function dispatchInboxFrame(frame: InboxEventFrame, handlers: InboxEventHandlers): void {
+  switch (frame.name) {
+    case 'hello':
+      handlers.onConnect?.();
+      return;
+    case 'reach':
+      try {
+        handlers.onReach?.(JSON.parse(frame.data) as InboxNotifyReach);
+      } catch {
+        // A malformed frame changes nothing.
+      }
+      return;
+    case 'drafts':
+      try {
+        const data = JSON.parse(frame.data) as { thread_id?: unknown };
+        if (typeof data.thread_id === 'string') handlers.onDrafts?.(data.thread_id);
+      } catch {
+        // A malformed frame changes nothing.
+      }
+      return;
+    case 'deliveries':
+      handlers.onDeliveries?.();
+      return;
+    case 'record': {
+      let parsed: InboxEvent | null = null;
+      try {
+        parsed = JSON.parse(frame.data) as InboxEvent;
+      } catch {
+        // A malformed frame still refreshes the list.
+      }
+      handlers.onRecord(parsed);
+      return;
+    }
+    case 'status':
+      try {
+        const data = JSON.parse(frame.data) as { update: InboxHealth['update']; updated?: string | null; restart_claude_code?: unknown };
+        handlers.onStatus(
+          data.update,
+          'updated' in data ? (data.updated ?? null) : undefined,
+          typeof data.restart_claude_code === 'number' ? data.restart_claude_code : undefined,
+        );
+      } catch {
+        // A malformed frame changes nothing.
+      }
+      return;
+  }
+}
+
+/**
+ * The server's event stream: `onRecord` for every store line after the
+ * cursor (the line, for the notifications), `onStatus` for restart-to-update.
+ *
+ * The Inbox tabs of one origin share ONE stream (sharedEvents.ts): the tab
+ * holding a Web Lock opens it and passes every frame on over a
+ * BroadcastChannel, so a browser never holds one HTTP/1.1 connection per tab
+ * (Chrome allows six per host; a seventh tab would stall). Where Web Locks or
+ * BroadcastChannel is missing, or there is no window to name, this tab opens
+ * its own stream exactly as before.
+ */
+export function subscribeInboxEvents(
+  cursor: number,
+  handlers: InboxEventHandlers,
+  /** This window, so the server counts it (and what its browser allows) while the stream is open. */
+  win?: InboxEventWindow,
+): () => void {
+  if (win && sharedInboxEventsSupported()) {
+    return subscribeSharedInboxEvents(cursor, handlers, win, browserSharedEventsEnv({ open: openInboxEventFrames, dispatch: dispatchInboxFrame }));
+  }
+  return openInboxEventFrames(cursor, (frame) => dispatchInboxFrame(frame, handlers), win);
 }

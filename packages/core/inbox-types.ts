@@ -16,7 +16,7 @@
 
 import type { QuestionAnswer, QuestionKind } from "./question-block";
 import type { InboxAnnotationRecord, InboxAttachment, InboxAttachmentKind, InboxInlineImage } from "./inbox-attachments";
-import type { InboxRowDelivery } from "./inbox-delivery";
+import type { InboxDeliverNowBy, InboxRowDelivery } from "./inbox-delivery";
 import { INBOX_CARD_ACTION_ON, type InboxCard } from "./inbox-cards";
 
 // The attachment shapes and file rules (step 2) live in their own module and
@@ -126,6 +126,65 @@ export function inboxThreadNameKey(name: string): string {
     .toLowerCase();
 }
 
+// ─────────────────────────────── Subjects ───────────────────────────────
+
+/** A line break in any spelling: CR, LF, U+2028, U+2029. */
+const SUBJECT_LINE_BREAK = /[\r\n\u2028\u2029]/;
+/**
+ * Text a model's malformed tool call can leak into a string argument: the
+ * closing tag of the field, the next parameter, an invoke block, or an
+ * `antml:`-prefixed tag. Narrow on purpose, so `a < b`, `Vec<T>` and `<div>`
+ * in prose stay allowed.
+ */
+const SUBJECT_TOOL_MARKUP =
+  /<\/subject\s*>|<\/parameter\s*>|<parameter\s+name\s*=|<invoke\s+name\s*=|<\/invoke\s*>|<\/?function_calls\s*>|<\/?antml:/i;
+
+/**
+ * A `subject` as an agent sends it (send_message, submit_guide): one line of
+ * plain text. Empty (or only spaces) means none, as before; the value is
+ * trimmed and otherwise kept. Refused, with one sentence the agent can act
+ * on: leaked tool-call markup (`</subject>`, `<parameter name=…>`), a line
+ * break, other control characters, bidi controls.
+ */
+export function checkInboxSubject(value: unknown): { ok: true; subject: string | null } | { ok: false; message: string } {
+  if (value === undefined || value === null) return { ok: true, subject: null };
+  if (typeof value !== "string") return { ok: false, message: "must be a string." };
+  const subject = value.trim();
+  if (subject === "") return { ok: true, subject: null };
+  if (SUBJECT_TOOL_MARKUP.test(subject)) {
+    return {
+      ok: false,
+      message:
+        "contains tool-call text (such as </subject> or <parameter name=…>), so your call was malformed. Send again with the subject alone as its value and every other field as its own argument. If you meant to write that text, reword it without the angle brackets.",
+    };
+  }
+  if (SUBJECT_LINE_BREAK.test(subject)) {
+    return { ok: false, message: "must be one line; it contains a line break. Send a short one-line subject; put the rest in body." };
+  }
+  if (THREAD_NAME_CONTROL.test(subject)) return { ok: false, message: "must not contain control characters." };
+  if (THREAD_NAME_BIDI.test(subject)) return { ok: false, message: "must not contain bidirectional control characters." };
+  return { ok: true, subject };
+}
+
+/**
+ * A stored subject as it is shown and served: its first line, cut where
+ * leaked tool-call markup starts, without control or bidi characters,
+ * trimmed; null when nothing is left. Subjects stored before the send-side
+ * check (`checkInboxSubject`) can hold such text; the append-only store is
+ * never rewritten, so every read goes through this instead.
+ */
+export function displayInboxSubject(subject: string | null | undefined): string | null {
+  if (typeof subject !== "string") return null;
+  let text = subject.split(SUBJECT_LINE_BREAK, 1)[0] ?? "";
+  const markup = SUBJECT_TOOL_MARKUP.exec(text);
+  if (markup) text = text.slice(0, markup.index);
+  text = text
+    .replace(new RegExp(THREAD_NAME_BIDI.source, "gu"), "")
+    .replace(new RegExp(THREAD_NAME_CONTROL.source, "g"), " ")
+    .trim();
+  return text === "" ? null : text;
+}
+
 // ─────────────────────────────── Records ───────────────────────────────
 
 /** One row of the window: the repository or folder an agent works in. */
@@ -180,6 +239,17 @@ export function isInboxNote(message: {
     message.author.kind === "person" &&
     ((message.set_aside?.length ?? 0) > 0 || (message.reopened?.length ?? 0) > 0 || (typeof message.ack_of === "string" && message.ack_of !== ""))
   );
+}
+
+/**
+ * The reply the Inbox writes for the person's Done / Can't do it on an action item
+ * (`action_report`, approval "inbox-next-actions"), once its Undo window
+ * passed. It is the person's reply for delivery (Sent, the wake, Send now),
+ * but not a look: it is written by the Inbox seconds after the click, so an
+ * agent message that landed meanwhile stays new.
+ */
+export function isInboxActionReport(message: { author: { kind: string }; action_report?: readonly string[] | null }): boolean {
+  return message.author.kind === "person" && (message.action_report?.length ?? 0) > 0;
 }
 
 export const INBOX_HOST_NAMES: Readonly<Record<string, string>> = {
@@ -309,6 +379,20 @@ export interface InboxMessage {
    */
   deliver_now_at?: string | null;
   /**
+   * Who asked for `deliver_now_at`: the person (Send now) or the Inbox after
+   * the item waited `INBOX_AUTO_SEND_AFTER_MS` on a busy session whose
+   * connection can take it mid-turn (approval "inbox-busy-agent-reply").
+   * Kept when a failed attempt clears `deliver_now_at`, so the Inbox never
+   * tries by itself twice. Absent on older records (a person's Send now).
+   */
+  deliver_now_by?: InboxDeliverNowBy | null;
+  /**
+   * When it began to wait on its busy session, written with the Inbox's own
+   * mark (`deliver_now_by: "auto"`), so "went into its turn by itself after
+   * N min" stays true after delivery. Absent otherwise. Additive.
+   */
+  wait_started_at?: string | null;
+  /**
    * A guided review this message carries (submit_guide, PLAN step 5): the
    * snapshot is a content-addressed blob, `inbox/blobs/<sha256>`. Absent on
    * every other message and on records older than step 5.
@@ -354,6 +438,19 @@ export interface InboxMessage {
    * the body). Added for replaced questions: older records lack it.
    */
   supersedes?: string[];
+  /**
+   * On an agent's message: the action items it said it saw done (send_message's
+   * `done`, as sent: `<message id>` for every open action item of that message, or
+   * `<message id>/<key>` for one). The action item records carry the result
+   * (`action_result` with `by: "agent"`). Absent otherwise and on older records.
+   */
+  done?: string[];
+  /**
+   * On a person's reply that reports action items (Done, Can't do it): the action items
+   * it reports (`<message id>/<key>`), sent once the Undo window passed.
+   * Absent on every other message.
+   */
+  action_report?: string[];
   /**
    * On a thread's root whose subject the agent did not give: the question
    * (`<message id>/<key>`) the subject was derived from, so the thread's
@@ -440,8 +537,12 @@ export interface InboxTag {
   wakes: boolean;
   /** It reached the session (its connection delivered it, or its own wait_for_reply returned it). */
   delivery?: InboxDelivery | null;
-  /** The person pressed Send now for this session. */
+  /** The person pressed Send now for this session (or the Inbox did, after the wait: `deliver_now_by`). */
   deliver_now_at?: string | null;
+  /** Who asked for `deliver_now_at` (see `InboxMessage.deliver_now_by`). */
+  deliver_now_by?: InboxDeliverNowBy | null;
+  /** When it began to wait on that session (see `InboxMessage.wait_started_at`). */
+  wait_started_at?: string | null;
   /** A session that is not woken read the thread with read_thread after the tag (its own read only). */
   read_at?: string | null;
 }
@@ -563,6 +664,17 @@ export interface InboxAck {
    * else null. Never stored.
    */
   delivered_at?: string | null;
+  /**
+   * The window's thread only: its note's `created_at`, `deliver_now_at` and
+   * `deliver_now_by` (a 👍 that waited on a busy session goes into the
+   * running turn by itself after `INBOX_AUTO_SEND_AFTER_MS`). Never stored.
+   */
+  note_at?: string | null;
+  deliver_now_at?: string | null;
+  deliver_now_by?: InboxDeliverNowBy | null;
+  /** The note's `wait_started_at` and its delivery's `into_turn` (the window's thread only). */
+  wait_started_at?: string | null;
+  delivered_into_turn?: boolean | null;
 }
 
 /**
@@ -590,6 +702,13 @@ export interface InboxDelivery {
   /** The session it was delivered to (the asking message's `author.session`, or the message's `to.session`). */
   session: string;
   at: string;
+  /**
+   * Written for an item the Inbox marked to go in by itself (approval
+   * "inbox-busy-agent-reply"): true when it went into a running turn, false
+   * when its session went idle after the mark (the session's own Ask question
+   * held the turn, so it went in when the turn ended). Absent otherwise.
+   */
+  into_turn?: boolean;
 }
 
 // ─────────────────────────────── Guided reviews (step 5) ───────────────────────────────
@@ -655,8 +774,18 @@ export interface InboxQuestionRecord {
   project_id: string;
   message_id: string;
   key: string;
+  /**
+   * The block's place among the message's blocks of its kind: questions are
+   * numbered Q1, Q2… and action items (`kind: "action"`) A1, A2… separately.
+   */
   position: number;
-  kind: QuestionKind;
+  /**
+   * The question's kind, or `"action"` for an action item (an Inbox-only `:::action`
+   * block: something only the person can go and do). Read it through
+   * `readInboxQuestionKind`: a kind a reader does not know is not answerable.
+   */
+  kind: InboxQuestionKind;
+  /** The question's prompt, or an action item's first line (what to do). */
   prompt: string;
   parsed: InboxQuestionFacts;
   stopped: string | null;
@@ -682,6 +811,65 @@ export interface InboxQuestionRecord {
    * Absent or null while it stands. Added for Mark read: older records lack it.
    */
   set_aside?: InboxQuestionSetAside | null;
+  /**
+   * On an action item (`kind: "action"`): where to do it, the command to run, and
+   * what the agent watches for. Absent on a question and on older records.
+   */
+  action?: InboxActionFacts | null;
+  /**
+   * On an action item: what came of it. The person's Done or Can't do it (`by:
+   * "person"`), sent to the agent once the Undo window passes (then
+   * `sent_revision === revision` and `sent_reply_id` names the reply), or
+   * the agent's own `done` (`by: "agent"`: it saw it happen; nothing is
+   * sent). Null while the action item is open, and after an Undo.
+   */
+  action_result?: InboxActionResult | null;
+}
+
+/**
+ * A question's kind as the Inbox stores it: Plannotator's question kinds,
+ * plus `"action"` for an action item (approval "inbox-next-actions").
+ */
+export type InboxQuestionKind = QuestionKind | "action";
+
+/** The kinds this build knows, for `readInboxQuestionKind`. */
+const INBOX_QUESTION_KINDS: readonly InboxQuestionKind[] = ["single", "multi", "text", "action"];
+
+/**
+ * A question record's kind, read fail-closed: a kind this build does not
+ * know (a newer Inbox's) reads as `"unknown"`, which no reader may answer or
+ * pick; draw it read-only.
+ */
+export function readInboxQuestionKind(value: unknown): InboxQuestionKind | "unknown" {
+  return typeof value === "string" && (INBOX_QUESTION_KINDS as readonly string[]).includes(value) ? (value as InboxQuestionKind) : "unknown";
+}
+
+/** An action item: a question record of kind `"action"`. */
+export function isInboxAction(question: { kind: unknown }): boolean {
+  return readInboxQuestionKind(question.kind) === "action";
+}
+
+/** What an action item's block says besides what to do and why (`InboxQuestionRecord.action`). */
+export interface InboxActionFacts {
+  /** `Where:` in words (a place, or the link's name), or null. */
+  where: string | null;
+  /** `Where:`'s link, http(s) only, or null: the card's "Open" button. */
+  where_url: string | null;
+  /** `Run:`, a command for the person to copy, or null. */
+  run: string | null;
+  /** `Watching:`, what the agent watches to notice it done by itself, or null. */
+  watching: string | null;
+}
+
+/** What came of an action item (`InboxQuestionRecord.action_result`). */
+export interface InboxActionResult {
+  outcome: "done" | "cant";
+  /** The person's note with Done, or the reason with Can't do it; null for none. */
+  note: string | null;
+  at: string;
+  by: "person" | "agent";
+  /** With `by: "agent"`: the agent's message whose `done` named it. */
+  message_id?: string | null;
 }
 
 /** A question Mark read closed (`InboxQuestionRecord.set_aside`). */
@@ -695,7 +883,7 @@ export interface InboxQuestionSetAside {
    * `person_read_at`).
    */
   read_seq?: number;
-  previous: Pick<InboxQuestionRecord, "answer" | "revision" | "sent_revision" | "picked_by" | "picked_at">;
+  previous: Pick<InboxQuestionRecord, "answer" | "revision" | "sent_revision" | "picked_by" | "picked_at" | "action_result">;
 }
 
 /**
@@ -714,7 +902,8 @@ export type InboxQuestionState = "open" | "picked" | "sent" | "closed" | "supers
 export interface InboxQuestion {
   key: string;
   position: number;
-  kind: QuestionKind;
+  /** `"action"` for an action item; read it with `readInboxQuestionKind` (fail-closed). */
+  kind: InboxQuestionKind;
   prompt: string;
   context: string | null;
   choices: InboxQuestionChoice[];
@@ -739,20 +928,37 @@ export interface InboxQuestion {
    * answer a skip), or null. Absent from an older Inbox.
    */
   set_aside_at?: string | null;
+  /** On an action item (`kind: "action"`): where, run and watching. Absent on a question and from an older Inbox. */
+  action?: InboxActionFacts | null;
+  /** On an action item: what came of it, or null while open. Absent on a question and from an older Inbox. */
+  action_result?: InboxActionResult | null;
 }
 
 /** Workspaces' `NotificationQuestionSummary`: a row's questions, summed. */
 export interface InboxQuestionSummary {
+  /** Open questions and action items together: an action item counts like a question for every list rule. */
   open: number;
   picked: number;
   stopped: boolean;
   holds_up: string[];
   prompt: string | null;
+  /** How many of `open` are action items (`kind: "action"`): the row reads "1 action item". Absent from an older Inbox. */
+  actions?: number;
 }
 
 export interface InboxMessageWire extends InboxMessage {
-  /** Omitted when the message asks no question (the Workspaces rule). */
+  /**
+   * Omitted when the message asks no question (the Workspaces rule). The
+   * server lists the message's action items (`kind: "action"`) here too, after its
+   * questions; a reader that does not know `"action"` must not answer them.
+   */
   questions?: InboxQuestion[];
+  /**
+   * Never sent by the server: the Inbox window moves a message's action items here
+   * out of `questions` when it reads a thread (packages/inbox/actions.ts), so
+   * nothing that picks and sends answers ever meets one.
+   */
+  actions?: InboxQuestion[];
   /**
    * The seq of the message's first line in the event log. Rides only on
    * `GET /api/inbox/threads/:id` (the window's thread), is never stored and
@@ -1007,6 +1213,11 @@ export interface InboxHealth {
   update: InboxUpdate | null;
   /** Whether a notification can reach the person now (additive; absent from an older Inbox). */
   notify_reach?: InboxNotifyReach;
+  /**
+   * Event streams open now, the windows' and the phone door's (additive). The
+   * Inbox tabs of one browser origin share one stream (packages/inbox/sharedEvents.ts).
+   */
+  event_streams?: number;
 }
 
 /** What an Inbox window reports about its browser's notification permission for its own origin. */
@@ -1339,14 +1550,22 @@ export type InboxToolCostHost = "pi" | "opencode";
  * entry in Pi's request shape (that computation gives 7,325 for the entry Pi
  * measured at 7,328); the Pi and OpenCode cost tests hold it to 5%. While the
  * card action is held back (INBOX_CARD_ACTION_ON false), the size without it.
+ * Action items (approval "inbox-next-actions") then added the `:::action`
+ * paragraph to `body` and the `done` field: +861 bytes and +221 tokens with
+ * o200k_base on the generated entry in Pi's request shape (7,362 → 8,223
+ * bytes, 1,744 → 1,965 tokens), so 8,189 bytes (1,953 tokens) without the
+ * card action and 9,364 (2,268) with it, estimated, not re-measured on Pi.
+ * Renaming "to-do" to "action item" (owner, #2059) moved the entry by 5 bytes
+ * (8,228; 1,962 tokens), and "Action items you asked for" by 5 more (8,233;
+ * 1,963 tokens): the stated cost stands.
  */
-const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 8503, tokens: 2400 } : { bytes: 7328, tokens: 2000 };
+const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 9364, tokens: 2700 } : { bytes: 8189, tokens: 2300 };
 export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
   pi: INBOX_TOOL_COST_NOW,
   opencode: INBOX_TOOL_COST_NOW,
 };
 
-/** "about 7 KB, roughly 2,000 tokens" for a host's measured cost. */
+/** "about 8 KB, roughly 2,300 tokens" for a host's measured cost. */
 export function inboxToolCostText(host: InboxToolCostHost): string {
   const cost = INBOX_TOOL_COST[host];
   return `about ${Math.round(cost.bytes / 1000)} KB, roughly ${cost.tokens.toLocaleString("en-US")} tokens`;

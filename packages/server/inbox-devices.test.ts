@@ -288,7 +288,7 @@ describe("the device door, on the binary", () => {
     const health = await door("health");
     expect(health.status).toBe(200);
     const h = (await health.json()) as Json;
-    expect(Object.keys(h).sort()).toEqual(["app", "notify_reach", "ok", "pid", "serverSession", "update", "version"]);
+    expect(Object.keys(h).sort()).toEqual(["app", "event_streams", "notify_reach", "ok", "pid", "serverSession", "update", "version"]);
     expect(h).toMatchObject({ ok: true, app: "plannotator-inbox", serverSession });
     expect(await (await door("health", { token: null })).json()).toEqual({ error: "This request needs the phone's token.", code: "device_token_missing" });
   });
@@ -715,6 +715,23 @@ describe("the device door, on the binary", () => {
     expect([gone.status, ((await gone.json()) as Json).code]).toEqual([409, "session_not_live"]);
   });
 
+  test("7.63: an action item's Done and its Undo, forwarded unchanged and replayed by key; a question's key is not a door route", async () => {
+    const sent = await agent.send({ project_path: w.project, thread: "door-todo", body: ":::action\nApprove the deploy on Vercel\nWhere: https://vercel.com/acme\n:::" });
+    const listed = (await (await door(`threads/${sent.thread_id}`)).json()) as Json;
+    const todo = listed.thread.messages[0].questions.find((q: Json) => q.kind === "action");
+    expect(todo).toMatchObject({ state: "open", action: { where_url: "https://vercel.com/acme" } });
+    const route = `messages/${sent.message_id}/actions/${todo.key}`;
+    const key = keys();
+    const done = await door(route, { body: { idempotency_key: key, outcome: "done", note: "Approved." } });
+    expect(done.status).toBe(200);
+    expect(((await done.json()) as Json).questions.find((q: Json) => q.key === todo.key)).toMatchObject({ state: "picked", action_result: { outcome: "done", note: "Approved.", by: "person" } });
+    const again = await door(route, { body: { idempotency_key: key, outcome: "cant", note: "changed" } });
+    expect(again.headers.get("idempotent-replayed")).toBe("true");
+    const undone = await door(route, { body: { idempotency_key: keys(), outcome: null } });
+    expect(((await undone.json()) as Json).questions.find((q: Json) => q.key === todo.key)).toMatchObject({ state: "open", action_result: null });
+    expect((await door(`messages/${sent.message_id}/actions/q-00000000`, { body: { idempotency_key: keys(), outcome: "done" } })).status).toBe(404);
+  });
+
   test("7.12 and 7.13: resolve, then delete the thread", async () => {
     const resolved = await door(`messages/${threadId}/resolve`, { body: { idempotency_key: keys(), resolved: true } });
     expect(((await resolved.json()) as Json).thread.resolved_at).toBeTruthy();
@@ -956,7 +973,7 @@ describe("the device door, in process", () => {
       resetServedHostnamesForTests();
     }
   });
-  test("a phone's Send with words and no pick: without skip_unanswered (or with false) it skips nothing; only skip_unanswered: true skips, which is what an iPhone app older than the words-only rule (#1903) sent", async () => {
+  test("7.11: a phone's Send skips only what the person chose (skip: [keys]); skip_unanswered is ignored; one Send to one session is one reply", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "plannotator-inbox-devices-words-"));
     roots.push(dataDir);
     const inbox = await startInboxServer({ dataDir, binaryPath: null, phones: true, setAsideDelayMs: 60_000 });
@@ -969,11 +986,11 @@ describe("the device door, in process", () => {
         body: JSON.stringify({ code: made.offer.code, name: "iPhone", platform: "ios" }),
       });
       const token = ((await pair.json()) as Json).token as string;
-      const reply = (message: string, body: Json) =>
+      const reply = (message: string, body: Json, key: string = crypto.randomUUID()) =>
         fetch(`${base}/api/inbox/device/messages/${message}/reply`, {
           method: "POST",
           headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-          body: JSON.stringify({ idempotency_key: crypto.randomUUID(), ...body }),
+          body: JSON.stringify({ idempotency_key: key, ...body }),
         });
       // One session asks twice in one thread, one open question each: the owner's thread on 0.28.20.
       const ask = (n: number) => {
@@ -982,15 +999,15 @@ describe("the device door, in process", () => {
         const question = (prompt: string) => [":::question", prompt, "", "- [ ] Yes", "- [ ] No", ":::"].join("\n");
         const first = inbox.store.sendMessage({ project_id: project.id, author, body: question("Is this the film you submit?") }).message;
         const second = inbox.store.sendMessage({ project_id: project.id, author, reply_to: first.id, body: question("Is this the film you upload?") }).message;
-        return { first: first.id, second: second.id };
+        return { first: first.id, second: second.id, keys: [inbox.store.questionsOf(first.id)[0]!.key, inbox.store.questionsOf(second.id)[0]!.key] as const };
       };
       const thread = (id: string) => inbox.store.thread(id)!;
       const states = (id: string) => thread(id).messages.flatMap((m) => m.questions ?? []).map((q) => q.state);
       const people = (id: string) => thread(id).messages.filter((m) => m.author.kind === "person");
       const words = "Is there a way to attach video?";
 
-      // The words-only Send the window makes, as a phone that follows #1903 sends it: one reply, to the latest message.
-      for (const [n, extra] of [[0, {}], [1, { skip_unanswered: false }]] as const) {
+      // The default (Keep open): a words-only Send, with or without the old flag, skips nothing. One reply, to the latest message.
+      for (const [n, extra] of [[0, {}], [1, { skip_unanswered: true }]] as const) {
         const t = ask(n);
         expect((await reply(t.second, { words, questions: [], ...extra })).status).toBe(200);
         expect(states(t.first)).toEqual(["open", "open"]);
@@ -1000,12 +1017,43 @@ describe("the device door, in process", () => {
         ]);
       }
 
-      // What the iPhone app sent on 0.28.20 (its Keep open defaulted off): a reply to each message, both with skip_unanswered: true.
-      const t = ask(2);
-      expect((await reply(t.first, { words: "", questions: [], skip_unanswered: true })).status).toBe(200);
-      expect((await reply(t.second, { words, questions: [], skip_unanswered: true })).status).toBe(200);
+      // What the iPhone app sent on 0.28.20 (a reply to each message, skip_unanswered: true): now it skips nothing.
+      const old = ask(2);
+      expect((await reply(old.first, { words: "", questions: [], skip_unanswered: true })).status).toBe(422);
+      expect((await reply(old.second, { words, questions: [], skip_unanswered: true })).status).toBe(200);
+      expect(states(old.first)).toEqual(["open", "open"]);
+
+      // The person tapped Skip them: one reply to the latest message, skipping both questions (one names its message).
+      const t = ask(3);
+      const key = crypto.randomUUID();
+      const skipBody = { words, questions: [], skip: [{ message_id: t.first, key: t.keys[0] }, t.keys[1]] };
+      expect((await reply(t.second, skipBody, key)).status).toBe(200);
       expect(states(t.first)).toEqual(["sent", "sent"]);
-      expect(people(t.first).map((m) => m.body.split("\n")[0])).toEqual(["Skipped 1 question.", "Skipped 1 question."]);
+      expect(people(t.first).map((m) => [m.reply_to, m.body.split("\n")[0]])).toEqual([[t.second, "Skipped 2 questions."]]);
+      // Replayed (the door's idempotency log): the same answer, nothing new.
+      const again = await reply(t.second, skipBody, key);
+      expect(again.headers.get("Idempotent-Replayed")).toBe("true");
+      expect(people(t.first)).toHaveLength(1);
+
+      // Answers on both messages: one reply, each answer under its message's id.
+      const both = ask(4);
+      const answer = (k: string) => {
+        const q = [...inbox.store.questionsOf(both.first), ...inbox.store.questionsOf(both.second)].find((x) => x.key === k)!;
+        return { v: 1, key: k, kind: q.kind, prompt: q.prompt, selected: ["Yes"] };
+      };
+      const res = await reply(both.second, {
+        words: "",
+        questions: [
+          { message_id: both.first, key: both.keys[0], revision: 0, answer: answer(both.keys[0]) },
+          { key: both.keys[1], revision: 0, answer: answer(both.keys[1]) },
+        ],
+      });
+      expect(res.status).toBe(200);
+      expect(states(both.first)).toEqual(["sent", "sent"]);
+      const sent = people(both.first);
+      expect(sent).toHaveLength(1);
+      expect(sent[0]!.body.split("\n")[0]).toBe("Answered 2 questions.");
+      expect(sent[0]!.body).toContain(`### Your message ${both.first}`);
     } finally {
       inbox.stop();
     }

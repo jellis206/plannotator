@@ -17,7 +17,6 @@ import { AnnotationToolstrip } from '@plannotator/ui/components/AnnotationToolst
 import { HtmlSurfaceControls } from '@plannotator/ui/components/HtmlSurfaceControls';
 import { HtmlViewer } from '@plannotator/ui/components/html-viewer';
 import { Viewer, type ViewerHandle } from '@plannotator/ui/components/Viewer';
-import { useConfigValue } from '@plannotator/ui/config';
 import type { Annotation, EditorMode, InputMethod } from '@plannotator/ui/types';
 import { annotationOwnsHighlight } from '@plannotator/ui/utils/annotationOwnsHighlight';
 import { groupAnnotationsByDocument, type AnnotationScope } from '@plannotator/ui/utils/annotationScope';
@@ -149,9 +148,12 @@ export interface AttachmentPaneProps {
    * its header.
    */
   full: boolean;
-  /** Full screen is the only way the window can show the file (a phone, a narrow window: stack.ts): the toolbar leads with Back to the thread instead of Exit full screen. */
+  /** Full screen is the only way the window can show the file (a phone, a narrow window: stack.ts): the toolbar leads with Back to the thread instead of Side by side. */
   fullLocked?: boolean;
-  onToggleFull: () => void;
+  /** `pick`: the person chose with a button (remembered); Escape's last rung is not a pick. */
+  onToggleFull: (pick: boolean) => void;
+  /** The view switch's pressed half: the view on screen becomes the remembered one; the frame stays. */
+  onKeepView?: () => void;
   /** An annotation to select when the file opens (from the chip's list). */
   focusId: string | null;
   readOnly: boolean;
@@ -285,8 +287,6 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
   const [armed, setArmed] = useState(true);
   const [scope, setScope] = useState<AnnotationScope>('all');
   const viewerRef = useRef<ViewerHandle>(null);
-  // Plannotator's plan look (Settings, "Grid" or "Clean"), read from the same registry and cookie as its windows.
-  const gridEnabled = useConfigValue('gridEnabled');
 
   // The current file cannot be read (gone, or no longer the file that was sent): the sent version opens.
   const currentUnavailable = attachment.unavailable !== null;
@@ -495,12 +495,12 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
   const phonePeekHost = phone && menuOpen ? peekSheetHost(sectionRef.current) : null;
   /** The person moved in or out of full screen with a button: focus follows once the frame is drawn. */
   const toggledFull = useRef(false);
-  const toggleFull = () => {
+  const toggleFull = (pick = true) => {
     toggledFull.current = true;
     setMenuOpen(false);
     setSheet(false);
     setMoreOpen(false);
-    props.onToggleFull();
+    props.onToggleFull(pick);
   };
   const wasFull = useRef(false);
   useEffect(() => {
@@ -515,13 +515,14 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
       if (toggled) {
         // The header that held Full screen is gone: focus on the toolbar's first button.
         sectionRef.current?.querySelector<HTMLElement>('[data-full-view-bar] button')?.focus({ preventScroll: true });
-        announce('Full screen. Exit full screen is in the toolbar.');
+        announce('Full screen. Side by side is in the toolbar.');
       }
       // A one-file thread has no step to name the file: the chip names it once as full screen starts.
       if (stepsRef.current.length < 2) showChipRef.current(null);
     } else if (toggled) {
-      sectionRef.current?.querySelector<HTMLElement>('.ib-vhead [data-full-screen-toggle]')?.focus({ preventScroll: true });
-      announce('The file is beside the thread.');
+      // The switch's pressed part, Side by side, which the person just chose (or Escape chose for them).
+      sectionRef.current?.querySelector<HTMLElement>('.ib-vhead [data-view-side]')?.focus({ preventScroll: true });
+      announce('Side by side: the file is beside the thread.');
     }
   }, [full, announce]);
   const goTo = (target: number, source: StepSource) => {
@@ -574,7 +575,7 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
   const stepWhen = (dir: 1 | -1) => (event: KeyboardEvent) => {
     if (!multi) return false;
     const pane = sectionRef.current;
-    // An image at its own size that overflows scrolls with the arrows.
+    // An element that uses the arrows itself (a focused video) keeps them; a zoomed image does not: ← → always step.
     if (event.key.startsWith('Arrow') && pane?.querySelector('[data-claims-arrows="true"]')) return false;
     return stepKeyIntent(event, { full, pane, blocked }) === dir;
   };
@@ -851,7 +852,7 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
         return;
       case 'leave':
         if (props.fullLocked) close();
-        else toggleFull();
+        else toggleFull(false);
         return;
     }
   }
@@ -1329,7 +1330,7 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
             />
           }
           moreOpen={moreOpen}
-          leave={props.fullLocked ? { kind: 'back', onLeave: close } : { kind: 'exit', onLeave: toggleFull }}
+          leave={props.fullLocked ? { kind: 'back', onLeave: close } : { kind: 'exit', onLeave: () => toggleFull() }}
           chord={isHtml ? TOOLS_CHORD : null}
           shifted={drawerMode && drawer && hasPanel}
         />
@@ -1385,10 +1386,21 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
             </button>
           )}
           {!props.fullLocked && (
-            <button type="button" className="ib-btn ib-sm" onClick={toggleFull} data-full-screen-toggle="">
-              <Icon name="expand" size={14} />
-              Full screen
-            </button>
+            // The view's two parts (fileView.ts), the one shown pressed. This header shows only while the file is side by side.
+            <div className="ib-seg ib-viewseg" role="group" aria-label="View" data-view-switch="">
+              <Tip content="Side by side: files open beside the thread until you choose again">
+                <button type="button" className="ib-seg-o" aria-pressed="true" data-on="" onClick={() => props.onKeepView?.()} aria-label={folded ? 'Side by side' : undefined} data-view-side="">
+                  <Icon name="sideBySide" size={14} />
+                  {!folded && 'Side by side'}
+                </button>
+              </Tip>
+              <Tip content="Full screen: files open this way until you choose again">
+                <button type="button" className="ib-seg-o" aria-pressed="false" onClick={() => toggleFull()} aria-label={folded ? 'Full screen' : undefined} data-full-screen-toggle="">
+                  <Icon name="frame" size={14} />
+                  {!folded && 'Full screen'}
+                </button>
+              </Tip>
+            </div>
           )}
           <Tip content="Close">
             <button type="button" className="ib-iconbtn" onClick={close} aria-label={`Close ${attachment.name}`}>
@@ -1612,7 +1624,7 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
             </div>
           )}
           {view && !isHtml && !isCode && (
-            <div className={`ib-docscroll ${gridEnabled ? 'bg-grid' : 'bg-card'}`} data-look={gridEnabled ? 'grid' : 'clean'}>
+            <div className="ib-docscroll bg-card" data-look="clean">
               <Viewer
                 key={`${attachment.id}:${view.version}:${view.attachment.current?.sha256 ?? ''}`}
                 ref={viewerRef}
@@ -1627,7 +1639,7 @@ export const AttachmentPane = forwardRef<AttachmentPaneHandle, AttachmentPanePro
                 mode={isText ? mode : 'comment'}
                 inputMethod={isText ? inputMethod : 'drag'}
                 taterMode={false}
-                gridEnabled={gridEnabled}
+                gridEnabled={false}
                 maxWidth={full ? 760 : 640}
                 stickyActions={false}
                 disableCodePathValidation
