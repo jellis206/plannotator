@@ -85,6 +85,29 @@
  * guide }`: the inline image's id under `before.png`, the attached copy's under
  * `before.png (attached)`).
  *
+ * With `decisions` (decision mode, experimental; approval "inbox-decision-mode"):
+ * config.json turns decision mode on, and each project gets only this seed in
+ * place of the one above: Claude Code (`ses_da<i>`) asks two questions in one
+ * message (a Stopped pick-one of three, recommended, then a two-way), and
+ * Codex (`ses_db<i>`) asks one two-way question in a thread of its own. The
+ * world is `{ project, root, decide: { a, b, sessionA, sessionB } }`. A `send`
+ * line on stdin may carry `supersedes` (and `host`).
+ *
+ * With `first-run`, nothing is seeded (no project: the window opens on the
+ * first-run screen) and the first line's `worlds` is empty. A stdin line
+ * `{ "first": { root, session, body } }` is an agent writing its first
+ * message from folder `root` (made if missing); the server answers
+ * `{ "sent": <message id>, "project": <project id> }`. Start one server per
+ * test: the first message ends the first run for good.
+ *
+ * With `sent-reply`, each project also gets a thread one Claude Code session
+ * (`ses_sr<i>`) asks in twice: message `a` with two questions, then `b` with
+ * one; the person sent ONE reply with words ("Go with the dense table.
+ * Thanks!") answering a's first and b's question and skipping a's second,
+ * plus a comment's feedback text. And a second thread whose one question the
+ * person answered with no words. The world adds `sentReply` (`{ thread, a, b,
+ * reply, simple, simpleReply }`).
+ *
  * With `leaked-subject`, each project also gets a thread whose STORED subject
  * holds an agent's leaked tool-call text, as an Inbox older than the one-line
  * subject check kept it (tests/helpers/inbox-leaked-subject.ts); the world
@@ -101,6 +124,7 @@ import { createAgentEnvironmentFor } from "../../packages/server/inbox-agents";
 import { isScratchDataDir, refuseRealDataDir } from "./real-data-dir";
 import { seedTagWorld, TAG_SESSIONS } from "./inbox-tag-world";
 import { seedLeakedSubjects } from "./inbox-leaked-subject";
+import { markTourDecided } from "./tour-decided";
 
 const [dataDir, projectsDir, countArg, extra] = process.argv.slice(2);
 const withNews = extra === "news";
@@ -214,6 +238,12 @@ if (whatsNewMode) {
   process.env.PLANNOTATOR_UPDATE_API_URL = `http://127.0.0.1:${releaseApi.port}/releases/latest`;
 }
 const openInMode = extra === "open-in";
+const decisionsMode = extra === "decisions";
+// Decision mode is experimental and off by default: this mode turns it on in the scratch config.json.
+if (decisionsMode) {
+  mkdirSync(dataDir, { recursive: true });
+  writeFileSync(join(dataDir, "config.json"), JSON.stringify({ experimental: { decisionMode: true } }));
+}
 const restartMode = extra === "restart";
 const claudeDir = join(dataDir, "claude");
 const pluginFolder = (version: string) => join(claudeDir, "plugins", "cache", "plannotator", "plannotator", version);
@@ -297,6 +327,7 @@ type World = {
   leaked?: string;
   guide?: { thread: string; message: string };
   artifacts?: { thread: string; ids: Record<string, string>; guide: string };
+  sentReply?: { thread: string; a: string; b: string; reply: string; simple: string; simpleReply: string };
   news: string[];
 };
 /** The guided review the `guide` mode sends: two sections, one file each, so the first card and the second differ. */
@@ -339,11 +370,52 @@ const SENT_MULTI = [
   ":::",
 ].join("\n");
 const worlds: World[] = [];
-for (let i = 0; i < count; i++) {
+// `first-run-tour`: a first run whose window opens on the tour's entry screen (packages/inbox/tour.test.tsx).
+const firstRunMode = extra === "first-run" || extra === "first-run-tour";
+// Every other first run opens on the connect screen, as before the tour: the tour is marked skipped.
+if (extra === "first-run") markTourDecided(dataDir);
+for (let i = 0; i < (firstRunMode ? 0 : count); i++) {
   const root = join(projectsDir, `billing-${i}`);
   mkdirSync(root, { recursive: true });
   const project = store.ensureProject({ name: `billing-${i}`, root });
   const author = { kind: "agent" as const, host: "claude-code", session: `ses_a${i}`, name: "Claude Code" };
+  if (decisionsMode) {
+    const sessionA = `ses_da${i}`;
+    const sessionB = `ses_db${i}`;
+    const a = store.sendMessage({
+      project_id: project.id,
+      author: { ...author, session: sessionA },
+      body: [
+        "Two calls before the refund worker ships.",
+        "",
+        ":::question",
+        "Which way should the worker go on a Stripe 409?",
+        "",
+        "Stopped: the refund worker cannot ship without this.",
+        "",
+        "- [ ] Retry with the same key — Stripe charges once per key",
+        "- [ ] Fail to the dead-letter queue — today's behavior",
+        "- [ ] Retry with a new key — fastest, can refund twice",
+        "",
+        "Recommended: Retry with the same key",
+        ":::",
+        "",
+        ":::question",
+        "Page on-call after 5 tries?",
+        "",
+        "- [ ] Yes, page on-call",
+        "- [ ] No, a daily digest",
+        ":::",
+      ].join("\n"),
+    }).message;
+    const b = store.sendMessage({
+      project_id: project.id,
+      author: { kind: "agent", host: "codex", session: sessionB, name: "Codex" },
+      body: [":::question", "Ship the new flag off by default?", "", "- [ ] Yes", "- [ ] No", ":::"].join("\n"),
+    }).message;
+    worlds.push({ project: project.id, root, decide: { a: a.id, b: b.id, sessionA, sessionB } } as unknown as World);
+    continue;
+  }
   const stopped = store.sendMessage({ project_id: project.id, author, body: STOPPED }).message;
   const waiting = store.sendMessage({ project_id: project.id, author: { ...author, session: `ses_b${i}` }, body: WAITING }).message;
   // One thread two sessions write in: A asks, then B posts a later update in it.
@@ -393,6 +465,54 @@ for (let i = 0; i < count; i++) {
       questions: [{ key: multi.key, revision: multi.revision, answer: { v: 1, key: multi.key, kind: multi.kind, prompt: multi.prompt, selected: ["Toasts"] } }],
     });
     sentMulti = message.id;
+  }
+  let sentReply: World["sentReply"];
+  if (extra === "sent-reply") {
+    const replyAuthor = { ...author, session: `ses_sr${i}` };
+    const a = store.sendMessage({
+      project_id: project.id,
+      author: replyAuthor,
+      body: [
+        "Two calls on the invoice export:",
+        "",
+        ":::question",
+        "Which layout should the **export** use?",
+        "",
+        "- [ ] Cards",
+        "- [ ] A dense table",
+        ":::",
+        "",
+        ":::question",
+        "Should the export include voided invoices?",
+        "",
+        "- [ ] Yes",
+        "- [ ] No",
+        ":::",
+      ].join("\n"),
+    }).message;
+    const b = store.sendMessage({
+      project_id: project.id,
+      author: replyAuthor,
+      reply_to: a.id,
+      body: [":::question", "Ship it behind a flag?", "", "- [ ] Yes, behind a flag", "- [ ] No", ":::"].join("\n"),
+    }).message;
+    const [layout, voided] = store.questionsOf(a.id);
+    const [flag] = store.questionsOf(b.id);
+    const answer = (q: typeof layout, selected: string[]) => ({ v: 1 as const, key: q!.key, kind: q!.kind, prompt: q!.prompt, selected });
+    const reply = store.sendReply(b.id, {
+      idempotency_key: `sent-reply-${i}`,
+      words: "Go with the dense table. Thanks!",
+      questions: [
+        { message_id: a.id, key: layout!.key, revision: layout!.revision, answer: answer(layout, ["A dense table"]) },
+        { key: flag!.key, revision: flag!.revision, answer: answer(flag, ["Yes, behind a flag"]) },
+      ],
+      skip: [{ message_id: a.id, key: voided!.key }],
+      feedback: "# Feedback on the attached files\n\n## notes.md\n\n### 1. Feedback on: \"The plan\"\n> Say which plan.",
+    }).reply!;
+    const simple = store.sendMessage({ project_id: project.id, author: { ...author, session: `ses_sq${i}` }, body: WAITING.replace("docs site", "export page") }).message;
+    const [only] = store.questionsOf(simple.id);
+    const simpleReply = store.sendReply(simple.id, { idempotency_key: `sent-simple-${i}`, questions: [{ key: only!.key, revision: only!.revision, answer: answer(only, ["Pagefind"]) }] }).reply!;
+    sentReply = { thread: a.thread_id, a: a.id, b: b.id, reply: reply.id, simple: simple.thread_id, simpleReply: simpleReply.id };
   }
   let openIn: World["openIn"];
   if (openInMode) {
@@ -505,6 +625,7 @@ for (let i = 0; i < count; i++) {
     ...(openIn ? { openIn } : {}),
     ...(files ? { files } : {}),
     ...(sentMulti ? { sentMulti } : {}),
+    ...(sentReply ? { sentReply } : {}),
     project: project.id,
     stopped: stopped.id,
     waiting: waiting.id,
@@ -537,11 +658,20 @@ function tagHost(session: string): string {
 void (async () => {
   for await (const line of console) {
     const command = JSON.parse(line) as {
-      send?: { project: string; session: string; body: string; reply_to?: string };
+      send?: { project: string; session: string; body: string; reply_to?: string; supersedes?: string[]; host?: string };
       deliver?: { session: string };
       wait?: { thread: string; session: string };
       poll?: { session: string; body: Record<string, unknown> };
+      first?: { root: string; session: string; body: string };
     };
+    if (command.first) {
+      // An agent's first message: its folder becomes the Inbox's first project.
+      mkdirSync(command.first.root, { recursive: true });
+      const project = store.ensureProject({ name: command.first.root.split("/").pop()!, root: command.first.root });
+      const sent = store.sendMessage({ project_id: project.id, author: { kind: "agent", host: "claude-code", session: command.first.session, name: "Claude Code" }, body: command.first.body });
+      process.stdout.write(`${JSON.stringify({ sent: sent.message.id, project: project.id })}\n`);
+      continue;
+    }
     if (command.poll) {
       // That session's connection polling now: it is live, with what it loaded.
       await fetch(`http://127.0.0.1:${server.port}/api/inbox/bridge/poll`, {
@@ -568,8 +698,14 @@ void (async () => {
       continue;
     }
     if (!command.send) continue;
-    const { project, session, body, reply_to } = command.send;
-    const sent = store.sendMessage({ project_id: project, author: { kind: "agent", host: "claude-code", session, name: "Claude Code" }, body, ...(reply_to ? { reply_to } : {}) });
+    const { project, session, body, reply_to, supersedes, host } = command.send;
+    const sent = store.sendMessage({
+      project_id: project,
+      author: { kind: "agent", host: host ?? "claude-code", session, name: host === "codex" ? "Codex" : "Claude Code" },
+      body,
+      ...(reply_to ? { reply_to } : {}),
+      ...(supersedes ? { supersedes } : {}),
+    });
     process.stdout.write(`${JSON.stringify({ sent: sent.message.id })}\n`);
   }
 })();

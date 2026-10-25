@@ -27,7 +27,7 @@ import { INBOX_SET_ASIDE_HEADING } from "@plannotator/core/inbox-questions";
 import { INBOX_ACTION_EXAMPLE, INBOX_ACTION_GUIDE, INBOX_ACTIONS_HEADING } from "@plannotator/core/inbox-actions";
 import { HARNESSES, harnessPanel, shellLine, type ConnectContext, type Harness } from "@plannotator/inbox/harnesses";
 import { join } from "node:path";
-import { INBOX_MCP_TOOLS, INBOX_SERVED_TOOLS, INBOX_WAIT_DEFAULT_MS, INBOX_WAIT_MAX_SECONDS } from "@plannotator/server/inbox-mcp";
+import { INBOX_CONTRACT_EXAMPLE, INBOX_MCP_TOOLS, INBOX_SERVED_TOOLS, INBOX_WAIT_DEFAULT_MS, INBOX_WAIT_MAX_SECONDS } from "@plannotator/server/inbox-mcp";
 import { INBOX_BODY_CUT_BYTES, INBOX_EARLIER_PERSON_BYTES, INBOX_THREAD_WINDOW, sizeText } from "@plannotator/server/inbox-mcp-read";
 import { INBOX_AGENT_SEARCH_LIMIT } from "@plannotator/server/inbox-mcp-search";
 import { INBOX_TOOL_DEFAULTS, INBOX_TOOL_HOSTS } from "@plannotator/shared/config";
@@ -251,6 +251,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
   const noteLines = INBOX_NOTE_AGENT_IDS.map((id) => {
     const target = noteTarget(id, agents);
     const shown = displayPath(target.path, agents);
+    if (id === "cursor") return `- ${INBOX_AGENT_LABELS[id]} (\`${id}\`): manual copy to Cursor Settings → Rules. \`plannotator inbox --notes cursor\` prints the note; Plannotator cannot detect, update or remove a copied rule.`;
     if (target.reason) return `- ${INBOX_AGENT_LABELS[id]} (\`${id}\`): none. ${target.reason}`;
     return `- ${INBOX_AGENT_LABELS[id]} (\`${id}\`): ${code(shown ?? "")}, ${target.create ? "creates the file" : "adds a marked section"}.`;
   });
@@ -328,7 +329,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "",
     "## Where replies go",
     "",
-    `- With the \`${INBOX_TOOL_NAME}\` tool in Claude Code, Pi or OpenCode 2, the person's reply arrives in your session by itself as a new message once the session is idle, starting with the line \`Plannotator Inbox: <subject> (<reply id>)\`. End your turn instead of waiting. When the person presses Send now while you work, it arrives in the turn you are in, at your next step: answer it before you go on. To answer, send_message with \`reply_to\` set to that id. The person can also write to a live session first; it arrives the same way.`,
+    `- With the \`${INBOX_TOOL_NAME}\` tool in Claude Code, Pi or OpenCode 2, the person's reply arrives in your session by itself as a new message once the session is idle, starting with the line \`Plannotator Inbox: <subject> (<reply id>)\`. End your turn instead of waiting. When the person presses Send now while you work, it arrives in the turn you are in, at your next step: answer it before you go on. To answer, send_message with \`reply_to\` set to that id. The person can also write to a live session first; it arrives the same way. Every such message ends with one closing line, \`[thread <thread id> · more: <tool> read_thread · how it works: plannotator inbox --help]\` (a 👍 Looks good ends with \`[thread <thread id>]\` alone): read_thread with that \`thread_id\` shows the whole thread.`,
     "- The person can start a new thread with your session from the Inbox: an idea or a request of their own, not an answer to anything you asked, and it may have nothing to do with your current work. It arrives the same way, and its second line says so. Say how you will handle it before you start, and answer with `reply_to` set to the id on its first line, so your answer lands in that thread; name this thread on that reply with `thread` (a few words). Files they attached are listed under their words as `Attached: <name> (<path>)`; open them by path.",
     `- Replies come back to the session that sent the message: send with your \`${INBOX_TOOL_NAME}\` tool; inside Claude Code or Pi, a command your session runs also carries the session's identity.`,
     "- OpenCode 1 has the tool but no wake, and nothing wakes an MCP client: call wait_for_reply, or read_thread later.",
@@ -364,6 +365,20 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     INBOX_REPLACES_EXAMPLE,
     "```",
     "",
+    "### Decision lines and picture choices",
+    "",
+    "Optional lines after the question, for a decision that needs them. Most questions need none of these. Write each at the block's own indent (an indented one under a choice is that choice's text); each is read once, is never context, and does not change the question's key:",
+    "",
+    "- `Stakes: <one sentence>`: what the choice affects, in product terms. The card shows it under the question. Give one whenever you write `Stopped:` or `Holds up:`; the send result reminds you when you did not.",
+    "- `Shows: ![alt](path)` or `Shows: [name](file)`: the one picture or file the decision is about. Put long detail in that file, not in the block (context stays one to three sentences).",
+    "- `Why: <one line>`: why you recommend your answer, on its own line. Shown under the choices.",
+    "- `Reversible: no — <why>`: only when the answer cannot be taken back. `yes`, or no line, means it can.",
+    "- A picture choice: `- [ ] Label — ![alt](path) consequence` (or a plain `- Label — ![alt](path)` bullet), on `:::question` and `:::question-multi`. The card draws the choices as pictures the person picks; the label stays required and is the answer you get back, the rest is the choice's description. Pictures are captured like the message's other images, and the send result names any that will not show.",
+    "",
+    "```markdown",
+    INBOX_CONTRACT_EXAMPLE,
+    "```",
+    "",
     "### Action items only the person can do",
     "",
     INBOX_ACTION_GUIDE,
@@ -386,7 +401,7 @@ export function formatInboxHelp(options: InboxHelpOptions): string {
     "",
     "## A note in each agent's instructions",
     "",
-    "Plannotator can add a short, marked note about the Inbox to an agent's own instructions file, so it sends decisions and finished work here while the person is away. Only with the person's yes: show them this list, then run `plannotator inbox --notes <ids>` with only the agents they agreed to (comma-separated). It never overwrites a note the person edited; the Inbox's Settings and `plannotator uninstall` remove it. On this computer:",
+    "Plannotator can add a short note about the Inbox to an agent's instructions, so it sends decisions and finished work here while the person is away. Only with the person's yes: show them this list, then run `plannotator inbox --notes <ids>` with only the agents they agreed to (comma-separated). Managed notes never overwrite a note the person edited and can be removed in Settings or with `plannotator uninstall`; Cursor instead requires manual copy/paste and Plannotator cannot track or remove it. On this computer:",
     "",
     ...noteLines,
     "",

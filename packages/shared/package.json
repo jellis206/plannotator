@@ -58,6 +58,7 @@
     "./config": "./config.ts",
     "./data-dir": "./data-dir.ts",
     "./update-check": "./update-check.ts",
+    "./usage-counts": "./usage-counts.ts",
     "./prompts": "./prompts.ts",
     "./improvement-hooks": "./improvement-hooks.ts",
     "./pfm-reminder": "./pfm-reminder.ts",
@@ -108,6 +109,7 @@
     "./guide-format": "./guide-format.ts",
     "./guide-viewer-manifest": "./guide-viewer-manifest.ts",
     "./guide-format-fixtures": "./guide-format-fixtures.ts",
+    "./live-proxy-port": "./live-proxy-port.ts",
     "./live-proxy-core": "./live-proxy-core.ts",
     "./loopback-host": "./loopback-host.ts",
     "./request-origin": "./request-origin.ts",
@@ -136,13 +138,13 @@
     "./inbox/agent-link": "./inbox/agent-link.ts"
   },
   "dependencies": {
-    "@joplin/turndown-plugin-gfm": "^1.0.64",
+    "@joplin/turndown-plugin-gfm": "^1.0.68",
     "@plannotator/core": "workspace:*",
     "chokidar": "^5.0.0",
     "parse5": "^7.3.0",
     "turndown": "^7.2.4"
   },
   "devDependencies": {
-    "fast-check": "4.9.0"
+    "fast-check": "4.10.2"
   }
 }

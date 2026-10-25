@@ -50,6 +50,9 @@ import {
   type InboxCardColumn,
   INBOX_SOUND_DEFAULT_VOLUME,
   INBOX_TEXT_SIZE_DEFAULT,
+  INBOX_TOUR_VERSION,
+  type InboxTourChange,
+  type InboxTourState,
   INBOX_HOST_NAMES,
   isInboxId,
   isInboxSoundVolume,
@@ -67,6 +70,8 @@ import {
   INBOX_TOOL_HOSTS,
   loadConfig,
   parseAutoUpdateEnv,
+  parseExperimentalEnv,
+  resolveExperimental,
   parseInboxToolEnv,
   parseUpdateCheckEnv,
   resolveAutoUpdate,
@@ -128,6 +133,7 @@ import { createInboxLiveSessions } from "./inbox-sessions";
 import { claudePluginBehindInbox, claudeRestartCommand, claudeSessionOutdated, CLAUDE_PLUGIN_UPDATE_COMMAND, createClaudePluginInstallReader, piSessionOutdated } from "./inbox-restart";
 import { createInboxCompose, INBOX_UPLOAD_SWEEP_MS } from "./inbox-compose";
 import { createInboxReplyDrafts } from "./inbox-reply-drafts";
+import { createInboxPins } from "./inbox-pins";
 import { createInboxTagsRoute } from "./inbox-tags";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
 import type { PairingProbes } from "./inbox-pairing-checks";
@@ -138,6 +144,7 @@ import { createInboxUpdates, type InboxUpdatesOptions } from "./inbox-updates";
 import { INBOX_WHATS_NEW_IMAGE_PATH, whatsNewImageRoute } from "./inbox-whats-new-images";
 import { inboxCanonicalBaseUrl, inboxCanonicalRedirect } from "./inbox-canonical";
 import { createInboxWindows, parseWindowId, parseWindowOrigin, parseWindowPermission } from "./inbox-windows";
+import { handleInboxTourRequest } from "./inbox-tour";
 import {
   agentSpec,
   claudeCodeModOn,
@@ -440,6 +447,8 @@ const ERROR_STATUS: Record<string, number> = {
   card_person_only: 403,
   // Over your tailnet (packages/server/inbox-tailscale.ts).
   tailscale_env_decides: 409,
+  // Settings → General → Experimental, while PLANNOTATOR_EXPERIMENTAL decides.
+  experimental_env_decides: 409,
   tailscale_unavailable: 409,
   local_only: 403,
 };
@@ -658,13 +667,15 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const statusListeners = new Set<() => void>();
   /** A reply draft was saved or deleted (inbox-reply-drafts.ts): the windows' streams say `event: drafts`. */
   const draftListeners = new Set<(threadId: string) => void>();
+  /** The sidebar's pins changed (inbox-pins.ts): the windows' streams say `event: pins`. */
+  const pinListeners = new Set<() => void>();
   // The Inbox windows open now and whether any can show a notification (inbox-windows.ts).
   const windows = createInboxWindows({ graceMs: options.windowGraceMs });
   /** Event streams open now (health's `event_streams`): Inbox tabs of one origin share one. */
   let openEventStreams = 0;
   const binaryPath = options.binaryPath !== undefined ? options.binaryPath : version !== "dev" ? process.execPath : null;
-  // The sidebar's Update button (packages/server/inbox-updates.ts): the hourly
-  // release check, the binary on disk, Update now, Remind me tomorrow.
+  // The sidebar's Update button (packages/server/inbox-updates.ts): the release
+  // check, the binary on disk, Update now, Remind me tomorrow.
   const updates = createInboxUpdates({
     dataDir,
     version,
@@ -820,8 +831,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
    */
   const listModel = (projectFilter: string | null, archived: "include" | "exclude") => {
     // One pass over the store feeds both the folders' counts and the sections.
-    const rows = store.listRows();
+    // `pinned_at` (additive) on the window's and the phone's rows only: never on anything an agent reads.
+    const pinnedAt = new Map(store.pins().map((pin) => [pin.thread_id, pin.pinned_at]));
+    const rows = store.listRows().map((row) => (pinnedAt.has(row.thread_id) ? { ...row, pinned_at: pinnedAt.get(row.thread_id)! } : row));
     const scoped = projectFilter ? rows.filter((row) => row.project.id === projectFilter) : rows;
+    const byId = new Map(rows.map((row) => [row.thread_id, row]));
     return {
       serverSession,
       version,
@@ -838,6 +852,15 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       // Quiet included, and Settings lists them (GET /api/inbox/threads/archived).
       // Without it they stay in Quiet, as an older window and the phone expect.
       sections: inboxListSections(archived === "exclude" ? scoped.filter((row) => !inboxRowArchived(row)) : scoped),
+      /**
+       * The sidebar's pinned threads (approval "inbox-pinned-threads"), in pin
+       * order: every pinned thread whatever the project filter or `archived`
+       * (an archived thread stays pinned). Additive: absent from an older Inbox.
+       */
+      pins: store
+        .pins()
+        .map((pin) => byId.get(pin.thread_id))
+        .filter((row): row is InboxListRow => row !== undefined),
     };
   };
 
@@ -1068,7 +1091,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       }
     }
     if (typeof body.note === "boolean") {
-      if (!(INBOX_NOTE_AGENT_IDS as readonly string[]).includes(agent)) throw new InboxError("validation_error", "note: this agent has no instructions file.", { field: "note" });
+      if (!(INBOX_NOTE_AGENT_IDS as readonly string[]).includes(agent)) throw new InboxError("validation_error", "note: this agent has no Inbox note workflow.", { field: "note" });
+      if (agent === "cursor") throw new InboxError("validation_error", "Cursor rules must be copied manually from Settings → Agents.", { field: "note" });
       if (inboxNotesDisabled(agentEnvironment.env) && body.note) throw new InboxError("notes_disabled", "PLANNOTATOR_INBOX_NOTES=0 is set: notes are off.");
       // Adding one needs the agent here, as the note dialog and --notes ask; switching one off never does.
       if (body.note && !agentSpec(agent).detect(agentEnvironment)) {
@@ -1106,10 +1130,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // Read before adding: an agent whose note is added is no longer a candidate.
     const shown = (body.asked as InboxNoteAgentId[] | undefined) ?? (await noteCandidateIds(options));
     const results = adding.map((agent) =>
-      // Never a file for an agent that is not on this computer.
-      agentSpec(agent).detect(agentEnvironment)
-        ? addInboxNote(agent, dataDir, agentEnvironment)
-        : ({ ok: false, agent, reason: `${INBOX_AGENT_LABELS[agent]} was not found on this computer`, path: null } as const),
+      agent === "cursor"
+        ? ({ ok: true, agent, action: "manual", path: null } as const)
+        // Never a file for an agent that is not on this computer.
+        : agentSpec(agent).detect(agentEnvironment)
+          ? addInboxNote(agent, dataDir, agentEnvironment)
+          : ({ ok: false, agent, reason: `${INBOX_AGENT_LABELS[agent]} was not found on this computer`, path: null } as const),
     );
     const failed = new Set(results.filter((result) => !result.ok).map((result) => result.agent));
     await markNotesAsked([...new Set([...shown, ...adding])].filter((id) => !failed.has(id)), options);
@@ -1294,6 +1320,54 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   };
 
   /**
+   * The onboarding tour (config.json `inboxTour`, approval
+   * "inbox-onboarding-tour"): when it was started, finished or skipped, and
+   * whether the first real thread offers notifications once more. Kept per
+   * machine, so a port change keeps it.
+   */
+  const tourState = (): InboxTourState => {
+    const value = loadConfig().inboxTour;
+    const stamp = (v: unknown) => (typeof v === "string" && v ? v : null);
+    return {
+      version: typeof value?.version === "number" ? value.version : INBOX_TOUR_VERSION,
+      seen_at: stamp(value?.seen_at),
+      finished_at: stamp(value?.finished_at),
+      skipped_at: stamp(value?.skipped_at),
+      notify_again: value?.notify_again === true,
+    };
+  };
+
+  const saveTour = (input: unknown, validateOnly = false): InboxTourState => {
+    const keys = ["seen", "finished", "skipped", "notify_again"];
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      Object.keys(input).length === 0 ||
+      Object.entries(input).some(([key, value]) => !keys.includes(key) || typeof value !== "boolean")
+    ) {
+      throw new InboxError("validation_error", "tour: { seen?, finished?, skipped?, notify_again? }, each a boolean.", { field: "tour" });
+    }
+    if (validateOnly) return tourState();
+    const change = input as InboxTourChange;
+    const now = new Date().toISOString();
+    const current = tourState();
+    const next: InboxTourState = {
+      version: INBOX_TOUR_VERSION,
+      seen_at: change.seen ? now : current.seen_at,
+      finished_at: change.finished ? now : current.finished_at,
+      skipped_at: change.skipped ? now : current.skipped_at,
+      notify_again: change.notify_again ?? current.notify_again,
+    };
+    saveConfig({ inboxTour: next });
+    const saved = tourState();
+    if (saved.seen_at !== next.seen_at || saved.finished_at !== next.finished_at || saved.skipped_at !== next.skipped_at || saved.notify_again !== next.notify_again) {
+      throw new InboxError("config_not_saved", "config.json could not be written; nothing changed.");
+    }
+    return saved;
+  };
+
+  /**
    * The diff layout guided reviews draw (config.json `diffOptions.diffStyle`),
    * the same setting code review reads and writes, so a choice in either holds
    * in the other: `split` or `unified`, null while never chosen.
@@ -1369,6 +1443,39 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     return updatesState();
   };
 
+  /**
+   * Experimental features (config.json `experimental`, PLANNOTATOR_EXPERIMENTAL
+   * wins): each switch, and whether the env var decides it. Read on every
+   * request, so a switch applies at once.
+   */
+  const decisionModeOn = () => resolveExperimental(loadConfig(), "decision-mode");
+  const experimentalState = () => ({
+    decision_mode: { on: decisionModeOn(), env: parseExperimentalEnv("decision-mode") ?? null },
+  });
+
+  /** Save `experimental: { decision_mode }`. `validateOnly`: check and write nothing. */
+  const saveExperimental = (input: unknown, validateOnly = false) => {
+    if (
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      typeof (input as { decision_mode?: unknown }).decision_mode !== "boolean" ||
+      Object.keys(input).some((key) => key !== "decision_mode")
+    ) {
+      throw new InboxError("validation_error", "experimental: { decision_mode: boolean }.", { field: "experimental" });
+    }
+    const on = (input as { decision_mode: boolean }).decision_mode;
+    // The env var decides (like PLANNOTATOR_INBOX_TAILSCALE): saving to config.json would change nothing.
+    const env = parseExperimentalEnv("decision-mode");
+    if (env !== undefined) {
+      throw new InboxError("experimental_env_decides", `PLANNOTATOR_EXPERIMENTAL is set in this Inbox's environment, so decision mode stays ${env ? "on" : "off"}.`, { field: "experimental" });
+    }
+    if (validateOnly) return experimentalState();
+    saveConfig({ experimental: { decisionMode: on } });
+    if (loadConfig().experimental?.decisionMode !== on) throw new InboxError("config_not_saved", "config.json could not be written; nothing changed.");
+    return experimentalState();
+  };
+
   /** What Settings and the connect snippets read. */
   const settingsModel = (via: RequestVia) => ({
     serverSession,
@@ -1398,6 +1505,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     text_size: textSizeState(),
     /** The guided review's diff layout (config.json `diffOptions.diffStyle`), shared with code review; null when never chosen. */
     diff_style: diffStyleState(),
+    /** Experimental features, each off unless switched on (Settings → General → Experimental). */
+    experimental: experimentalState(),
+    /** The onboarding tour: started, finished or skipped, and whether the first real thread offers notifications once more. */
+    tour: tourState(),
     store: store.diskUsage(),
     /** Whether this Inbox serves phones; the window shows the Phones block only then. */
     phones: phonesOn,
@@ -1519,6 +1630,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         // A reply draft changed (any window's, or this one's): the list reads the rows' `unsent` again. Windows only.
         const onDraft = (threadId: string) => send(`event: drafts\ndata: ${JSON.stringify({ thread_id: threadId })}\n\n`);
         if (windowId) draftListeners.add(onDraft);
+        // The sidebar's pins changed (any window's, or a deletion): the list reads `pins` again. Windows only.
+        const onPins = () => send(`event: pins\ndata: {}\n\n`);
+        if (windowId) pinListeners.add(onPins);
         if (windowId) sendReach();
         // A row's delivery moved with the live sessions (no store line): windows only, like `reach`.
         const sendDeliveries = () => send(`event: deliveries\ndata: {}\n\n`);
@@ -1534,6 +1648,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           statusListeners.delete(onStatus);
           stopReach();
           draftListeners.delete(onDraft);
+          pinListeners.delete(onPins);
           deliveryListeners.delete(sendDeliveries);
           leave();
         };
@@ -1855,6 +1970,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       for (const listener of draftListeners) listener(threadId);
     },
   });
+  // Pins: threads pinned to the window's sidebar (packages/server/inbox-pins.ts). A deletion's prune tells the windows too.
+  const pins = createInboxPins({ store, serverSession, readBody: (req) => readBody(req), json });
+  const stopPinEvents = store.onPinsChange(() => {
+    for (const listener of pinListeners) listener();
+  });
   const uploadSweep = setInterval(() => compose.sweep(), INBOX_UPLOAD_SWEEP_MS);
   (uploadSweep as { unref?: () => void }).unref?.();
 
@@ -1994,10 +2114,25 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // What reached the pairing code, and step 1's checks of this computer, are this computer's own business too.
     if (via === "tailnet" && (path === "/api/inbox/pairing" || path === "/api/inbox/pairing/checks")) return localOnly();
 
+    // The onboarding tour's fixture and assets (inbox-tour.ts): read only, served from the binary on demand.
+    const tourAnswer = await handleInboxTourRequest(req, path);
+    if (tourAnswer) return tourAnswer;
+
     try {
       if (path === "/api/inbox/health" && req.method === "GET") return json(health());
       if (path === "/api/inbox/threads" && req.method === "GET") return json(listModel(projectFilterOf(url), archivedModeOf(url)));
       if (path === "/api/inbox/threads/archived" && req.method === "GET") return json(archivedModel(url));
+      // Decision mode (experimental, approval "inbox-decision-mode"): a read-only projection of every
+      // decision waiting on the person. Off (the default), the route does not exist.
+      if (path === "/api/inbox/decisions") {
+        if (!decisionModeOn()) return json({ error: "Not found", code: "not_found" }, 404);
+        if (req.method !== "GET") return json({ error: "Use GET." }, 405);
+        // Another site's page must not read (or time) what waits on the person.
+        if (!isSameOriginOrNoOrigin(origin, req.headers.get("host") ?? "", req.headers.get("sec-fetch-site"))) {
+          return json({ error: "Cross-origin requests are not accepted.", code: "cross_origin" }, 403);
+        }
+        return json({ serverSession, cursor: store.cursor(), decisions: store.openDecisions({ projectId: projectFilterOf(url) }) });
+      }
       if (path === "/api/inbox/projects" && req.method === "GET") return json({ serverSession, cursor: store.cursor(), projects: projectFolders() });
       if (path === "/api/inbox/events" && req.method === "GET") {
       // Another site's page must not hold (or time) a stream of everything the Inbox holds:
@@ -2128,9 +2263,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           body.theme === undefined &&
           body.text_size === undefined &&
           body.diff_style === undefined &&
+          body.experimental === undefined &&
+          body.tour === undefined &&
           !updateSwitches
         ) {
-          throw new InboxError("validation_error", "body: inbox_tool, notifications, sound, tailscale, theme, text_size, diff_style, update_check or auto_update is required.");
+          throw new InboxError("validation_error", "body: inbox_tool, notifications, sound, tailscale, theme, text_size, diff_style, experimental, tour, update_check or auto_update is required.");
         }
         // Updating changes this computer: never from a page that came through the tailnet.
         if (updateSwitches && via === "tailnet") return localOnly();
@@ -2161,6 +2298,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (body.theme !== undefined) saveTheme(body.theme, true);
         if (body.text_size !== undefined) saveTextSize(body.text_size, true);
         if (body.diff_style !== undefined) saveDiffStyle(body.diff_style, true);
+        if (body.experimental !== undefined) saveExperimental(body.experimental, true);
+        if (body.tour !== undefined) saveTour(body.tour, true);
         const tailnet = tailscaleChange === undefined ? tailscale.state() : tailscale.set(tailscaleChange.on, { via, replaceExposed: tailscaleChange.replaceExposed });
         const notifications = body.notifications === undefined ? notificationsState() : saveNotifications(body.notifications);
         const sound = body.sound === undefined ? soundState() : saveSound(body.sound);
@@ -2170,7 +2309,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const theme = body.theme === undefined ? themeState() : saveTheme(body.theme);
         const textSize = body.text_size === undefined ? textSizeState() : saveTextSize(body.text_size);
         const diffStyle = body.diff_style === undefined ? diffStyleState() : saveDiffStyle(body.diff_style);
-        return json({ inbox_tool: inboxTool, notifications, sound, tailscale: tailnet, updates: updateState, theme, text_size: textSize, diff_style: diffStyle });
+        const experimental = body.experimental === undefined ? experimentalState() : saveExperimental(body.experimental);
+        const tour = body.tour === undefined ? tourState() : saveTour(body.tour);
+        return json({ inbox_tool: inboxTool, notifications, sound, tailscale: tailnet, updates: updateState, theme, text_size: textSize, diff_style: diffStyle, experimental, tour });
       }
       // The one-time sound dialog: the page asks to show it, and only the first ask ever gets `show: true`.
       if (path === "/api/inbox/sound/dialog") {
@@ -2194,6 +2335,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       // Reply drafts: the reply box's words per thread (approval "inbox-reply-drafts").
       const drafted = await replyDrafts.route(req, url);
       if (drafted) return drafted;
+      // Pins (approval "inbox-pinned-threads"): pin, unpin and the order of the sidebar's pinned threads.
+      const pinned = await pins.route(req, url);
+      if (pinned) return pinned;
 
       // The Board's cards (approval "inbox-board", step 1): the person's read and moves.
       if (path === "/api/inbox/cards") {
@@ -2367,7 +2511,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const messageId = messageMatch[1]!;
         switch (messageMatch[2]) {
           case "picks": {
-            const questions = store.savePicks(messageId, body.questions as never);
+            // `unsent_only` (decision mode): a pick that raced the Send of its reply never reopens what went.
+            if (body.unsent_only !== undefined && typeof body.unsent_only !== "boolean") {
+              throw new InboxError("validation_error", "unsent_only: a boolean.", { field: "unsent_only" });
+            }
+            const questions = store.savePicks(messageId, body.questions as never, { unsentOnly: body.unsent_only === true });
             return json({ message_id: messageId, questions, reply: null });
           }
           case "reply": {
@@ -2473,6 +2621,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const canonical = inboxCanonicalRedirect(req, url, port, via);
         if (canonical) return canonical;
         const page = options.htmlContent ?? NOT_BUILT_PAGE;
+        // A page load (or a refresh) asks for a new release when the answer is
+        // over a minute old: fire-and-forget, the button follows on the event stream.
+        if (req.method === "GET") updates.nudge();
         if (via === "tailnet") return tailnetWindowPage(req, page);
         return new Response(req.method === "HEAD" ? null : page, {
           headers: { ...WINDOW_PAGE_HEADERS, "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
@@ -2658,6 +2809,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // No capture writes after stop (a restart to update starts the next binary on this store).
     imageCapture.stop();
     clearInterval(uploadSweep);
+    stopPinEvents();
     clearInterval(restartWatch);
     clearInterval(deliveryWatch);
     clearInterval(autoSendWatch);

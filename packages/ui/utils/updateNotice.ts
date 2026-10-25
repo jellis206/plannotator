@@ -3,10 +3,10 @@
  * .product/approved/plannotator-updates/ §4.5, owner's answers 1 and 3).
  *
  * The server says whether a newer release exists (`updateAvailable` on
- * /api/plan and /api/diff, from the machine's once-a-day check): the browser
+ * /api/plan and /api/diff, from the machine's own check): the browser
  * never asks GitHub. This module parses that advert, decides whether the toast
- * may show now (once per version, and at most once every three days across
- * versions, remembered in a cookie that every localhost port shares), and
+ * may show now (once per version, and at most once a day across versions,
+ * remembered in a cookie that every localhost port shares), and
  * words the toast for the host that launched the session.
  */
 
@@ -25,8 +25,8 @@ export interface UpdateAdvert {
   publishedAt?: string;
 }
 
-/** The toast shows at most this often, across versions. */
-export const UPDATE_TOAST_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000;
+/** The toast shows at most this often, across versions (owner's choice: once a day). */
+export const UPDATE_TOAST_INTERVAL_MS = 24 * 60 * 60 * 1000;
 
 const TOAST_KEY = 'plannotator-update-toast';
 const VERSION = /^\d{1,9}\.\d{1,9}\.\d{1,9}$/;

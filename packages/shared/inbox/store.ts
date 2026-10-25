@@ -27,6 +27,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { join } from "node:path";
+import { inboxDecisionExcerpt, orderInboxDecisions, type InboxDecisionCandidate } from "./decisions";
 import {
   checkInboxAnswer,
   composeInboxReaskBody,
@@ -37,6 +38,7 @@ import {
   deriveInboxSubject,
   derivePersonThreadSubject,
   inboxQuestionState,
+  inboxQuestionWaitsOnPerson,
   isInboxQuestionSupersedable,
   parseInboxQuestionBlocks,
   parseInboxSupersedeRef,
@@ -58,6 +60,7 @@ import {
   type InboxAck,
   type InboxAddressee,
   type InboxAuthor,
+  type InboxDecision,
   type InboxGuideRef,
   type InboxLine,
   type InboxMessage,
@@ -67,6 +70,7 @@ import {
   type InboxQuestion,
   type InboxQuestionRecord,
   type InboxReplyDraft,
+  type InboxPin,
   type InboxSupersededBy,
   type InboxListRow,
   type InboxListSection,
@@ -119,6 +123,7 @@ import { inboxMarkupNamesOf, removeInboxMarkups } from "./markups";
 import { pendingInboxUploadBlobs, removeUnusedInboxUploadFiles } from "./uploads";
 import { inboxDraftsBytes } from "./drafts";
 import { checkInboxReplyDraftInput, readInboxReplyDrafts, removeInboxReplyDraft, writeInboxReplyDraft } from "./reply-drafts";
+import { checkInboxPinOrder, checkInboxPinRestore, readInboxPins, writeInboxPins } from "./pins";
 import { INBOX_CARD_PR_HINT, parseInboxCardPr } from "./cards";
 import {
   INBOX_CARD_COLUMN_LABELS,
@@ -535,6 +540,14 @@ export class InboxStore {
    * by thread id: files outside the event log, read at load and kept here.
    */
   private readonly replyDrafts = new Map<string, InboxReplyDraft>();
+  /**
+   * The threads pinned to the window's sidebar, in pin order (pins.ts,
+   * approval "inbox-pinned-threads"): a file outside the event log, read at
+   * load. Read by nothing that routes, lists or answers an agent.
+   */
+  private pinList: InboxPin[] = [];
+  /** Told when the pins change (no store line is written for them). */
+  private readonly pinListeners = new Set<() => void>();
   /** The Board's cards, by id (approval "inbox-board"). Read by nothing that routes or lists threads. */
   private readonly cards = new Map<string, InboxCard>();
   /** A guided review's files by its snapshot's sha256 (a blob never changes). */
@@ -572,7 +585,10 @@ export class InboxStore {
     this.replyDrafts.clear();
     for (const [threadId, draft] of readInboxReplyDrafts(this.dir)) this.replyDrafts.set(threadId, draft);
     const projectsDir = join(this.dir, INBOX_PROJECTS_DIR);
-    if (!existsSync(projectsDir)) return;
+    if (!existsSync(projectsDir)) {
+      this.loadPins();
+      return;
+    }
     const lines: InboxLine[] = [];
     for (const key of readdirSync(projectsDir)) {
       const folder = join(projectsDir, key);
@@ -598,6 +614,7 @@ export class InboxStore {
     lines.sort((a, b) => a.seq - b.seq);
     for (const line of lines) this.apply(line);
     this.repairUnsentAnswers();
+    this.loadPins();
   }
 
   /**
@@ -776,6 +793,111 @@ export class InboxStore {
   subscribe(listener: InboxListener): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);
+  }
+
+  /** The pins changed (pinned, unpinned, reordered, or a deleted thread left them): no store line is written. */
+  onPinsChange(listener: () => void): () => void {
+    this.pinListeners.add(listener);
+    return () => this.pinListeners.delete(listener);
+  }
+
+  private pinsChanged(): void {
+    for (const listener of this.pinListeners) {
+      try {
+        listener();
+      } catch {
+        // A listener's failure never fails the write.
+      }
+    }
+  }
+
+  /**
+   * Read pins.json and keep the pins of threads that exist. Pruning happens
+   * here, on load, rather than when a thread is deleted, because the delete
+   * paths (deleteThread, deleteProject) end in a full reload, and because an
+   * Inbox that predates pins may have deleted a pinned thread while this file
+   * sat on disk: every load is where a pin can outlive its thread, so every
+   * load drops it and writes the file back. Called at the end of every load.
+   */
+  private loadPins(): void {
+    const before = this.pinList;
+    const read = readInboxPins(this.dir);
+    const kept = read.filter((pin) => this.isThreadRoot(pin.thread_id));
+    this.pinList = kept;
+    if (kept.length !== read.length) {
+      try {
+        writeInboxPins(this.dir, kept);
+      } catch {
+        // Best effort: the next load prunes it again.
+      }
+    }
+    // A reload that dropped a pin the window still draws: tell it.
+    if (before.some((pin) => !kept.some((k) => k.thread_id === pin.thread_id))) this.pinsChanged();
+  }
+
+  private isThreadRoot(threadId: string): boolean {
+    return this.messages.get(threadId)?.thread_id === threadId;
+  }
+
+  /** The pinned threads, in pin order (the sidebar's order). */
+  pins(): readonly InboxPin[] {
+    return this.pinList;
+  }
+
+  private commitPins(next: InboxPin[]): readonly InboxPin[] {
+    const same = next.length === this.pinList.length && next.every((pin, i) => pin.thread_id === this.pinList[i]!.thread_id && pin.pinned_at === this.pinList[i]!.pinned_at);
+    if (same) return this.pinList;
+    writeInboxPins(this.dir, next);
+    this.pinList = next;
+    this.pinsChanged();
+    return next;
+  }
+
+  /**
+   * Pin a thread (at the bottom) or unpin it. Any thread may be pinned, an
+   * archived one too, with no limit. Pinning a pinned thread, or unpinning one
+   * that is not, changes nothing. Writes no store line.
+   */
+  setPinned(threadId: string, pinned: boolean): readonly InboxPin[] {
+    if (!this.isThreadRoot(threadId)) throw new InboxError("thread_not_found", `No thread ${threadId}.`);
+    const has = this.pinList.some((pin) => pin.thread_id === threadId);
+    if (has === pinned) return this.pinList;
+    return this.commitPins(pinned ? [...this.pinList, { thread_id: threadId, pinned_at: this.now().toISOString() }] : this.pinList.filter((pin) => pin.thread_id !== threadId));
+  }
+
+  /**
+   * Put the pins in an order (Move up, Move down): a permutation of the
+   * threads pinned NOW. The threads `order` names that are pinned come first,
+   * in that order, then every other pin in its place, so a window that has
+   * not seen another tab's pin never drops it. A named thread that is not
+   * pinned (another tab unpinned it, or it no longer exists) is skipped: an
+   * order never pins and never unpins.
+   */
+  orderPins(value: unknown): readonly InboxPin[] {
+    const order = checkInboxPinOrder(value);
+    const byId = new Map(this.pinList.map((pin) => [pin.thread_id, pin]));
+    const named: InboxPin[] = [];
+    for (const id of order) {
+      const pin = byId.get(id);
+      if (pin) named.push(pin);
+    }
+    const namedIds = new Set(named.map((pin) => pin.thread_id));
+    return this.commitPins([...named, ...this.pinList.filter((pin) => !namedIds.has(pin.thread_id))]);
+  }
+
+  /**
+   * Unpin's Undo: pin exactly one thread again at `index` (clamped to the
+   * pins as they are now) with the `pinned_at` it had. A thread that is
+   * pinned again already (another tab) keeps its place; one that no longer
+   * exists is refused (`thread_not_found`).
+   */
+  restorePin(value: unknown): readonly InboxPin[] {
+    const restore = checkInboxPinRestore(value);
+    if (!this.isThreadRoot(restore.thread_id)) throw new InboxError("thread_not_found", `No thread ${restore.thread_id}.`);
+    if (this.pinList.some((pin) => pin.thread_id === restore.thread_id)) return this.pinList;
+    const next = [...this.pinList];
+    next.splice(Math.min(restore.index, next.length), 0, { thread_id: restore.thread_id, pinned_at: restore.pinned_at });
+    return this.commitPins(next);
   }
 
   /** A thread's reply draft was saved or deleted: its row's `unsent` (and section) changed with no store line. */
@@ -1406,6 +1528,80 @@ export class InboxStore {
       if (row) out.push(row);
     }
     return out.sort((a, b) => b.last_at.localeCompare(a.last_at) || b.thread_id.localeCompare(a.thread_id));
+  }
+
+  /**
+   * Decision mode's projection (approval "inbox-decision-mode", brief §10):
+   * every question and action item that waits on the person (core's
+   * `inboxQuestionWaitsOnPerson`) in a live agent message, across threads, in
+   * queue order. What a waiting Re-ask note lists is left out, since the
+   * agent is about to ask it again (per note, so a thread where one session
+   * was asked to re-ask still shows another session's questions); a thread
+   * whose every open question is listed (the list puts it in Sent) shows
+   * nothing. Read only; no record.
+   */
+  openDecisions(filter: { projectId?: string | null } = {}): InboxDecision[] {
+    const candidates: InboxDecisionCandidate[] = [];
+    for (const [threadId] of this.threadMembers) {
+      const root = this.messages.get(threadId);
+      if (!root || root.thread_id !== threadId) continue;
+      if (filter.projectId && root.project_id !== filter.projectId) continue;
+      const waiting: { message: InboxMessage; question: InboxQuestion }[] = [];
+      // What a waiting Re-ask note lists is about to be asked again: left out, per note (so per session).
+      const reasked = this.reaskListedIds(threadId);
+      for (const message of this.threadMessages(threadId)) {
+        if (message.author.kind !== "agent" || this.closedByArchive(message)) continue;
+        for (const question of this.questionsOf(message.id)) {
+          // A listed question the person picked since still waits for their Send (as the list's rule 2a reads it).
+          const reask = question.state === "open" && reasked.has(`${message.id}/${question.key}`);
+          if (inboxQuestionWaitsOnPerson(question) && !reask) waiting.push({ message, question });
+        }
+      }
+      if (waiting.length === 0) continue;
+      const row = this.listRow(threadId);
+      if (!row) continue;
+      for (const { message, question } of waiting) {
+        const author = message.author as Extract<InboxAuthor, { kind: "agent" }>;
+        const inBlock = (ref: string) =>
+          [question.context ?? "", ...question.choices.flatMap((c) => [c.label, c.description ?? ""])].some((text) => text.includes(ref));
+        const images = [...(message.inline_images ?? [])].sort((a, b) => Number(inBlock(b.ref)) - Number(inBlock(a.ref)));
+        candidates.push({
+          seq: this.messageSeq.get(message.id) ?? 0,
+          decision: {
+            id: `${message.id}/${question.key}`,
+            question,
+            message: { id: message.id, created_at: message.created_at, author: message.author, excerpt: inboxDecisionExcerpt(message.body) },
+            pictures: {
+              inline: images.map((image) => ({
+                attachment_id: image.id,
+                ref: image.ref,
+                name: image.name,
+                media_type: image.media_type ?? null,
+                width: image.width ?? null,
+                height: image.height ?? null,
+              })),
+              attachments: (message.attachments ?? []).map((file) => ({
+                attachment_id: file.id,
+                name: file.name,
+                kind: file.kind,
+                size: file.size,
+                media_type: file.media_type ?? null,
+                paths: [file.path, ...(file.named_path ? [file.named_path] : [])],
+              })),
+            },
+            thread: { id: threadId, subject: row.subject, thread_name: row.thread_name, project: row.project, section: row.section },
+            session: {
+              key: author.session ? `s:${author.host ?? ""}\u0000${author.session}` : `m:${message.id}`,
+              host: author.host,
+              session: author.session,
+              name: author.name,
+              wakes: message.wakes === true,
+            },
+          },
+        });
+      }
+    }
+    return orderInboxDecisions(candidates);
   }
 
   /** The list, placed in its sections; a project filter keeps the sections and drops other rows. */
@@ -2826,6 +3022,7 @@ export class InboxStore {
     mode: "pick" | "send",
     /** Each entry's index in the request's `questions` (a Send's entries are planned per message). */
     indices?: readonly number[],
+    options: { unsentOnly?: boolean } = {},
   ): { record: InboxQuestionRecord; answer: QuestionAnswer | null | undefined }[] {
     const records = new Map(this.questionRecords(message.id).map((r) => [r.key, r]));
     const seen = new Set<string>();
@@ -2856,6 +3053,13 @@ export class InboxStore {
       if (record.revision !== entry.revision) {
         throw refusalError({ code: "question_revision_conflict", key: entry.key, current_revision: record.revision });
       }
+      // `unsentOnly` (decision mode): a question a reply already sent takes no new pick (nor a cleared one). Its
+      // revision matches when the pick raced the Send (read before it, saved after), and saving it would reopen an
+      // answer the agent already has. Without it a sent question takes a pick again, as the thread-state model has
+      // it (the window never offers one; adr/implementation/inbox-thread-state.md).
+      if (mode === "pick" && options.unsentOnly === true && record.answer !== null && record.revision > 0 && record.sent_revision === record.revision) {
+        throw refusalError({ code: "question_already_sent", key: entry.key });
+      }
       let answer: QuestionAnswer | null | undefined;
       if (entry.answer === null) {
         if (mode === "send") throw new InboxError("validation_error", `${field}.answer: a Send cannot clear a pick.`, { field: `${field}.answer` });
@@ -2876,12 +3080,13 @@ export class InboxStore {
   }
 
   /** Save picks at once (no reply is written): each revision goes up by one. */
-  savePicks(messageId: string, entries: readonly InboxAnswerEntry[]): InboxQuestion[] {
+  /** `unsentOnly`: refuse a pick on a question a reply already sent (`question_already_sent`), as decision mode asks. */
+  savePicks(messageId: string, entries: readonly InboxAnswerEntry[], options: { unsentOnly?: boolean } = {}): InboxQuestion[] {
     const message = this.targetMessage(messageId);
     if (!Array.isArray(entries) || entries.length === 0) {
       throw new InboxError("validation_error", "questions: at least one question is required.", { field: "questions" });
     }
-    const plan = this.planAnswers(message, entries, "pick");
+    const plan = this.planAnswers(message, entries, "pick", undefined, options);
     const at = this.stamp();
     for (const { record, answer } of plan) {
       this.appendQuestion(
@@ -3185,7 +3390,20 @@ export class InboxStore {
     if (!messages.some((m) => m.author.kind === "person" && (m.reask?.length ?? 0) > 0)) return false;
     const states = new Map<string, string>();
     for (const m of messages) if (m.author.kind === "agent") for (const q of this.questionsOf(m.id)) states.set(`${m.id}/${q.key}`, q.state);
-    const covered = new Set<string>();
+    const listed = this.reaskListedIn(messages);
+    const open = [...states].filter(([, state]) => state === "open").map(([id]) => id);
+    return open.length > 0 && open.every((id) => listed.has(id));
+  }
+
+  /**
+   * The questions (`<message id>/<key>`) a Re-ask note in these messages lists
+   * while the note still waits: the session it went to (its `to`, else the
+   * session of the message it answers) has not written since. Per note, so
+   * per session: another session's questions in the same thread are not in it.
+   */
+  private reaskListedIn(messages: readonly InboxMessage[], options: { live?: boolean } = {}): Set<string> {
+    const listed = new Set<string>();
+    const presence = this.deliveryPresence;
     messages.forEach((note, index) => {
       if (note.author.kind !== "person" || (note.reask?.length ?? 0) === 0) return;
       const asked = note.reply_to ? this.messages.get(note.reply_to) : undefined;
@@ -3195,10 +3413,38 @@ export class InboxStore {
         .slice(index + 1)
         .some((m) => m.author.kind === "agent" && m.author.session === by.session && (m.author.host ?? "") === (by.host ?? ""));
       if (wrote) return;
-      for (const id of note.reask!) if (states.get(id) === "open") covered.add(id);
+      // `live`: only while that session is still there (the sessions route's grace). A note to a session that ended
+      // waits on nobody who will ask again. Only a session that wakes can be told ended (the thread's rule): the note
+      // went `to` a live session, or the asking message came through a connection that wakes its session. An agent
+      // that reads the Inbox through MCP may be blocked in wait_for_reply right now, so its note always waits.
+      const wakes = note.to ? true : asked?.wakes === true;
+      if (options.live && presence && by.session && wakes && !presence.askerLive(by.session)) return;
+      for (const id of note.reask!) listed.add(id);
     });
-    const open = [...states].filter(([, state]) => state === "open").map(([id]) => id);
-    return open.length > 0 && open.every((id) => covered.has(id));
+    return listed;
+  }
+
+  /**
+   * The questions of a thread a still-waiting Re-ask note lists: the agent is
+   * about to ask them again, so decision mode leaves those still open out (the
+   * rest of the thread, another session's questions included, stays).
+   *
+   * A note waits exactly as the list's rule 2a reads it: until the session it
+   * went to writes in the thread again, and only for what it lists that is
+   * still open (answered, superseded, set aside or archived, a question is no
+   * longer hidden; one the person picks since shows, waiting for its Send).
+   * One bound more than the list: only while that session is still there
+   * (presence's `askerLive`, with its grace), so a note to a session that ended
+   * never hides its questions for good; the list's row may still read Sent then.
+   * That bound holds only for a session that wakes (the note went `to` a live
+   * session, or the asked message has `wakes`), the one kind that can be told
+   * ended: an MCP-only agent's note waits until it writes again. With no
+   * presence (tests, tools) every session counts as there.
+   */
+  reaskListedIds(threadId: string): Set<string> {
+    const messages = this.threadMessages(threadId);
+    if (!messages.some((m) => m.author.kind === "person" && (m.reask?.length ?? 0) > 0)) return new Set();
+    return this.reaskListedIn(messages, { live: true });
   }
 
   /**

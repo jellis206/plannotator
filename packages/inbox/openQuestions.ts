@@ -13,6 +13,8 @@
 
 import type { InboxMessageWire, InboxQuestion } from '@plannotator/core/inbox-types';
 import { readInboxQuestionKind } from '@plannotator/core/inbox-types';
+import { inboxQuestionWaitsOnPerson } from '@plannotator/core/inbox-questions';
+import { isQuestionAnswerEmpty, type QuestionAnswer } from '@plannotator/core/question-block';
 import { formatCount } from './format';
 
 /** One row of the list. */
@@ -35,8 +37,8 @@ const isQuestion = (q: InboxQuestion) => {
   return kind !== 'unknown' && kind !== 'action';
 };
 
-/** Open, or picked and not sent. */
-const waits = (q: InboxQuestion) => q.state === 'open' || q.state === 'picked';
+/** Open, or picked and not sent: core's one "waits on the person" rule (decision mode and the list read it too). */
+const waits = (q: InboxQuestion) => inboxQuestionWaitsOnPerson(q);
 
 /**
  * The thread's open questions, in thread order, and how many replaced ones
@@ -118,4 +120,62 @@ export function openQuestionState(q: OpenQuestion): OpenQuestionState {
   if (q.question.stopped) return { kind: 'stopped' };
   if (q.question.holds_up.length > 0) return { kind: 'holds', count: q.question.holds_up.length };
   return null;
+}
+
+/** The row's question is skipped in the person's draft: the row goes quiet, and the card's Skip reads "Unskip". */
+export function openQuestionSkipped(q: OpenQuestion): boolean {
+  return q.question.answer?.skipped === true;
+}
+
+/**
+ * What the select mode's button does with the ticked rows (approval
+ * "oq-skip-select", variant A): a ticked question not skipped yet is skipped,
+ * a ticked skipped one is unskipped. Only questions that take a Skip count.
+ */
+export function skipSelection(questions: readonly OpenQuestion[], ticked: ReadonlySet<string>): { skip: OpenQuestion[]; unskip: OpenQuestion[] } {
+  const skip: OpenQuestion[] = [];
+  const unskip: OpenQuestion[] = [];
+  for (const q of questions) {
+    if (!ticked.has(q.id) || !openQuestionSkippable(q)) continue;
+    (openQuestionSkipped(q) ? unskip : skip).push(q);
+  }
+  return { skip, unskip };
+}
+
+/**
+ * What "Skip all N" covers: the open questions with nothing picked. A draft
+ * pick, and a question already skipped, stay as they are.
+ */
+export function skipAllCandidates(questions: readonly OpenQuestion[]): OpenQuestion[] {
+  return questions.filter((q) => !q.picked && !openQuestionSkipped(q) && openQuestionSkippable(q));
+}
+
+/**
+ * Whether a row can be skipped: exactly when its card offers Skip (an open or picked
+ * question; a sent, closed or replaced one, and an action item, take none).
+ * The list holds only such questions, so this is a guard, not a filter.
+ */
+export function openQuestionSkippable(q: OpenQuestion): boolean {
+  return isQuestion(q.question) && waits(q.question);
+}
+
+/**
+ * What a Skip from the list saves: the answer the card's own Skip makes from
+ * the same starting answer (ui's QuestionBlock `toggleSkip`, then its
+ * `commit`). Skipped already: the skip comes off (Unskip), the note stays.
+ * Otherwise the choices, Other and the text go and `skipped` is set, the note
+ * staying. An answer left with nothing in it is null (the pick is cleared).
+ * `base` is the card's: its saved or pending answer, else the question's
+ * empty answer.
+ */
+export function skipToggledAnswer(base: QuestionAnswer): QuestionAnswer | null {
+  let next: QuestionAnswer;
+  if (base.skipped) {
+    const { skipped: _skipped, ...rest } = base;
+    next = rest;
+  } else {
+    const { other: _other, text: _text, ...rest } = base;
+    next = { ...rest, selected: [], skipped: true };
+  }
+  return isQuestionAnswerEmpty(next) ? null : next;
 }

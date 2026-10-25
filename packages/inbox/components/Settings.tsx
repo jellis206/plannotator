@@ -12,7 +12,9 @@ import type { TestResult } from '../notify';
 import { blockedSteps, browserName, isMac, notifyStatusKind, notifyStatusText, reachText, testMissHint } from '../notifyStatus';
 import { DevicesSection, devicesNeedAttention, usePhones } from './Devices';
 import { SidebarTrigger } from '../shell/sidebar';
-import { useInboxTheme } from '../theme';
+import { useInboxPalettes, useInboxTheme } from '../theme';
+import { PaletteRow } from './Palettes';
+import { DEFAULT_COLOR_THEME } from '@plannotator/ui/utils/themeRegistry';
 import { chooseTextSize, useInboxTextSize } from '../textSize';
 import { SETTINGS_SECTION_LABEL, SETTINGS_SECTIONS, settingsHash, type SettingsSection } from '../settingsRoute';
 
@@ -36,9 +38,16 @@ const SHOWN_PROJECTS = 2;
 
 export interface SettingsPageProps {
   settings: SettingsModel | null;
+  /**
+   * Settings → General's first group, "Getting started" (approval
+   * "inbox-onboarding-tour", returning users): Take the tour. Absent: none.
+   */
+  onTakeTour?: () => void;
   context: ConnectContext | null;
   error: string | null;
   onToggleTool: (host: AgentToolHost, next: boolean) => void;
+  /** Settings → General → Experimental: decision mode's switch. Absent: no Experimental group. */
+  onToggleExperimental?: (next: boolean) => void;
   /** Over your tailnet: the switch, and whether a change is in flight. */
   onToggleTailscale: (next: boolean, replaceExposed?: boolean) => void;
   tailscaleBusy: boolean;
@@ -163,8 +172,9 @@ const THEME_CHOICES = [
 
 /**
  * General (design of record `.product/approved/inbox-settings-tabs/`):
- * Appearance (light, dark, or match this computer; Plannotator's one theme
- * preference, so plan review follows it too), and how the Inbox gets your
+ * Appearance (light, dark, or match this computer; the text size; and the
+ * palette for each half, Plannotator's one theme preference, so plan review
+ * follows it too), and how the Inbox gets your
  * attention when an agent asks: desktop notifications and the sound.
  */
 function GeneralSection({
@@ -174,7 +184,11 @@ function GeneralSection({
   notifyReach,
   onTestNotification,
   sound,
+  onToggleExperimental,
+  onTakeTour,
 }: {
+  onToggleExperimental?: (next: boolean) => void;
+  onTakeTour?: () => void;
   settings: SettingsModel;
   permission: NotificationPermission | 'unsupported';
   onToggleNotifications: (next: boolean) => void;
@@ -196,6 +210,25 @@ function GeneralSection({
       : reachText({ here: notificationsOn, enabled: settings.notifications.enabled, reach, origin: typeof window !== 'undefined' ? window.location.origin : '' });
   return (
     <>
+      {onTakeTour && (
+        <section className="ib-sgroup" data-settings-tour="" aria-labelledby="ib-g-start">
+          <h2 id="ib-g-start">Getting started</h2>
+          <div className="ib-card">
+            <div className="ib-prow">
+              <span className="ib-txt">
+                <span className="ib-l">Tour</span>
+                <span className="ib-desc">See how the Inbox works through real threads from building Plannotator · 2 min</span>
+              </span>
+              <span className="ib-ctl">
+                <button type="button" className="ib-btn" onClick={onTakeTour} data-settings-take-tour="">
+                  <Icon name="play" size={14} />
+                  Take the tour
+                </button>
+              </span>
+            </div>
+          </div>
+        </section>
+      )}
       <section className="ib-sgroup" data-settings-theme={mode} aria-labelledby="ib-g-appearance">
         <h2 id="ib-g-appearance">Appearance</h2>
         <div className="ib-card">
@@ -245,6 +278,7 @@ function GeneralSection({
               </span>
             </span>
           </div>
+          <PaletteRow />
         </div>
       </section>
       <section className="ib-sgroup" data-settings-notifications="" aria-labelledby="ib-g-attention">
@@ -323,6 +357,33 @@ function GeneralSection({
           Notifications are allowed per address, so a browser on another device asks once there.
         </div>
       </section>
+      {settings.experimental && onToggleExperimental && (
+        <section className="ib-sgroup" data-settings-experimental="" aria-labelledby="ib-g-experimental">
+          <h2 id="ib-g-experimental">Experimental</h2>
+          <div className="ib-card">
+            <div className="ib-prow">
+              <span className="ib-txt">
+                <span className="ib-l" id="ib-decision-mode-label">
+                  Decision mode
+                </span>
+                <span className="ib-desc">
+                  {settings.experimental.decision_mode.env !== null
+                    ? `PLANNOTATOR_EXPERIMENTAL turns it ${settings.experimental.decision_mode.env ? 'on' : 'off'}.`
+                    : 'Answer what agents ask across threads, one decision at a time; each agent gets one reply per thread.'}
+                </span>
+              </span>
+              <span className="ib-ctl">
+                <Switch
+                  on={settings.experimental.decision_mode.on}
+                  labelledBy="ib-decision-mode-label"
+                  disabled={settings.experimental.decision_mode.env !== null}
+                  onClick={() => onToggleExperimental(!settings.experimental!.decision_mode.on)}
+                />
+              </span>
+            </div>
+          </div>
+        </section>
+      )}
     </>
   );
 }
@@ -539,6 +600,7 @@ export function SettingsPage(props: SettingsPageProps) {
   const phones = usePhones(phonesOn);
   const via = settings?.via ?? 'local';
   const { mode } = useInboxTheme();
+  const palettes = useInboxPalettes();
   const heading = useRef<HTMLHeadingElement>(null);
   const firstSection = useRef(true);
 
@@ -581,8 +643,13 @@ export function SettingsPage(props: SettingsPageProps) {
   const value = (id: SettingsSection): string => {
     if (!settings) return '';
     switch (id) {
-      case 'general':
-        return mode === 'system' ? 'Match system' : mode === 'light' ? 'Light' : 'Dark';
+      case 'general': {
+        const modeLabel = mode === 'system' ? 'Match system' : mode === 'light' ? 'Light' : 'Dark';
+        // The palette on screen, unless both halves are still the default one.
+        const shownPalette = palettes.pair[palettes.shown];
+        const defaults = palettes.pair.light === DEFAULT_COLOR_THEME && palettes.pair.dark === DEFAULT_COLOR_THEME;
+        return defaults ? modeLabel : `${modeLabel} · ${palettes.nameOf(shownPalette)}`;
+      }
       case 'agents': {
         if (props.agents) {
           const connected = props.agents.agents.filter((row) => row.detected && row.reach.on).map((row) => row.label);
@@ -615,6 +682,8 @@ export function SettingsPage(props: SettingsPageProps) {
             notifyReach={notifyReach}
             onTestNotification={onTestNotification}
             sound={sound}
+            onToggleExperimental={props.onToggleExperimental}
+            onTakeTour={props.onTakeTour}
           />
         );
         break;

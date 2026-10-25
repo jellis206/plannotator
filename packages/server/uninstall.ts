@@ -132,6 +132,7 @@ const PURGE_OWNED_TOP_LEVEL = [
   "update-result.json",
   "update.lock",
   "update.log",
+  "update.log.1",
   "update-notes",
   "install-flags.json",
 ] as const;
@@ -1027,6 +1028,11 @@ function removeInstallerData(
       state,
     );
   }
+  // Usage counts (packages/shared/usage-counts.ts) are worth nothing to keep
+  // and a reinstall should start clean: every uninstall removes them, purge or
+  // not. An opt-out (`usageCounts: false` in config.json) stays with the config,
+  // which a plain uninstall keeps.
+  removePath(join(state.dataDir, "usage-counts"), request, state);
 }
 
 function purgeLocalData(
