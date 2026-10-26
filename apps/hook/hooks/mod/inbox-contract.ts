@@ -188,7 +188,7 @@ export const INBOX_AGENT_FIELD_DESCRIPTIONS: Readonly<Record<string, Readonly<Re
     thread: "A short thread name, one line, to keep separate work apart: the same name in this project is the same open thread, across sessions. Without it, your messages join your session's open thread. Ignored with reply_to, except when you are asked to name a thread the person started: then it names that thread, once.",
     supersedes: 'Your own questions in this thread that are still open (read_thread state open or picked) and no longer apply: a newer message replaces them, or the reply settled them in words. "<message id>/<key>" for one, "<message id>" for all of that message\'s; send with reply_to into their thread. With one question in this message it replaces them, otherwise they read "No longer applies".',
     done: 'Your own open action items (`:::action`) in this thread that you saw done yourself, e.g. the deploy you watch is Ready: "<message id>/<key>" (key a-…); send with reply_to into their thread. The card says you saw it done; nothing is sent to the person.',
-    attachments: 'Files to show the person beside the message, absolute or relative to project_path: a plan, a screenshot, an HTML mock, code, a video, any file. Link one from the body (`[the mock](mock.html)`) to open it beside the thread. Their comments on the files come back in the reply. Folders and .env files are refused.',
+    attachments: 'Files to show the person beside the message, absolute or relative to project_path: a plan, a screenshot, an HTML mock, code, a video, any file. For something visual, a screenshot or image usually reads fastest; attach the HTML or source too when they should open or click through it. Link one from the body (`[the mock](mock.html)`) to open it beside the thread. Their comments on the files come back in the reply. Folders and .env files are refused.',
   },
   submit_guide: {
     guide: "The guide in get_guide_brief's output_schema, as an object or its JSON.",
@@ -223,6 +223,42 @@ export const INBOX_REMINDER_TEXT_NO_WAKE =
 export function inboxReminderText(toolName: string = INBOX_TOOL_NAME, options: { wakes?: boolean } = {}): string {
   const text = options.wakes === false ? INBOX_REMINDER_TEXT_NO_WAKE : INBOX_REMINDER_TEXT
   return text.replace(INBOX_TOOL_NAME, toolName)
+}
+
+/**
+ * The most characters (UTF-16 code units, a string's `length`) a custom Inbox
+ * reminder may hold. Longer text is refused when saved and ignored when read,
+ * so the host falls back to the next text in line (the shared one, then the
+ * default).
+ */
+export const INBOX_REMINDER_MAX_CHARS = 4128
+
+/**
+ * The person's own reminder for a host, from config.json
+ * (`prompts.inbox.runtimes.<host>.reminder`, which wins, then the shared
+ * `prompts.inbox.reminder`), or null when neither holds usable text: a
+ * string with something besides whitespace, at most INBOX_REMINDER_MAX_CHARS
+ * long. Takes the parsed config.json object (anything else reads as unset).
+ */
+export function inboxReminderCustomText(config: unknown, host: string): string | null {
+  const record = (value: unknown): Record<string, unknown> | null =>
+    value && typeof value === 'object' && !Array.isArray(value) ? (value as Record<string, unknown>) : null
+  const usable = (value: unknown): string | null =>
+    typeof value === 'string' && value.trim() !== '' && value.length <= INBOX_REMINDER_MAX_CHARS ? value : null
+  const inbox = record(record(record(config)?.prompts)?.inbox)
+  if (!inbox) return null
+  return usable(record(record(inbox.runtimes)?.[host])?.reminder) ?? usable(inbox.reminder)
+}
+
+/**
+ * The reminder a host sends: the person's own text when there is one (it
+ * REPLACES the line, for hosts with the wake and without it alike, every
+ * whole word `plannotator_inbox` in it renamed to the tool as the host
+ * registered it), else exactly `inboxReminderText(toolName, options)`.
+ */
+export function inboxReminderFor(custom: string | null | undefined, toolName: string = INBOX_TOOL_NAME, options: { wakes?: boolean } = {}): string {
+  if (typeof custom !== 'string' || custom.trim() === '') return inboxReminderText(toolName, options)
+  return custom.replace(/(^|[^A-Za-z0-9_])plannotator_inbox(?![A-Za-z0-9_])/g, (_match: string, before: string) => before + toolName)
 }
 
 /**

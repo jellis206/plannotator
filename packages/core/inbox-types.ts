@@ -24,6 +24,7 @@ import { INBOX_CARD_ACTION_ON, type InboxCard } from "./inbox-cards";
 export * from "./inbox-attachments";
 export * from "./inbox-open-in";
 export * from "./inbox-delivery";
+export * from "./inbox-codex";
 // The Board's cards (approval "inbox-board"), the same way.
 export * from "./inbox-cards";
 // The surface bridge's messages (the phone, PLAN step S1), the same way.
@@ -260,6 +261,19 @@ export const INBOX_HOST_NAMES: Readonly<Record<string, string>> = {
   codex: "Codex",
   cursor: "Cursor",
 };
+
+/**
+ * The agent hosts a person's reply wakes as a new turn by itself: Claude Code,
+ * Pi and OpenCode 2 through Plannotator's own connection (OpenCode 1 has the
+ * tool but no wake), and Codex through MCP alone, where the Inbox puts the
+ * reply into the Codex thread with `codex queue` (Codex CLI
+ * INBOX_CODEX_QUEUE_MIN_VERSION or later; packages/server/inbox-codex-wake.ts).
+ * The one list: wording that names which agents a reply wakes reads it.
+ */
+export const INBOX_WAKING_HOSTS = ["claude-code", "pi", "opencode", "codex"] as const;
+
+/** Of INBOX_WAKING_HOSTS, the ones an MCP connection alone wakes (no Plannotator plugin): Codex. */
+export const INBOX_MCP_WAKING_HOSTS: readonly string[] = ["codex"];
 
 /** How the person sees an agent: the name it gave, else its host's name, else "An agent". */
 export function inboxAgentName(author: { kind: string; host?: string | null; name?: string | null } | null | undefined): string {
@@ -1396,7 +1410,7 @@ export interface InboxTourChange {
 }
 
 /** The tour's content version: the fixture's `v`, recorded with each stamp. */
-export const INBOX_TOUR_VERSION = 1;
+export const INBOX_TOUR_VERSION = 2;
 
 /**
  * The Inbox window's text size (config.json `inboxTextSize`, through GET and
@@ -1557,6 +1571,13 @@ export interface InboxAgentRow {
    * alone: 1), for the plugin line that version reads.
    */
   plugin?: { installed: boolean; disabled?: boolean; managed?: boolean; generation?: "1" | "2" } | null;
+  /**
+   * An agent its MCP connection alone wakes (INBOX_MCP_WAKING_HOSTS: Codex),
+   * connected through MCP: whether this Inbox can wake it now (Codex: a Codex
+   * CLI INBOX_CODEX_QUEUE_MIN_VERSION or later it can run). Absent for every
+   * other row and from an older Inbox.
+   */
+  wakes?: boolean;
 }
 
 export interface InboxAgentsModel {
@@ -1669,8 +1690,13 @@ export type InboxToolCostHost = "pi" | "opencode";
  * Pi with the cost test (INBOX_TOOL_COST_DUMP): 8,248 → 8,701 bytes, 1,964 →
  * 2,086 tokens with o200k_base (+453 bytes, +122 tokens). So 8,701 bytes
  * without the card action and 9,817 with it (9,364 + 453, estimated).
+ * The screenshot nudge in `attachments` ("For something visual, a screenshot
+ * or image usually reads fastest…") added one sentence, measured on Pi with
+ * the cost test: 8,701 → 8,841 bytes (+140; about +30 tokens, so the rounded
+ * token figure stands). So 8,841 without the card action and 9,957 with it
+ * (9,817 + 140, estimated).
  */
-const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 9817, tokens: 2800 } : { bytes: 8701, tokens: 2500 };
+const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 9957, tokens: 2800 } : { bytes: 8841, tokens: 2500 };
 export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
   pi: INBOX_TOOL_COST_NOW,
   opencode: INBOX_TOOL_COST_NOW,
@@ -1869,4 +1895,69 @@ export function inboxEngineTooOldForSendNow(version: string | null | undefined):
     if (have[i]! !== min[i]!) return have[i]! < min[i]!;
   }
   return false;
+}
+
+/**
+ * Settings → Prompts (approval "inbox-prompts-page", #2194): what Plannotator
+ * tells agents, as `GET /api/inbox/settings` carries it in `prompts`.
+ */
+export const INBOX_PROMPT_HOSTS = ["claude-code", "pi", "opencode"] as const;
+export type InboxPromptHost = (typeof INBOX_PROMPT_HOSTS)[number];
+
+/** One of the plan, review and annotate prompts (config.json `prompts.<group>.<name>`), read-only in the window. */
+export interface InboxPromptItem {
+  /** `prompts.<group>.<name>`, the config.json key. */
+  key: string;
+  group: "plan" | "review" | "annotate";
+  /** The group's heading: Plan, Code review, Annotate. */
+  group_label: string;
+  label: string;
+  /** Plannotator's own text. */
+  default: string;
+  /** The text in effect for an agent without its own: config.json's, else the default. */
+  text: string;
+  /** config.json sets this prompt (the shared text, or one agent's own). */
+  custom: boolean;
+  /** The agents config.json gives their own text for this prompt (`prompts.<group>.runtimes.<agent>.<name>`). */
+  runtimes: string[];
+  /** A fact about the default, shown while it is in effect ("OpenCode has a shorter default."). */
+  note: string | null;
+}
+
+export interface InboxPromptsSettings {
+  /** The Inbox reminder at session start (config.json `prompts.inbox`). */
+  reminder: {
+    /** `prompts.inbox.reminder`: the person's shared text, or null (the default). */
+    shared: string | null;
+    /** `prompts.inbox.runtimes.<agent>.reminder`: an agent's own text (it wins), or null. */
+    runtimes: Record<InboxPromptHost, string | null>;
+    /** The built-in lines: for hosts whose reply comes back by itself, and for those without it (OpenCode 1). */
+    defaults: { wake: string; no_wake: string };
+    /** The most characters a custom reminder may hold; a longer one is refused. */
+    max: number;
+    /** Whether each agent gets a reminder at all (`inboxReminder`, with the Inbox tool). */
+    on: Record<InboxPromptHost, boolean>;
+    /**
+     * Whether each agent's reply comes back by itself, so its default is `defaults.wake`;
+     * false: the no-wake default (OpenCode 1). Absent from an older Inbox: all true.
+     */
+    wakes?: Record<InboxPromptHost, boolean>;
+    /**
+     * Text config.json holds that is over `max` and so is ignored (the agent gets the
+     * next text in line): its length, else null. Absent from an older Inbox.
+     */
+    over?: { shared: number | null; runtimes: Record<InboxPromptHost, number | null> };
+    /** Whether this page may change it: false through the tailnet (it reaches every agent on this computer). */
+    editable: boolean;
+  };
+  /** The plan, review and annotate prompts, in the order the page lists them. */
+  others: InboxPromptItem[];
+}
+
+/** `POST /api/inbox/settings` `{ prompts: { inbox: … } }`: a string sets the text, null (or blank) deletes the key. */
+export interface InboxPromptsChange {
+  inbox: {
+    reminder?: string | null;
+    runtimes?: Partial<Record<InboxPromptHost, { reminder?: string | null }>>;
+  };
 }

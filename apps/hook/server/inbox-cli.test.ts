@@ -320,6 +320,7 @@ describe("plannotator inbox mcp (the stdio shim)", () => {
 
 describe("plannotator inbox mcp inside an agent session", () => {
   const CLAUDE_SESSION = "0f3c2a51-7d4e-4b8a-9e21-5c6d7e8f9a0b";
+  const CODEX_THREAD = "019a2b3c-4d5e-7f00-8a9b-0c1d2e3f4a5c";
 
   async function shim(box: Sandbox, cwd: string, extraEnv: Record<string, string>): Promise<Client> {
     const client = new Client({ name: "shim-session", version: "1.0.0" });
@@ -345,7 +346,9 @@ describe("plannotator inbox mcp inside an agent session", () => {
     expect(piHost).toBe("pi");
     expect(piName).toBeDefined();
     expect(INBOX_SESSION_HOST_NAMES[piHost!]).toBe(piName!);
-    expect(Object.keys(INBOX_SESSION_HOST_NAMES).sort()).toEqual(["claude-code", "opencode", "pi"]);
+    // Codex has no plannotator_inbox tool: the Inbox wakes it itself (`codex queue`), and the shim sends as its thread.
+    expect(Object.keys(INBOX_SESSION_HOST_NAMES).sort()).toEqual(["claude-code", "codex", "opencode", "pi"]);
+    expect(INBOX_SESSION_HOST_NAMES.codex).toBe("Codex");
   });
 
   test("the session tag is read strictly; anything malformed is ignored", () => {
@@ -378,9 +381,37 @@ describe("plannotator inbox mcp inside an agent session", () => {
     ]) {
       expect(inboxHostSessionFromEnv({ PLANNOTATOR_SESSION_TAG: tag })).toBeNull();
     }
+    // Codex sets CODEX_THREAD_ID in the commands its shell runs: a thread id (a UUID), nothing else.
+    expect(inboxHostSessionFromEnv({ CODEX_THREAD_ID: CODEX_THREAD })).toEqual({ host: "codex", session: CODEX_THREAD, name: "Codex" });
+    expect(inboxHostSessionFromEnv({ PLANNOTATOR_SESSION_TAG: `codex:${CODEX_THREAD}` })).toEqual({ host: "codex", session: CODEX_THREAD, name: "Codex" });
+    for (const bad of ["", "abc", `${CODEX_THREAD} `, "--yolo", "ses_01ABC"]) expect(inboxHostSessionFromEnv({ CODEX_THREAD_ID: bad })).toBeNull();
+    expect(inboxHostSessionFromEnv({ PI_SESSION_ID: "pi-1", CODEX_THREAD_ID: CODEX_THREAD })?.host).toBe("pi");
     expect(inboxHostSessionFromEnv({ PI_SESSION_ID: "" })).toBeNull();
     expect(inboxHostSessionFromEnv({ PI_SESSION_ID: "a;b" })).toBeNull();
     expect(inboxHostSessionFromEnv({})).toBeNull();
+  });
+
+  test("a call from Codex is its thread's: the thread id from _meta, host codex, whatever the environment says", () => {
+    const meta = { threadId: CODEX_THREAD, "x-codex-turn-metadata": { turn_started_at_unix_ms: 1 } };
+    const fill = (name: string, args: Record<string, unknown>, callMeta: unknown, clientName?: string | null) =>
+      fillInboxToolArguments(
+        { jsonrpc: "2.0", id: 1, method: "tools/call", params: { name, arguments: args, _meta: callMeta as Record<string, unknown> } },
+        "/work",
+        "ses_OWN",
+        { host: "claude-code", session: CLAUDE_SESSION, name: "Claude Code" },
+        clientName,
+      ).params!;
+    expect(fill("send_message", { body: "hi" }, meta).arguments).toEqual({ body: "hi", project_path: "/work", agent_session: CODEX_THREAD, agent_host: "codex", agent_name: "Codex" });
+    // The _meta stays on the call: the Inbox reads the turn from it.
+    expect(fill("send_message", { body: "hi" }, meta)._meta).toEqual(meta);
+    expect(fill("read_thread", {}, meta).arguments).toEqual({ project_path: "/work", agent_session: CODEX_THREAD });
+    // Codex's client name alone is enough (a call without turn metadata).
+    expect(fill("wait_for_reply", {}, { threadId: CODEX_THREAD }, "codex-mcp-client").arguments).toEqual({ project_path: "/work", agent_session: CODEX_THREAD });
+    // Not from Codex, or no thread id: the environment's session, as before.
+    expect(fill("send_message", { body: "hi" }, { threadId: CODEX_THREAD }).arguments).toMatchObject({ agent_session: CLAUDE_SESSION, agent_host: "claude-code" });
+    expect(fill("send_message", { body: "hi" }, { threadId: "nope", "x-codex-turn-metadata": {} }).arguments).toMatchObject({ agent_session: CLAUDE_SESSION });
+    // The agent's own session stands.
+    expect(fill("send_message", { body: "hi", agent_session: "mine" }, meta).arguments).toEqual({ body: "hi", project_path: "/work", agent_session: "mine" });
   });
 
   test("host and name are filled only on the tools that record an author, and only when the agent left them out", () => {
@@ -482,6 +513,36 @@ describe("plannotator inbox mcp inside an agent session", () => {
     expect(await poll("another-session")).toEqual([]);
   }, 90_000);
 
+  test("the shim inside a Claude Code session whose bridge polls now is told the reply arrives by itself; without the poll, to wait_for_reply", async () => {
+    const box = sandbox();
+    const project = gitProject(box);
+    const registry = (await background(box)).registry!;
+    const client = await shim(box, project, { PLANNOTATOR_SESSION_TAG: `claude-code:${CLAUDE_SESSION}` });
+    const textOf = (result: unknown) => ((result as { content: { text: string }[] }).content[0]!.text);
+
+    // No bridge poll for that session yet: nothing will hand it the reply, so it must ask.
+    const before = textOf(await client.callTool({ name: "send_message", arguments: { body: "Before the poll.", idempotency_key: "wake-0" } }));
+    expect(before).toContain("reply won't arrive in this session by itself");
+
+    // The mod's wake polls the bridge as that session (held open, as the mod's long poll is).
+    const controller = new AbortController();
+    const held = fetch(`http://127.0.0.1:${registry.port}${INBOX_BRIDGE_POLL_PATH}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${registry.token}` },
+      body: JSON.stringify({ session: CLAUDE_SESSION, host: "claude-code", waitMs: 20_000 }),
+      signal: controller.signal,
+    }).catch(() => undefined);
+    cleanups.push(() => {
+      controller.abort();
+      return held.then(() => undefined);
+    });
+    await Bun.sleep(300);
+
+    const after = textOf(await client.callTool({ name: "send_message", arguments: { body: "After the poll.", idempotency_key: "wake-1" } }));
+    expect(after).toContain("The person's reply arrives in this session by itself");
+    expect(after).not.toContain("wait_for_reply with this thread_id");
+  }, 90_000);
+
   test("an explicit agent_session wins; a malformed tag is ignored (one fresh id per process); Pi's PI_SESSION_ID is that session", async () => {
     const box = sandbox();
     const project = gitProject(box);
@@ -505,6 +566,15 @@ describe("plannotator inbox mcp inside an agent session", () => {
     const pi = await shim(box, project, { PI_SESSION_ID: piSession });
     const fromPi = (await pi.callTool({ name: "send_message", arguments: { body: "From Pi's bash.", idempotency_key: "pi-1" } })).structuredContent as { thread_id: string };
     expect(await author(registry.port, fromPi.thread_id, 0)).toEqual({ kind: "agent", host: "pi", session: piSession, name: "Pi" });
+
+    // Codex: its MCP client (codex-mcp-client) names the thread on every call; the shim sends as that thread.
+    const codex = new Client({ name: "codex-mcp-client", version: "0.160.0" });
+    await codex.connect(new StdioClientTransport({ command: process.execPath, args: ["run", entry, "inbox", "mcp"], cwd: project, env: box.env, stderr: "pipe" }));
+    cleanups.push(() => codex.close());
+    const fromCodex = (
+      await codex.callTool({ name: "send_message", arguments: { body: "From a Codex thread.", idempotency_key: "codex-1" }, _meta: { threadId: CODEX_THREAD } })
+    ).structuredContent as { thread_id: string };
+    expect(await author(registry.port, fromCodex.thread_id, 0)).toEqual({ kind: "agent", host: "codex", session: CODEX_THREAD, name: "Codex" });
   }, 90_000);
 });
 

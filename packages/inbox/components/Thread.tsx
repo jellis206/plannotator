@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import { Viewer, type ViewerHandle } from '@plannotator/ui/components/Viewer';
+import { useRefHoverCards } from '@plannotator/ui/components/RefHoverCard';
 import type { Annotation, Block } from '@plannotator/ui/types';
 import { annotationOwnsHighlight } from '@plannotator/ui/utils/annotationOwnsHighlight';
 import { ImageLightbox } from '@plannotator/ui/components/ImageLightbox';
+import { ImageResolverContext, type ImageResolver } from '@plannotator/ui/components/ImageResolverContext';
+import { getImageSrc } from '@plannotator/ui/components/ImageThumbnail';
 import { parseMarkdownToBlocks } from '@plannotator/ui/utils/parser';
 import type { InboxListRow, InboxMessageWire, InboxProjectRepo, InboxQuestion, InboxSentRecipient, InboxThread, InboxUpload } from '@plannotator/core/inbox-types';
 import { capQuestionPrompt, emptyQuestionAnswer, indexQuestionBlocks, isQuestionAnswerEmpty, type IndexedQuestion, type QuestionAnswer, type QuestionStatus } from '@plannotator/core/question-block';
@@ -21,7 +24,7 @@ import { ArtifactsView } from './ArtifactsView';
 import { fileViewFor, openingView, parseFileView, readFileViewChoice, writeFileViewChoice, type FileView } from '../fileView';
 import type { InboxToastModel } from './Toast';
 import { AnnotationsChip } from './AnnotationsChip';
-import { agentName, clockTime, dayWords, fullTime, plural, whenTime } from '../format';
+import { agentName, clockTime, dayWords, formatCount, fullTime, plural, whenTime } from '../format';
 import { foldSnippet, holdingsOf, isDelivered, isPersonLook, isPersonReply, lastNonNote, lookBoundary, newSinceLook, planFolds, snippetText, type FoldSnippet, type Holding } from '../folding';
 import { highlightSearchHits } from '../search/highlight';
 import { AuthorMark, Icon } from '../icons';
@@ -33,7 +36,7 @@ import { useReplyDraft } from '../replyDraft';
 import { conflictText, DraftHead, DraftFootNote } from './DraftLabel';
 import { canToggleRead } from '../markRead';
 import { NewMessageButton, NewMessageComposer, NewMessagePopover, hostName, useLiveSessions, type NewMessageMode } from './NewMessage';
-import { autoAfterText, deliveryLine, restartNote, TURN_ENDED_TEXT, waitInputs, type DeliveryLine, type RecipientConnection } from '../deliveryLine';
+import { autoAfterText, deliveryLine, restartNote, TURN_ENDED_TEXT, uncertainItem, waitInputs, type DeliveryLine, type RecipientConnection } from '../deliveryLine';
 import { RestartLine } from './RestartNote';
 import { UndeliveredBand, UndeliveredText, useMinuteClock } from './Undelivered';
 import { SendToAnotherSession } from '../compose/SendToAnotherSession';
@@ -74,7 +77,7 @@ import { actionForBlock } from '../actions';
 import { splitInboxSkillsBlock } from '@plannotator/core/skill-reference-block';
 import { Tip } from './Tip';
 import { OpenQuestionsButton } from './OpenQuestions';
-import { laidOutChildren, pillHitsButtons } from '../footFit';
+import { fitWholeFootRow, footRowOpenQuestionsForm, footRowTokens, laidOutChildren, pillHitsButtons, type OpenQuestionsLabelForm } from '../footFit';
 import { openQuestionsShown, placeOf, reaskItemLabel, skipToggledAnswer, threadOpenQuestions, type OpenQuestion, type OpenQuestionPlace } from '../openQuestions';
 import { selectionToolbarShowing } from '../selectionToolbar';
 import { replyKeysToRenew, routeSendAnnotations, sendTargetAnswerIds, sendTargetsOf, type SendTarget, type SentContents } from '../sendTargets';
@@ -261,6 +264,7 @@ export function MessageBody({
   imageBase,
   onImage,
   pictureBadge,
+  inlineRefOf,
 }: {
   message: InboxMessageWire;
   /** The thread's project root: relative links start there or at the message's own folder. */
@@ -304,6 +308,8 @@ export function MessageBody({
     onSave: (annotation: Annotation) => Promise<boolean>;
     onUnanchored?: (report: { attempted: readonly string[]; unanchored: readonly string[] }) => void;
     onPainted?: () => void;
+    /** Words the comment box opens with for this selection (the tour's suggested comment); absent: an empty box. */
+    suggest?: (selectedText: string) => string | undefined;
   };
   /**
    * The person's own sent reply (sentReply.ts): the answers it carried, read
@@ -326,6 +332,12 @@ export function MessageBody({
   onImage?: (src: string, alt: string) => void;
   /** A label over each picture choice's picture (ui QuestionBlock `pictureBadge`); absent: none. */
   pictureBadge?: (choice: { label: string; image: { alt: string; src: string } }) => string | null;
+  /**
+   * The src as the body wrote it, read back from an image URL the body drew: what finds the image's captured
+   * file (`inline_images`, by `ref`). Absent: the message's own image route (inlineImageRefFromSrc). The
+   * tour passes its own, for images drawn from its assets.
+   */
+  inlineRefOf?: (src: string) => string | null;
 }) {
   // A person's message ends with the skills block the window pasted when it
   // was sent: folded behind one quiet line (SkillsLine). An agent's message
@@ -338,9 +350,23 @@ export function MessageBody({
   const blocks = useMemo(() => parseMarkdownToBlocks(shown, { frontmatter: false }), [shown]);
   const restBlocks = useMemo(() => (restShown ? parseMarkdownToBlocks(restShown, { frontmatter: false }) : []), [restShown]);
   const refRepo = useRefRepo(repo);
+  // The body's images go through a host resolver that names the same URL ui's
+  // default would (the window's resolver, `inboxImageSrcResolver`), only so ui
+  // draws an image the Inbox refuses (403 image_hidden, 404) as its alt text in
+  // a quiet chip instead of a broken-image icon: markdown images, `<img>` in
+  // raw-HTML blocks and question cards' pictures alike. Remote, `data:` and
+  // `blob:` sources keep their URL (HtmlBlock's default test: `https:host/a.png`
+  // is remote too).
+  const imageBaseDir = imageBase ?? inboxMessageImageBase(message.id);
+  const resolveImage = useCallback<ImageResolver>(
+    (src) => ({ kind: 'src', src: /^(https?:|data:|blob:)/i.test(src) ? src : getImageSrc(src, imageBaseDir) }),
+    [imageBaseDir],
+  );
   // A tall screenshot in the body shows its top, cropped like the gallery's
   // (inbox.css); a click still opens it whole.
   const bodyRef = useRef<HTMLDivElement>(null);
+  // Hover cards for issue, PR and MR links in the body (ui RefHoverCard).
+  const refCard = useRefHoverCards(bodyRef);
   useEffect(() => {
     const body = bodyRef.current;
     if (!body) return;
@@ -361,17 +387,20 @@ export function MessageBody({
   const openImageRef = useRef(onOpenInlineImage);
   openImageRef.current = onOpenInlineImage;
   const [fallback, setFallback] = useState<{ src: string; alt: string } | null>(null);
+  const refOfRef = useRef(inlineRefOf);
+  refOfRef.current = inlineRefOf;
+  const refOf = useCallback((src: string) => (refOfRef.current ? refOfRef.current(src) : inlineImageRefFromSrc(src, message.id)), [message.id]);
   const imageOf = useCallback(
     (src: string | null) => {
-      const ref = src ? inlineImageRefFromSrc(src, message.id) : null;
+      const ref = src ? refOf(src) : null;
       return ref === null ? null : (inlineRef.current.find((image) => image.ref === ref) ?? null);
     },
-    [message.id],
+    [refOf],
   );
   /** Open one of the body's images: its captured file in the viewer, else the lightbox. False: not one of them. */
   const openImage = useCallback(
     (src: string | null, alt: string): boolean => {
-      if (!src || inlineImageRefFromSrc(src, message.id) === null) return false;
+      if (!src || refOf(src) === null) return false;
       // An image that failed to load (outside the project, gone) opens nothing: an empty lightbox helps no one.
       if ([...(bodyRef.current?.querySelectorAll<HTMLImageElement>('img[data-ib-broken]') ?? [])].some((img) => img.getAttribute('src') === src)) return true;
       const image = imageOf(src);
@@ -379,7 +408,7 @@ export function MessageBody({
       else setFallback({ src, alt });
       return true;
     },
-    [imageOf, message.id],
+    [imageOf, refOf],
   );
   const onImageRef = useRef(onImage);
   onImageRef.current = onImage;
@@ -391,7 +420,7 @@ export function MessageBody({
       // A question card's picture (a picture choice, `Shows:`): the card makes it pick, or opens it with its own button.
       if (img.hasAttribute('data-question-picture')) continue;
       const src = img.getAttribute('src');
-      const ref = src ? inlineImageRefFromSrc(src, message.id) : null;
+      const ref = src ? refOf(src) : null;
       if (ref === null || img.hasAttribute('data-ib-broken')) continue;
       const image = imageOf(src);
       const name = image?.name ?? ref.split(/[\\/]/).pop() ?? 'image';
@@ -604,7 +633,9 @@ export function MessageBody({
   );
 
   return (
+    <ImageResolverContext.Provider value={resolveImage}>
     <div className="ib-body" data-message-id={message.id} data-text-comments={comments ? '' : undefined} data-sent-reply={replyParts ? '' : undefined} ref={bodyRef}>
+      {refCard}
       {(!replyParts || shown !== '') && (
       <Viewer
         ref={viewerRef}
@@ -615,6 +646,7 @@ export function MessageBody({
         onSelectAnnotation={comments ? selectComment : noop}
         selectedAnnotationId={comments ? selectedComment : null}
         textComments={comments !== undefined}
+        suggestComment={comments?.suggest}
         allowImages={false}
         onRestoreReport={comments ? restoreReport : undefined}
         mode="selection"
@@ -622,7 +654,7 @@ export function MessageBody({
         maxWidth={null}
         stickyActions={false}
         disableCodePathValidation
-        imageBaseDir={imageBase ?? inboxMessageImageBase(message.id)}
+        imageBaseDir={imageBaseDir}
         onImageClick={onImageClick}
         resolveLocalLink={resolveLocalLink}
         refRepo={refRepo}
@@ -660,7 +692,7 @@ export function MessageBody({
           maxWidth={null}
           stickyActions={false}
           disableCodePathValidation
-          imageBaseDir={imageBase ?? inboxMessageImageBase(message.id)}
+          imageBaseDir={imageBaseDir}
           onImageClick={onImageClick}
           resolveLocalLink={resolveLocalLink}
           refRepo={refRepo}
@@ -682,6 +714,7 @@ export function MessageBody({
       )}
       {fallback && createPortal(<ImageLightbox src={fallback.src} alt={fallback.alt} onClose={() => setFallback(null)} />, document.body)}
     </div>
+    </ImageResolverContext.Provider>
   );
 }
 
@@ -2600,7 +2633,8 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
             name: last.delivery ? toName(last, last.delivery) : last.to ? toName(last, last.to) : hostName(lastTo.host),
             deliveredAt: last.delivery?.at ?? null,
             time: whenTime,
-            wakes: true,
+            // A Codex reply whose `codex queue` ran out of time may not have gone: saved, not queued.
+            wakes: !uncertainItem(recipientConnection, last.id),
             sendingNow: !!last.deliver_now_at,
             connection: recipientConnection,
             undelivered: undelivered ? { host: hostName(lastTo.host) } : null,
@@ -2611,7 +2645,7 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
             // A reply that tags agents: the owner's own delivery, never another recipient's.
             deliveredAt: lastTags.length > 0 ? (last.delivery?.at ?? sent?.recipients?.find((r) => r.owner)?.delivered_at ?? null) : (sent?.checked_at ?? null),
             time: whenTime,
-            wakes: wakingSession !== null || (askedSession !== null && recipientConnection != null),
+            wakes: (wakingSession !== null || (askedSession !== null && recipientConnection != null)) && !uncertainItem(recipientConnection, last.id),
             sendingNow: !!last.deliver_now_at,
             connection: recipientConnection,
             askerEnded: askerEnded && asking ? { name: asking.name } : null,
@@ -2834,6 +2868,40 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
   // While new messages are below the view: a pill that goes to them.
   // On a phone the pill sits over the middle of the foot's row; when a button lies under that middle, above the foot.
   const footRowRef = useRef<HTMLDivElement>(null);
+  /**
+   * How far the closed foot shortened so the buttons and the draft status share one line (footFit.ts
+   * `fitWholeFootRow`: the skip chip, Edit, the open questions count, the draft's words, tighter spacing).
+   * Null: no status, no layout, or even the shortest form does not fit (the status wraps above).
+   */
+  const [rowLevel, setRowLevel] = useState<number | null>(null);
+  const footStatusShown = waiting || draftKept;
+  const footRowShown = !resolved && !(guard && staleQuestions.length > 0) && newMessage?.kind !== 'compose' && !box.open && !(route.open && asking);
+  const rowMax: OpenQuestionsLabelForm = phone ? 'short' : 'full';
+  // What the row shows; a change re-fits it (with its width).
+  const footSig = [footStatusShown, draftKept, picksCount, records.length, unanswered.length, keepOpen, skipIds.size, openQShown, openQ.questions.length, reaskActions, rowMax, phone].join('|');
+  const rowFittedFor = useRef('');
+  const fitRowRef = useRef<(force?: boolean) => void>(() => {});
+  fitRowRef.current = (force = false) => {
+    const row = footRowRef.current;
+    if (!row) return;
+    const key = `${row.getBoundingClientRect().width}|${footSig}`;
+    if (!force && key === rowFittedFor.current) return;
+    rowFittedFor.current = key;
+    const level = footStatusShown ? fitWholeFootRow(row, rowMax, phone) : null;
+    setRowLevel((current) => (current === level ? current : level));
+  };
+  // Every render (after the open questions button drew itself), and whenever the row's width changes.
+  useLayoutEffect(() => fitRowRef.current());
+  useEffect(() => {
+    const row = footRowRef.current;
+    if (!row || typeof ResizeObserver === 'undefined') return;
+    const observer = new ResizeObserver(() => fitRowRef.current());
+    observer.observe(row);
+    // Words measured in a fallback font fit differently once the real one loads.
+    void document.fonts?.ready.then(() => fitRowRef.current(true));
+    return () => observer.disconnect();
+    // The row comes and goes (the reply box, the route choice, the stale guard, compose).
+  }, [footRowShown]);
   const [pillAbove, setPillAbove] = useState(false);
   const pillOnRow = showNew && phone && !waiting && !draftKept;
   const placePill = useCallback(() => {
@@ -3783,7 +3851,7 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
           {/* Buttons on the left in today's order, the draft status and the skip chip at the right end (approval
               "thread-foot-status-right", option A). Too narrow for one line, the status takes its own line ABOVE the
               buttons (wrap-reverse; one item per line aligns to the start), so it never wraps between them. */}
-          <div className="ib-acts ib-footrow" data-foot-row="" ref={footRowRef}>
+          <div className="ib-acts ib-footrow" data-foot-row="" data-fit={rowLevel ? footRowTokens(rowLevel, phone) : undefined} ref={footRowRef}>
             <div className="ib-footbtns" data-foot-buttons="">
               {(waiting || draftKept) && (
                 <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending} aria-describedby={footStatusIds}>
@@ -3800,7 +3868,15 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
                 aria-describedby={waiting || draftKept ? footStatusIds : undefined}
               >
                 <Icon name={waiting || draftKept ? 'pen' : 'reply'} size={15} />
-                {waiting || draftKept ? 'Edit draft' : 'Reply'}
+                {/* Short of room, "Edit", and on a phone the pencil alone (footFit.ts): the words stay as hidden text,
+                    so the name is "Edit draft". */}
+                {waiting || draftKept ? (
+                  <span>
+                    Edit<span className="ib-fl"> draft</span>
+                  </span>
+                ) : (
+                  'Reply'
+                )}
               </button>
               {/* The thread's open questions (approval "inbox-thread-open-questions"): a list that takes the person to each
                   card, with Re-ask at its foot (owner, 2026-10-23: the open questions again, in one message per session). */}
@@ -3818,6 +3894,7 @@ export function ThreadPane({ notice, thread, sent, onQuestions, onChanged, draft
                   measure={measureOpenQuestions}
                   onPick={(q) => jumpTo({ kind: 'question', messageId: q.messageId, key: q.key })}
                   onSetSkipped={setSkippedFromList}
+                  rowForm={rowLevel !== null && footStatusShown ? footRowOpenQuestionsForm(rowLevel, rowMax) : null}
                 />
               )}
               {/* 👍 Looks good beside Reply: sent to the agent after the Undo window; hidden while a question waits. */}
@@ -3948,10 +4025,22 @@ function SkipChip({ count, keepOpen, onToggle, id }: { count: number; keepOpen: 
       {/* The icon and the sentence are one item, so where the chip wraps (a narrow reply box) the icon stays with its words. */}
       <span className="ib-skip-s" id={id}>
         {!keepOpen && <Icon name="forward" size={14} />}
-        {keepOpen ? `${plural(count, 'question')} ${count === 1 ? 'stays' : 'stay'} open` : `${plural(count, 'question')} will be skipped`}
+        {/* Short of room, the foot's row drops the middle words ("1 open", "Skip"; footFit.ts, inbox.css): they leave
+            only the eye, so the description and the button's name keep them, and the text reads the same. */}
+        <span>
+          {formatCount(count)}
+          <span className="ib-fl">{keepOpen ? ` question${count === 1 ? ' stays' : 's stay'}` : ` question${count === 1 ? '' : 's'} will be`}</span>
+          {keepOpen ? ' open' : ' skipped'}
+        </span>
       </span>
       <button type="button" onClick={onToggle} data-skip-toggle="">
-        {keepOpen ? `Skip ${them}` : 'Keep open'}
+        {keepOpen ? (
+          <>
+            Skip<span className="ib-fl"> {them}</span>
+          </>
+        ) : (
+          'Keep open'
+        )}
       </button>
     </span>
   );

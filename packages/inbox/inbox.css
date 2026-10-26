@@ -945,6 +945,32 @@ button.ib-band:hover { background: var(--ib-band-hover-s, var(--ib-band)); }
 .ib-footstatus { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; min-width: 0; }
 .ib-footstatus > * { flex: none; max-width: 100%; }
 .ib-footstatus .ib-draft-foot { margin-right: 0; }
+/* Short of room, the row shortens before the status wraps above the buttons (footFit.ts `fitWholeFootRow`,
+   one step per token of `data-fit`). The words it drops (.ib-fl) leave only the eye, so names, descriptions
+   and the text itself keep them. */
+.ib-footrow[data-fit~="skip"] .ib-skipchip .ib-fl,
+.ib-footrow[data-fit~="edit"] [data-edit-draft] .ib-fl,
+.ib-footrow[data-fit~="draft"] .ib-draft-foot .ib-st { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; margin: 0; }
+/* Step 4 drops the pick words; the comment count stays, as a glyph and the number inside the Draft pill
+   ("Draft 💬3"; aria-hidden, the words "3 comments" stay as hidden text). No comments: "Draft" alone. */
+.ib-draft-comma { font-size: 0; }
+.ib-draft-pc { display: none; align-items: center; gap: 3px; margin-left: 5px; font-variant-numeric: tabular-nums; }
+.ib-draft-pc .ib-ic { width: 12px; height: 12px; }
+.ib-footrow[data-fit~="draft"] .ib-draft-pc { display: inline-flex; }
+.pn-inbox .ib-footrow[data-fit~="draft"] .ib-draft-foot .ib-draft-pill { padding-left: 7px; padding-right: 7px; }
+.pn-inbox .ib-footrow[data-fit~="tight"] { column-gap: 6px; }
+.pn-inbox .ib-footrow[data-fit~="tight"] .ib-footbtns,
+.pn-inbox .ib-footrow[data-fit~="tight"] .ib-footstatus { gap: 6px; }
+.pn-inbox .ib-footrow[data-fit~="tight"] .ib-draft-pc { margin-left: 4px; }
+.pn-inbox .ib-footrow[data-fit~="tight"] .ib-footbtns .ib-btn { padding-left: 10px; padding-right: 10px; gap: 5px; }
+.pn-inbox .ib-footrow[data-fit~="tight"] .ib-oq-btn .ib-oq-chev { display: none; }
+/* A phone only, after tight: Edit draft as its pencil (its words stay as hidden text, so the name is still
+   "Edit draft"), and the gaps 4 px. */
+.pn-inbox .ib-footrow[data-fit~="icon"] { column-gap: 4px; }
+.pn-inbox .ib-footrow[data-fit~="icon"] .ib-footbtns,
+.pn-inbox .ib-footrow[data-fit~="icon"] .ib-footstatus { gap: 4px; }
+.pn-inbox .ib-footrow[data-fit~="icon"] .ib-footbtns .ib-btn[data-edit-draft] { width: 44px; padding-left: 0; padding-right: 0; justify-content: center; }
+.ib-footrow[data-fit~="icon"] [data-edit-draft] > span { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; margin: 0; }
 .ib-error[data-foot-error="above"] { margin: 0 0 8px; }
 .ib-reply-l { font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); margin-bottom: 6px; }
 .ib-rbox { border: 1px solid color-mix(in oklch, var(--primary) 60%, transparent); box-shadow: 0 0 0 3px color-mix(in oklch, var(--primary) 14%, transparent); border-radius: 8px; background: var(--card); margin-bottom: 10px; }
@@ -1525,6 +1551,41 @@ button.ib-band:hover { background: var(--ib-band-hover-s, var(--ib-band)); }
 .pn-inbox .ib-fvdock-phone .ib-fvhandle { top: auto; bottom: calc(14px + max(var(--ib-fvfoot, 0px), env(safe-area-inset-bottom))); height: 52px; min-width: 44px; padding: 0 10px 0 12px; border-radius: 14px 0 0 14px; }
 .ib-view.ib-fullview.ib-phone.ib-panel-open .ib-fvdock { visibility: hidden; }
 .ib-view.ib-fullview.ib-phone .ib-fvchip { bottom: calc(80px + max(var(--ib-fvfoot, 0px), env(safe-area-inset-bottom))); }
+/* A phone's position: the `4/9 ⌄` pill opens every file of the thread in one tap (fileSwipe.ts steps by a swipe). */
+.pn-inbox .ib-fvdock-phone .ib-fvb.ib-fvpill { min-width: 52px; padding: 0 6px 0 9px; gap: 0; background: color-mix(in oklch, var(--muted) 70%, transparent); color: var(--foreground); font-weight: 600; }
+.pn-inbox .ib-fvdock-phone .ib-fvb.ib-fvpill[aria-expanded="true"] { background: var(--muted); }
+.ib-fvpill small { margin-right: 3px; }
+/* The narrowest phones (320 px): the HTML page's toolbar (Back, pen, count, pill, ⋯, Hide) fits with two-digit counts in the count and the pill ("12", "13/13"). Every button keeps its 44 px. */
+@media (max-width: 359px) {
+  .ib-fvdock-phone .ib-fvbar { right: calc(8px + env(safe-area-inset-right)); gap: 0; padding: 3px; }
+  .ib-fvdock-phone .ib-fvdv { display: none; }
+  .pn-inbox .ib-fvdock-phone .ib-fvb { padding: 0 5px; }
+  .pn-inbox .ib-fvdock-phone .ib-fvb.ib-fvcount { gap: 3px; }
+  .pn-inbox .ib-fvdock-phone .ib-fvb.ib-fvpill { min-width: 44px; padding: 0 3px 0 6px; }
+  .ib-fvpill small { margin-right: 1px; }
+}
+/* ‹ Previous and Next › at the top of the phone's file sheet: 44 px each, the position between them. */
+.pn-inbox .ib-peekstep { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 0 8px; border-bottom: 1px solid color-mix(in oklch, var(--border) 60%, transparent); }
+.pn-inbox .ib-peekstep-b { flex: none; display: inline-flex; align-items: center; gap: 4px; height: 44px; min-width: 44px; padding: 0 12px; border-radius: 10px; background: var(--muted); color: var(--foreground); font-size: var(--ib-fs-14, 14px); font-weight: 600; }
+.pn-inbox .ib-peekstep-b:first-child { padding-left: 8px; }
+.pn-inbox .ib-peekstep-b:last-child { padding-right: 8px; }
+.pn-inbox .ib-peekstep-b[aria-disabled="true"] { opacity: 0.4; }
+.pn-inbox .ib-peekstep-b:active:not([aria-disabled="true"]) { background: color-mix(in oklch, var(--muted) 70%, var(--foreground) 12%); }
+.pn-inbox .ib-peekstep-n { min-width: 0; color: var(--muted-foreground); font-size: var(--ib-fs-13, 13px); font-variant-numeric: tabular-nums; white-space: nowrap; }
+/* The file a swipe brings in: "Next · name" at the edge it comes from (the file itself follows the finger by transform). */
+.ib-swipecard { position: absolute; z-index: 9; top: 50%; transform: translateY(-50%); display: flex; align-items: center; gap: 8px; max-width: min(64%, 280px); padding: 8px 12px; border-radius: 14px; background: var(--popover); color: var(--popover-foreground); border: 1px solid var(--border); box-shadow: 0 12px 34px rgba(0, 0, 0, 0.3); pointer-events: none; }
+:root.light .ib-swipecard { box-shadow: 0 10px 28px rgba(0, 0, 0, 0.14); }
+.ib-swipecard-r { right: calc(12px + env(safe-area-inset-right)); }
+.ib-swipecard-l { left: calc(12px + env(safe-area-inset-left)); }
+.ib-swipecard > svg { flex: none; color: var(--muted-foreground); }
+.ib-swipecard-th { width: 28px; height: 28px; flex: none; border-radius: 6px; overflow: hidden; display: inline-grid; place-items: center; background: var(--muted); }
+.ib-swipecard-th img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* A type tile grows with its label ("JSONC", "HTML") instead of clipping it. */
+.ib-swipecard-th.ib-swipecard-th-tile { width: auto; min-width: 28px; padding: 0 4px; box-sizing: border-box; }
+.ib-swipecard-tile { font: 700 9.5px/1 var(--font-sans, system-ui); letter-spacing: 0.02em; color: var(--muted-foreground); white-space: nowrap; }
+.ib-swipecard-text { display: flex; flex-direction: column; min-width: 0; line-height: 1.2; }
+.ib-swipecard-dir { font-size: var(--ib-fs-11-5, 11.5px); color: var(--muted-foreground); }
+.ib-swipecard-nm { font-size: var(--ib-fs-14, 14px); font-weight: 600; min-width: 0; overflow: hidden; white-space: nowrap; }
 /* the image's size bar moves out from under the toolbar */
 .ib-view.ib-fullview:not(.ib-phone) .ib-imgbar { right: auto; left: 14px; }
 /* and the "Your marked-up copy" chip sits under it */
@@ -2188,6 +2249,29 @@ button.ib-vtime:hover { background: color-mix(in oklch, var(--primary) 22%, tran
 /* The stepping bar beside the thread wraps rather than cutting its parts in a narrow pane. */
 .pn-inbox .ib-vfoot { flex-wrap: wrap; row-gap: 8px; padding-top: 8px; padding-bottom: 8px; }
 
+/* Pull down to refresh, on a phone's list (pullRefresh.ts): the list moves down from the very top and
+   uncovers a small ↻ under the header, behind it. The script writes the travel (--ib-pull), the ↻'s
+   turn (--ib-pull-turn), the opacity and data-state (pull, ready, refreshing, settling); the list is
+   painted over the ↻ while a pull is on, so the ↻ shows only in the gap it leaves. */
+@property --ib-pull { syntax: '<length>'; inherits: true; initial-value: 0px; }
+.ib-pull { position: relative; height: 0; z-index: 0; pointer-events: none; opacity: 0; --ib-pull-turn: 0deg; clip-path: inset(0 0 -200px 0); }
+.ib-pull-dot {
+  position: absolute; left: 50%; top: 0; width: 34px; height: 34px; margin-left: -17px; border-radius: 50%;
+  display: grid; place-items: center; color: var(--muted-foreground);
+  background: color-mix(in oklch, var(--muted) 72%, var(--card));
+  translate: 0 calc(var(--ib-pull) / 2 - 17px); scale: 0.88;
+  transition: color 160ms ease-out, scale 160ms ease-out;
+}
+.ib-pull-dot svg { transform: rotate(var(--ib-pull-turn)); }
+.ib-pull:is([data-state="ready"], [data-state="refreshing"]) .ib-pull-dot { color: var(--foreground); scale: 1; }
+.ib-pull[data-state="refreshing"] .ib-pull-dot svg { animation: ib-pull-spin 800ms linear infinite; }
+@keyframes ib-pull-spin { from { transform: rotate(var(--ib-pull-turn)); } to { transform: rotate(calc(var(--ib-pull-turn) + 360deg)); } }
+.ib-lbody[data-pull] { z-index: 1; background: var(--card); }
+@media (prefers-reduced-motion: reduce) {
+  .ib-pull-dot, .ib-pull:is([data-state="ready"], [data-state="refreshing"]) .ib-pull-dot { transition: none; }
+  .ib-pull-dot svg, .ib-pull[data-state="refreshing"] .ib-pull-dot svg { transform: none; animation: none; }
+}
+
 /* ───────────── The Inbox on a phone ─────────────
    One screen at a time, like a mail app: the list, then a thread (Back to
    the list), then a file (Back to the thread). The query is PHONE_QUERY in
@@ -2648,6 +2732,8 @@ label.ib-anote-r:hover { background: color-mix(in oklch, var(--muted) 40%, trans
 .ib-cl li > .ib-mut { font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); min-width: 0; overflow-wrap: anywhere; }
 .ib-cl li.ib-mut { color: var(--muted-foreground); }
 .pn-inbox .ib-cl svg.ib-cl-tick { width: 14px; height: 14px; flex: none; color: var(--success); stroke-width: 2.2; }
+.ib-empty .ib-note.ib-cn-wake { align-items: flex-start; margin: 0; line-height: 1.5; font-size: var(--ib-fs-13, 13px); }
+.pn-inbox .ib-empty .ib-note.ib-cn-wake svg.ib-ic { flex: none; margin-top: 2px; }
 .ib-cl-ring { width: 14px; height: 14px; border-radius: 50%; border: 1.5px solid var(--muted-foreground); flex: none; }
 .ib-cl-ring.ib-cl-dash { border-style: dashed; }
 .ib-cl li.ib-cl-now { font-weight: 550; }
@@ -3423,7 +3509,9 @@ svg.ib-ic.ib-glyph { stroke: currentColor; fill: none; stroke-width: 1.6; stroke
 .pn-inbox .question-block [data-question-tile] > label[data-question-option], .pn-inbox .question-block [data-question-tile] > label[data-question-option]:hover, .pn-inbox .question-block [data-question-tile] > label[data-question-option]:has(input:checked) { background: transparent; border-radius: 0; }
 .pn-inbox .question-block label[data-question-option]:has(input:checked) { background: var(--ib-qc-opt-on-s, color-mix(in oklab, var(--primary) 12%, transparent)); }
 .pn-inbox .question-block [data-question-part="choice"] > span:first-child { font-weight: var(--ib-qc-choice-w-s, 550); }
-.pn-inbox .question-block [data-question-part="choice"] .rounded { border-radius: var(--ib-qc-pill-s, 0.25rem); letter-spacing: var(--ib-qc-tag-track-s, 0.03em); }
+/* The Recommended tag only (ui's Tag carries data-question-tag): an image or inline code in a choice keeps its
+   own radius. */
+.pn-inbox .question-block [data-question-part="choice"] [data-question-tag] { border-radius: var(--ib-qc-pill-s, 0.25rem); letter-spacing: var(--ib-qc-tag-track-s, 0.03em); }
 .pn-inbox .question-block [role="radiogroup"] > div, .pn-inbox .question-block [role="group"] > div { border-radius: var(--ib-qc-opt-r-s, 7px); }
 .pn-inbox .question-block > div.border-t { border-top-color: var(--ib-qc-foot-line-s, color-mix(in oklab, var(--border) 55%, transparent)); }
 .pn-inbox .question-block > div.border-t > button:not(.ml-auto) { border-radius: var(--ib-qc-btn-r-s, 5px); }
@@ -4377,6 +4465,17 @@ dialog.ib-dm::backdrop { background: oklch(0 0 0 / 0.45); }
 .pn-inbox .ib-tc-back { height: 30px; padding: 0 8px; border-radius: 7px; color: var(--muted-foreground); font-weight: 500; }
 .pn-inbox .ib-tc-back:hover { color: var(--foreground); background: var(--muted); }
 .pn-inbox .ib-tc-next { height: 30px; padding: 0 12px; border-radius: 8px; background: var(--primary); color: var(--primary-foreground); font-weight: 600; }
+/* "Your turn" (the owner, 2026-10-25): a card that asks the person to act says so at its top, in the primary colour. */
+.ib-tour-coach .ib-tc-eb { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.ib-tc-turn { display: inline-flex; align-items: center; gap: 3px; height: 20px; padding: 0 8px 0 6px; border-radius: 999px; background: var(--primary); color: var(--primary-foreground); font-size: var(--ib-fs-11-5, 11.5px); font-weight: 650; letter-spacing: 0; white-space: nowrap; }
+.ib-tour-coach[data-your-turn] { box-shadow: 0 0 0 2px var(--primary), var(--ib-float-shadow, 0 16px 40px -12px rgb(0 0 0 / 0.45)); }
+/* Fast-forward: quiet, at the card's foot, always there when the card asks or waits. */
+.pn-inbox .ib-tc-ff { display: inline-flex; align-items: center; gap: 5px; height: 30px; padding: 0 10px; border-radius: 8px; color: var(--muted-foreground); font-weight: 550; font-size: var(--ib-fs-12-5, 12.5px); }
+.pn-inbox .ib-tc-ff:hover { color: var(--foreground); background: var(--muted); }
+/* The tour's answer to a click it cannot use: one short line on the card. */
+.ib-tour-coach .ib-tc-nudge { margin: 8px 0 0; padding: 6px 9px; border-radius: 8px; background: color-mix(in oklch, var(--primary) 10%, var(--popover)); color: var(--foreground); font-size: var(--ib-fs-12-5, 12.5px); line-height: 1.4; }
+/* A click on the card shows its target again. */
+.pn-inbox .ib-tour-again { outline: 3px solid var(--primary) !important; outline-offset: 3px; }
 .ib-tc-do { font-size: var(--ib-fs-12-5, 12.5px); color: var(--primary); font-weight: 600; display: inline-flex; gap: 5px; align-items: center; }
 .ib-tc-wait { display: inline-flex; align-items: center; gap: 8px; font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); }
 .ib-tc-wait::before { content: ""; width: 12px; height: 12px; border-radius: 50%; border: 2px solid color-mix(in oklch, var(--primary) 30%, transparent); border-top-color: var(--primary); }
@@ -4387,6 +4486,7 @@ dialog.ib-dm::backdrop { background: oklch(0 0 0 / 0.45); }
   @keyframes ib-tour-pulse { 0% { box-shadow: 0 0 0 0 color-mix(in oklch, var(--primary) 45%, transparent); } 100% { box-shadow: 0 0 0 10px transparent; } }
   .ib-tour-coach { animation: ib-pm-in 160ms ease-out; }
   .ib-tc-wait::before { animation: ib-spin 0.9s linear infinite; }
+  .pn-inbox .ib-tour-again { animation: ib-tour-pulse 0.8s ease-out 2; }
 }
 
 /* The replay's marks: what is a replay of the real thread says so. */
@@ -4403,6 +4503,13 @@ dialog.ib-dm::backdrop { background: oklch(0 0 0 / 0.45); }
 .ib-tour-filetile .ib-tft-t b { font-weight: 600; font-size: var(--ib-fs-14, 14px); }
 .ib-tour-filetile .ib-tft-t span { font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); }
 .ib-tour-filetile .ib-tft-o { margin-left: auto; font-size: var(--ib-fs-13, 13px); font-weight: 600; color: var(--primary); }
+.ib-tour-filetile .ib-tft-o.ib-tft-off { font-weight: 500; color: var(--muted-foreground); }
+/* The mock's place when its copy is not here: a still of it, or a quiet card naming it (never an error). */
+.ib-tour-file .ib-tf-still { display: grid; place-items: center; overflow: auto; padding: 20px; min-height: 0; background: var(--background); }
+.ib-tour-file .ib-tf-still img { max-width: 100%; max-height: 100%; border-radius: 6px; box-shadow: 0 0 0 1px var(--border); }
+.ib-tour-file .ib-tf-card { padding: 32px 22px; }
+/* A picture in the viewer that is not here: its own words, calmly, where it would be. */
+.ib-tour-viewer .ib-tv-words { max-width: 46ch; padding: 24px; border-radius: 10px; background: var(--muted); color: var(--foreground); text-align: center; line-height: 1.5; }
 .ib-tour-gal { display: flex; flex-wrap: wrap; gap: 10px; margin-top: 10px; }
 .pn-inbox .ib-tour-gal button { flex: 1 1 240px; max-width: 360px; text-align: left; border-radius: 9px; }
 .ib-tour-gal img { width: 100%; aspect-ratio: 1.6; object-fit: cover; object-position: top left; border-radius: 8px; box-shadow: 0 0 0 1px var(--border); display: block; }
@@ -4430,6 +4537,52 @@ dialog.ib-dm::backdrop { background: oklch(0 0 0 / 0.45); }
 /* The entry screen: connecting is a first-class path. */
 .pn-inbox .ib-empty.ib-te-empty { max-width: 1180px; }
 .ib-te-paths { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; max-width: 900px; }
+/* The bento's top tile: how the Inbox fits with your agents (tour/Fit.tsx), wide, the picture beside the words. */
+.ib-te-fit { display: grid; grid-template-columns: minmax(0, 1fr); max-width: 900px; margin-bottom: 16px; }
+.ib-te-fit .ib-te-fit-pic { padding: 18px 20px 12px; background: color-mix(in oklch, var(--primary) 6%, var(--muted)); }
+.ib-te-fit .ib-te-body { justify-content: center; gap: 0; }
+.pn-inbox .ib-te-fit .ib-te-body h3 { margin: 0 0 8px; }
+.ib-te-fit .ib-te-body p { flex: none; margin: 0 0 6px; }
+@media (max-width: 359px) { .tp-win .tp-note-long { display: none; } .tp-win .tp-note-short { display: inline; } }
+/* The picture (tour/Fit.tsx): your agents in a column, a straight arrow from each into the Inbox card, the reply back. */
+.tp { display: grid; grid-template-columns: minmax(0, 1fr) 76px minmax(0, 0.95fr); grid-template-rows: repeat(3, minmax(0, 1fr)); row-gap: 8px; align-items: stretch; }
+.tp-win { grid-column: 1; display: flex; align-items: center; gap: 8px; padding: 0 12px; min-height: 40px; border-radius: 8px; background: var(--card); box-shadow: 0 0 0 1px var(--border); font-size: var(--ib-fs-13, 13px); white-space: nowrap; min-width: 0; overflow: hidden; }
+.tp-win .ib-mk { width: var(--ib-mark-20); height: var(--ib-mark-20); border-radius: var(--ib-mark-20-r); flex: none; }
+.tp-win .ib-mk > svg, .tp-win .ib-mk > img { width: var(--ib-mark-20-g); height: var(--ib-mark-20-g); }
+.tp-win b { font-weight: 600; flex: none; }
+.tp-win .tp-note { color: var(--muted-foreground); min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.tp-win .tp-note-short { display: none; }
+.tp-link { grid-column: 2; position: relative; display: flex; flex-direction: column; justify-content: center; gap: 7px; padding: 0 4px; }
+.tp-link i { position: relative; display: block; height: 0; border-top: 1.5px solid var(--muted-foreground); }
+.tp-link i::after { content: ""; position: absolute; top: -4.75px; border: 4px solid transparent; }
+.tp-link .tp-to::after { right: -1px; border-left: 6px solid var(--muted-foreground); border-right: 0; }
+.tp-link .tp-back { border-top: 2px solid var(--primary); }
+.tp-link .tp-back::after { left: -1px; top: -5px; border-right: 6px solid var(--primary); border-left: 0; }
+.tp-link .tp-reply { position: absolute; left: 0; right: 0; bottom: 2px; text-align: center; font-size: var(--ib-fs-10, 10px); font-weight: 600; color: var(--primary); white-space: nowrap; }
+@media (prefers-reduced-motion: no-preference) {
+  .tp-ret-draw { transform-origin: right center; animation: tp-draw 600ms 450ms ease-out both; }
+}
+@keyframes tp-draw { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.tp-down { display: none; }
+.tp-inbox { grid-column: 3; grid-row: 1 / span 3; }
+.tp-inbox { border-radius: 10px; background: var(--card); box-shadow: 0 0 0 1px var(--border); overflow: hidden; min-width: 0; }
+.tp-inbox .tp-ih { display: flex; align-items: center; gap: 6px; padding: 7px 10px; border-bottom: 1px solid var(--border); font-size: var(--ib-fs-11-5, 11.5px); font-weight: 650; }
+.tp-inbox .tp-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 4px 8px; padding: 8px 10px; font-size: var(--ib-fs-12, 12px); align-items: center; }
+.tp-inbox .tp-row + .tp-row { border-top: 1px solid var(--border); }
+.tp-inbox .tp-row .ib-mk { width: var(--ib-mark-16); height: var(--ib-mark-16); border-radius: var(--ib-mark-16-r); }
+.tp-inbox .tp-row .ib-mk > svg, .tp-inbox .tp-row .ib-mk > img { width: var(--ib-mark-16-g); height: var(--ib-mark-16-g); }
+.tp-inbox .tp-row b { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tp-inbox .tp-row .tp-c { color: var(--muted-foreground); font-size: var(--ib-fs-11, 11px); white-space: nowrap; }
+.tp-inbox .tp-row .tp-th { grid-column: 2; width: 74px; aspect-ratio: 16 / 10; object-fit: cover; object-position: top left; border-radius: 4px; box-shadow: 0 0 0 1px var(--border); }
+/* The tour's first card ("a fresh reminder"): the same words and picture, Show me. Below the tour bar, so Exit stays in reach. */
+.ib-tour-intro-scrim { position: fixed; inset: var(--ib-tour-bar-h, 45px) 0 0 0; display: grid; place-items: center; padding: 24px; background: color-mix(in oklch, var(--background) 55%, transparent); backdrop-filter: blur(2px); overflow: auto; }
+.ib-tour-intro { width: min(720px, 100%); border-radius: 14px; overflow: hidden; background: var(--popover); color: var(--popover-foreground); box-shadow: 0 0 0 1px color-mix(in oklch, var(--primary) 45%, var(--border)), var(--ib-float-shadow, 0 16px 40px -12px rgb(0 0 0 / 0.45)); }
+.ib-tour-intro .ib-ti-pic { padding: 22px 26px 10px; background: color-mix(in oklch, var(--primary) 6%, var(--muted)); border-bottom: 1px solid var(--border); }
+.ib-tour-intro .ib-ti-body { padding: 20px 26px 22px; font-size: var(--ib-fs-14, 14px); line-height: 1.55; }
+.pn-inbox .ib-tour-intro h2 { margin: 0 0 8px; font-size: var(--ib-fs-20, 20px); font-weight: 650; }
+.ib-tour-intro p { margin: 0 0 6px; color: var(--muted-foreground); }
+.ib-tour-intro .ib-ti-acts { display: flex; margin-top: 14px; }
+.ib-tour-intro .ib-ti-acts .ib-btn.ib-pri { height: 36px; padding: 0 18px; font-weight: 600; }
 .ib-te-card { display: flex; flex-direction: column; border-radius: 12px; background: var(--card); box-shadow: 0 0 0 1px var(--border), var(--card-shadow, none); overflow: hidden; }
 .ib-te-paths .ib-te-card { box-shadow: 0 0 0 1px color-mix(in oklch, var(--primary) 35%, var(--border)), var(--card-shadow, none); }
 .ib-te-pic { position: relative; aspect-ratio: 16 / 8; background: #111; overflow: hidden; }
@@ -4474,7 +4627,128 @@ dialog.ib-dm::backdrop { background: oklch(0 0 0 / 0.45); }
   .pn-inbox .ib-tour-viewer header .ib-iconbtn { width: 44px; height: 44px; }
   .ib-tour-viewer header .ib-mut { display: none; }
   .ib-tour-file .ib-tf-from { display: none; }
+  /* The picture stacks: your agents on top, the questions down and the reply up, then the Inbox card. */
+  .tp { grid-template-columns: minmax(0, 1fr); grid-template-rows: none; row-gap: 6px; }
+  .tp-win { grid-row: auto !important; min-height: 44px; }
+  .tp-link { display: none; }
+  .tp-down { display: flex; justify-content: center; gap: 28px; padding: 6px 0 4px; font-size: var(--ib-fs-11, 11px); font-weight: 600; }
+  .tp-down span { display: inline-flex; flex-direction: column; align-items: center; gap: 3px; }
+  .tp-down span::before { content: ""; width: 0; height: 22px; border-left: 1.5px solid var(--muted-foreground); }
+  .tp-dn { color: var(--muted-foreground); }
+  .tp-dn::before { border-image: none; }
+  .tp-up { color: var(--primary); }
+  .tp-up::before { border-left: 2px solid var(--primary) !important; }
+  .tp-inbox { grid-column: auto; grid-row: auto; }
+  .ib-te-fit .ib-te-fit-pic { padding: 14px 14px 10px; }
+  /* The tour's first card: a sheet under the tour bar, Show me full width and 44 px. */
+  .ib-tour-intro-scrim { padding: 0; place-items: stretch; }
+  .ib-tour-intro { width: 100%; border-radius: 0; display: flex; flex-direction: column; min-height: 100%; }
+  .ib-tour-intro .ib-ti-pic { padding: 16px 14px 10px; }
+  .ib-tour-intro .ib-ti-body { padding: 18px 18px calc(18px + env(safe-area-inset-bottom)); display: flex; flex-direction: column; flex: 1; }
+  .ib-tour-intro .ib-ti-acts { margin-top: auto; padding-top: 16px; }
+  .ib-tour-intro .ib-ti-acts .ib-btn.ib-pri { height: 44px; width: 100%; justify-content: center; }
 }
 /* The tour thread's controls that do nothing in the tour (Mark read, Archive, Reply): drawn quiet, still focusable, their tooltip says why. */
 .pn-inbox [data-tour-thread] button[aria-disabled="true"] { opacity: 0.45; cursor: default; }
 .pn-inbox [data-tour-thread] button[aria-disabled="true"]:hover { background: none; }
+
+/* ── Tour v2: the opener's picture, the closing card's list, the phrase it points at, replies' lines ── */
+.ib-tour-coach.ib-tc-wide { width: 380px; }
+.ib-tour-orient { display: grid; grid-template-columns: 92px minmax(0, 1fr); grid-template-rows: auto auto; gap: 6px; margin-top: 10px; padding: 8px; border-radius: 10px; background: var(--muted); font-size: var(--ib-fs-11-5, 11.5px); line-height: 1.3; }
+.ib-tour-orient .ib-to-side { grid-row: span 2; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 7px; background: var(--card); }
+.ib-tour-orient .ib-to-lbl { color: var(--muted-foreground); font-weight: 600; }
+.ib-tour-orient .ib-to-proj { display: flex; align-items: center; gap: 4px; padding: 3px 5px; border-radius: 5px; background: color-mix(in oklch, var(--primary) 12%, transparent); color: var(--foreground); font-weight: 550; }
+.ib-tour-orient .ib-to-list { min-width: 0; display: flex; flex-direction: column; gap: 3px; padding: 5px; border-radius: 7px; background: var(--card); }
+.ib-tour-orient .ib-to-row { display: flex; align-items: center; gap: 5px; min-width: 0; padding: 3px 5px; border-radius: 5px; }
+.ib-tour-orient .ib-to-row[data-on] { background: color-mix(in oklch, var(--primary) 10%, transparent); }
+.ib-tour-orient .ib-to-chip { flex: none; padding: 0 5px; border-radius: 999px; background: var(--muted); color: var(--muted-foreground); }
+.ib-tour-orient .ib-to-subj { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); font-weight: 550; }
+.ib-tour-orient .ib-to-mail { min-width: 0; display: flex; flex-direction: column; gap: 4px; padding: 6px; border-radius: 7px; background: var(--card); }
+.ib-tour-orient .ib-to-from { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.ib-tour-orient .ib-to-from .ib-mut { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ib-tour-orient .ib-to-line { height: 5px; border-radius: 3px; background: color-mix(in oklch, var(--muted-foreground) 30%, transparent); }
+.ib-tour-orient .ib-to-line.ib-short { width: 62%; }
+.ib-tour-orient .ib-to-tiles { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 2px; }
+.ib-tour-orient .ib-to-tile { max-width: 100%; box-sizing: border-box; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; display: inline-flex; align-items: center; gap: 3px; padding: 2px 5px; border-radius: 5px; border: 1px solid var(--border); color: var(--foreground); }
+.ib-tour-also { list-style: none; margin: 4px 0 0; padding: 0; display: grid; gap: 7px; }
+.ib-tour-also li { display: grid; grid-template-columns: 22px 1fr; gap: 2px 8px; font-size: var(--ib-fs-13, 13px); color: var(--muted-foreground); line-height: 1.4; }
+.ib-tour-also li b { color: var(--foreground); font-weight: 600; }
+.ib-tour-also li > span:first-child { grid-row: span 2; text-align: center; font-size: var(--ib-fs-14, 14px); }
+::highlight(ib-tour-phrase) { background-color: color-mix(in oklch, var(--primary) 22%, transparent); }
+.pn-inbox [data-tour-phrase-host] { scroll-margin: 80px; }
+.ib-tour-filenote { margin: 4px 0 0; font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); }
+.ib-tour-sentcomments { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 8px 0 2px; font-size: var(--ib-fs-13, 13px); color: var(--muted-foreground); }
+.ib-tour-moment { padding: 0 7px; border-radius: 999px; background: var(--muted); color: var(--foreground); }
+.pn-inbox .ib-tour-rbox .ib-rtext { width: 100%; box-sizing: border-box; border: 0; background: transparent; resize: none; padding: 10px 12px; color: var(--foreground); font: inherit; }
+.pn-inbox .ib-tour-rbox .ib-rtext:focus { outline: none; }
+.ib-tour-in-dialog { z-index: 5; }
+@media (max-width: 767px), (max-height: 500px) and (max-width: 1023px) and (pointer: coarse) {
+  .ib-tour-coach.ib-tc-wide { width: auto; }
+  .pn-inbox .ib-tour-coach .ib-tc-next { min-height: 44px; padding: 0 16px; }
+  .pn-inbox .ib-tour-coach .ib-tc-ff { min-height: 44px; padding: 0 12px; }
+}
+/* Full screen in the tour starts under the tour bar, so Exit tour and the file's own toolbar both stay in reach. */
+.pn-inbox[data-tour] .ib-view.ib-full { top: var(--ib-tour-bar-h, 45px); }
+
+/* Compose in the tour: the dialog is modal (the page under it is inert), so it carries its own copy of the tour bar
+   at the top of the window, and on a phone the sheet starts under it (the tour bar stays in view, Exit in reach). */
+.ib-tour-bar.ib-tour-bar-over { position: fixed; top: 0; left: 0; right: 0; z-index: 3; margin: 0; }
+/* The dialog's entrance moves it with a transform, which would carry the fixed bar (and the coach) with it: none in the tour. */
+.pn-inbox[data-tour] dialog.ib-cp[open] { animation: none; }
+@media (max-width: 767px), (max-height: 500px) and (max-width: 1023px) and (pointer: coarse) {
+  .pn-inbox[data-tour] dialog.ib-cp[data-phone] { top: var(--ib-tour-bar-h, 52px); height: calc(var(--ib-vvh, 100%) - var(--ib-tour-bar-h, 52px)); padding-top: 0; }
+}
+
+/* Settings → Prompts (design of record .product/approved/inbox-prompts-page/, #2194): the Inbox reminder, shared and per agent, then the plan, review and annotate prompts folded, read-only. */
+.pm-shared { padding: 14px 16px; }
+.pm-head { display: flex; align-items: center; gap: 8px; min-height: 28px; margin-bottom: 8px; }
+.pm-sp { flex: 1; }
+.pn-inbox .ib-chip.pm-custom { background: color-mix(in oklch, var(--primary) 12%, transparent); color: var(--primary); }
+.pm-text { margin: 0; font-family: var(--font-sans); font-size: var(--ib-fs-13-5, 13.5px); line-height: 1.6; color: var(--foreground); white-space: pre-wrap; overflow-wrap: anywhere; padding: 10px 12px; border-radius: var(--ib-rl-sm-s, 8px); background: color-mix(in oklch, var(--foreground) 5%, transparent); border: 1px solid transparent; }
+.pm-text.pm-faint { color: var(--muted-foreground); background: transparent; border: 1px dashed var(--border); }
+.pn-inbox .pm-area { display: block; width: 100%; box-sizing: border-box; min-height: 96px; resize: vertical; margin: 0; padding: 10px 12px; border-radius: var(--ib-rl-sm-s, 8px); border: 1px solid var(--border); background: var(--card); font: inherit; font-size: var(--ib-fs-13-5, 13.5px); line-height: 1.6; color: var(--foreground); }
+.pn-inbox .pm-area:focus-visible { outline: 2px solid var(--ring); outline-offset: 1px; border-color: transparent; }
+.pn-inbox .pm-area[aria-invalid="true"] { border-color: var(--destructive); }
+.pm-acts { display: flex; align-items: center; gap: 6px; margin-top: 8px; }
+.pm-count { font-size: var(--ib-fs-12, 12px); color: var(--muted-foreground); font-variant-numeric: tabular-nums; }
+.pm-count[data-over] { color: var(--destructive); }
+/* A config.json path outside the home folder can be long: it wraps, never runs off a phone's screen. */
+.pm-path { overflow-wrap: anywhere; }
+.pm-over { margin: 8px 0 0; font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); line-height: 1.45; }
+.pm-err { margin: 8px 0 0; font-size: var(--ib-fs-12-5, 12.5px); color: var(--destructive); line-height: 1.45; }
+.pn-inbox .pm-disc { display: inline-flex; align-items: center; gap: 4px; margin-top: 8px; padding: 2px 0; background: none; border: 0; font-size: var(--ib-fs-12-5, 12.5px); color: var(--muted-foreground); cursor: pointer; }
+.pn-inbox .pm-disc:hover { color: var(--foreground); }
+.pn-inbox .pm-disc svg.ib-ic { width: 13px; height: 13px; transition: transform 120ms ease-out; }
+.pm-disc[aria-expanded="true"] svg.ib-ic { transform: rotate(90deg); }
+.pm-disc + .pm-text { margin-top: 6px; }
+.pn-inbox .pm-ghost { color: var(--muted-foreground); }
+.pn-inbox .ib-btn.ib-ghost.pm-ghost:hover { background: var(--ib-fill, var(--muted)); color: var(--foreground); }
+.pm-ag { border-top: 1px solid var(--ib-sep-s, var(--ib-hair)); }
+.pm-ag .ib-prow { border-bottom: 0; min-height: 52px; padding-top: 9px; padding-bottom: 9px; }
+.pm-ag-body { padding: 0 16px 14px 60px; }
+.pn-inbox .pm-fold { display: flex; align-items: center; gap: 8px; width: 100%; padding: 13px 16px; background: none; border: 0; text-align: left; font-size: var(--ib-fs-14, 14px); color: var(--foreground); cursor: pointer; }
+.pn-inbox .pm-fold:hover { background: var(--ib-hover-s, color-mix(in oklch, var(--muted) 45%, transparent)); }
+.pm-fold .ib-mut { color: var(--muted-foreground); font-size: var(--ib-fs-12-5, 12.5px); }
+.pn-inbox .pm-fold svg.ib-ic { width: 14px; height: 14px; color: var(--muted-foreground); transition: transform 120ms ease-out; }
+.pm-fold[aria-expanded="true"] svg.ib-ic { transform: rotate(90deg); }
+.pm-osec { border-top: 1px solid var(--ib-sep-s, var(--ib-hair)); padding: 12px 16px 4px; }
+.pm-osec h3 { margin: 0 0 8px; font-size: var(--ib-fs-12-5, 12.5px); font-weight: 600; color: var(--muted-foreground); }
+.pm-oitem { padding: 0 0 14px; }
+.pm-ohead { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; font-size: var(--ib-fs-13-5, 13.5px); }
+.pm-ohead b { font-weight: 500; }
+.pm-ohead code { margin-left: auto; font-family: var(--font-mono); font-size: var(--ib-fs-11-5, 11.5px); color: var(--muted-foreground); }
+.pm-otext { margin: 0; font-family: var(--font-mono); font-size: var(--ib-fs-12, 12px); line-height: 1.6; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--foreground); padding: 9px 12px; border-radius: var(--ib-rl-sm-s, 8px); background: color-mix(in oklch, var(--foreground) 5%, transparent); }
+.pm-onote { font-size: var(--ib-fs-12, 12px); color: var(--muted-foreground); margin: 6px 0 0; }
+@media (prefers-reduced-motion: reduce) { .pm-disc svg.ib-ic, .pm-fold svg.ib-ic { transition: none; } }
+@media (max-width: 767px), (max-height: 500px) and (max-width: 1023px) and (pointer: coarse) {
+  .pm-shared { padding: 12px; }
+  .pm-ag-body { padding: 0 12px 12px; }
+  .pm-ag .ib-prow { padding-left: 12px; padding-right: 12px; flex-wrap: nowrap; }
+  .pm-ag .ib-prow .ib-txt { flex-basis: auto; }
+  .pn-inbox .pm-area { min-height: 180px; font-size: var(--ib-fs-16-in, 16px); }
+  .pm-ohead code { margin-left: 0; flex-basis: 100%; }
+  .pm-osec { padding: 12px 12px 4px; }
+  .pm-acts .ib-btn.ib-pri { flex: 1; justify-content: center; }
+  .pn-inbox .pm-disc, .pn-inbox .pm-fold { min-height: 44px; }
+  .pm-ag .ib-desc a { display: inline-flex; align-items: center; min-height: 44px; margin: -12px 0; }
+}
