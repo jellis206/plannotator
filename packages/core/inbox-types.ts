@@ -17,7 +17,7 @@
 import type { QuestionAnswer, QuestionKind } from "./question-block";
 import type { InboxAnnotationRecord, InboxAttachment, InboxAttachmentKind, InboxInlineImage } from "./inbox-attachments";
 import type { InboxDeliverNowBy, InboxRowDelivery } from "./inbox-delivery";
-import { INBOX_CARD_ACTION_ON, type InboxCard } from "./inbox-cards";
+import type { InboxCard } from "./inbox-cards";
 
 // The attachment shapes and file rules (step 2) live in their own module and
 // reach the Inbox through this published entry, so core's export map is unchanged.
@@ -1610,20 +1610,57 @@ export interface InboxAgentsModel {
 export type InboxToolHostId = "claude-code" | "pi" | "opencode";
 
 /**
+ * The runtime a polling session runs in, as the window names its fix: Claude
+ * Code, Pi, Oh My Pi (polls as host `pi`, says `plugin.host: "oh-my-pi"`), or
+ * OpenCode 2 (host `opencode`; OpenCode 1 does not poll).
+ */
+export type InboxReloadRuntime = "claude-code" | "pi" | "oh-my-pi" | "opencode";
+
+/**
  * A polling session runs an older Plannotator plugin than a restart would
- * load (`fix: "restart"`), or the installed plugin is itself behind this
- * Inbox's Plannotator, so a restart alone does not help (`fix:
- * "update_plugin"`; Pi: `"update_extension"`, `pi update --extensions` then
- * `/reload`). `loaded` is the version the session runs (null when its
- * connection predates reporting it), `installed` what a restart loads (Pi:
- * the Inbox's own version, which the extension should match).
+ * load (`fix: "restart"`, Claude Code), or the installed plugin is itself
+ * behind this Inbox's Plannotator, so a restart alone does not help (`fix:
+ * "update_plugin"`). Pi, Oh My Pi and OpenCode 2 (packages/server/inbox-restart.ts):
+ * `"reload"` when reloading the host loads newer code than the session runs
+ * (`reload_command`: Pi `/reload`, Oh My Pi `/restart`, OpenCode 2
+ * `opencode2 reload` or `opencode2 plugin update`), `"update_extension"` when
+ * the package on disk is itself behind this Inbox (`update_command`, then
+ * `reload_command`). `loaded` is the version the session runs (null when its
+ * connection predates reporting it), `installed` what a restart loads (Pi with
+ * an older connection: the Inbox's own version, which the extension should match).
  */
 export interface InboxSessionOutdated {
   loaded: string | null;
   installed: string | null;
-  fix: "restart" | "update_plugin" | "update_extension";
-  /** With `update_plugin`: the command that updates the plugin itself. */
+  fix: "restart" | "update_plugin" | "update_extension" | "reload";
+  /** With `update_plugin` / `update_extension`: the command that updates the plugin itself. */
   update_command?: string;
+  /** Which runtime the session runs in (absent from an older Inbox: Claude Code, or Pi for `update_extension`). */
+  runtime?: InboxReloadRuntime;
+  /** What loads the new code in that runtime: `/reload`, `/restart`, `opencode2 reload`. Absent for Claude Code (`/reload-plugins`). */
+  reload_command?: string;
+  /** Typed in the session (`/reload`, `/restart`) or run in a shell (`opencode2 reload`). */
+  reload_where?: "session" | "shell";
+  /** When the reload does not take: `opencode2 service restart`. */
+  fallback_command?: string;
+  /**
+   * OpenCode 2: the config pins this exact spec (`@plannotator/opencode@0.28.20`), so
+   * `opencode2 plugin update` does nothing: the person changes it to `pin_to`, then reloads.
+   */
+  pinned_spec?: string;
+  pin_to?: string;
+  /** OpenCode 2: `all` when the plugin's configured spec is unknown, so `opencode2 plugin update` names no target and updates every outdated plugin. */
+  update_scope?: "all";
+}
+
+/**
+ * The live sessions a reload alone brings up to date, per runtime: the
+ * sidebar's "Reload Claude Code N" ("Reload agents N" when more than one
+ * runtime has some). Additive beside `restart_claude_code`.
+ */
+export interface InboxRestartAgents {
+  total: number;
+  runtimes: Partial<Record<InboxReloadRuntime, number>>;
 }
 
 /** One open session as Settings → Agents lists it. */
@@ -1640,6 +1677,8 @@ export interface InboxOpenSession {
   outdated: InboxSessionOutdated | null;
   /** `cd <folder> && claude --resume <session>` (Claude Code, with a known folder); null otherwise. */
   restart_command: string | null;
+  /** The runtime it runs in (Pi's group holds Oh My Pi sessions too). Absent from an older Inbox. */
+  runtime?: InboxReloadRuntime;
 }
 
 export interface InboxHostSessions {
@@ -1695,8 +1734,21 @@ export type InboxToolCostHost = "pi" | "opencode";
  * the cost test: 8,701 → 8,841 bytes (+140; about +30 tokens, so the rounded
  * token figure stands). So 8,841 without the card action and 9,957 with it
  * (9,817 + 140, estimated).
+ * The Board's step 2 switched the card action on (INBOX_CARD_ACTION_ON), with
+ * its `ref` argument and the Backlog wording: measured on Pi with the cost
+ * test, 10,131 bytes; tokens scaled from the last o200k_base count (2,086 for
+ * 8,701 bytes, so about 2,430) and stated high, as always. The review then let
+ * `column` take `asked` (the old name of backlog, listed in the schema and
+ * its description): measured again, 10,171 bytes (+40).
+ * Then the Board became something the person turns on (config.json
+ * `inboxBoard`, off by default; approval "inbox-board" 2026-10-26): an Inbox
+ * lists `card` only while it is on, so what a user gets by default is the
+ * entry WITHOUT `card`, and that is the stated cost. With the Board on it is
+ * the 10,171 bytes above.
  */
-const INBOX_TOOL_COST_NOW = INBOX_CARD_ACTION_ON ? { bytes: 9957, tokens: 2800 } : { bytes: 8841, tokens: 2500 };
+const INBOX_TOOL_COST_NOW = { bytes: 8841, tokens: 2500 };
+/** The entry with the Board on (the `card` action listed): for the switch's words, measured on Pi. */
+export const INBOX_TOOL_COST_WITH_BOARD = { bytes: 10171, tokens: 2900 } as const;
 export const INBOX_TOOL_COST: Readonly<Record<InboxToolCostHost, { bytes: number; tokens: number }>> = {
   pi: INBOX_TOOL_COST_NOW,
   opencode: INBOX_TOOL_COST_NOW,

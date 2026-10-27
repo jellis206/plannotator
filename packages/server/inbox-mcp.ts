@@ -16,6 +16,7 @@ import { isAbsolute } from "node:path";
 import { McpServer } from "@modelcontextprotocol/server";
 import * as z from "zod";
 import { QUESTION_AUTHORING_GUIDE } from "@plannotator/core/question-block";
+import { inboxQuestionKeysWithRecommendedMarker } from "@plannotator/core/inbox-questions";
 import { INBOX_ACTION_EXAMPLE, INBOX_ACTION_GUIDE, INBOX_DONE_DESCRIPTION } from "@plannotator/core/inbox-actions";
 import { checkInboxSubject, INBOX_CARD_ACTION_ON, inboxAgentName, INBOX_NAME_THIS_THREAD_HINT, INBOX_SECTIONS, isInboxNote, INBOX_THREAD_NAME_MAX, type InboxGuideRef, type InboxSectionId, type InboxLine, type InboxMessage, type InboxProject } from "@plannotator/core/inbox-types";
 import { INBOX_WAKES_META_KEY, inboxTaggedLine } from "@plannotator/shared/inbox/connection";
@@ -30,6 +31,7 @@ import { registerInboxGuideTools } from "./inbox-guides";
 import { INBOX_BODY_CUT_BYTES, INBOX_EARLIER_PERSON_BYTES, INBOX_THREAD_WINDOW, clip, questionWords, shortTime, sizeText, windowedThread, windowedThreadText } from "./inbox-mcp-read";
 import { registerInboxSearchTool } from "./inbox-mcp-search";
 import { registerInboxCardTool } from "./inbox-mcp-cards";
+export { INBOX_BOARD_OFF_TEXT } from "./inbox-mcp-cards";
 import { fail, guarded, ok, okComplete, PROJECT_PATH_DESCRIPTION, TEXT_COMPLETE_META, type ToolResult } from "./inbox-mcp-result";
 
 // The result helpers live in inbox-mcp-result.ts (no import cycle for the tool modules); re-exported for older importers.
@@ -43,8 +45,19 @@ export const INBOX_WAIT_MAX_SECONDS = 50;
 
 export const INBOX_MCP_TOOLS = ["send_message", "read_thread", "search", "resolve_message", "wait_for_reply", "get_guide_brief", "submit_guide", "card"] as const;
 
-/** The tools this Inbox serves: every one, except `card` while INBOX_CARD_ACTION_ON holds it back. */
+/**
+ * The tools this Inbox serves with the Board on: every one, except `card`
+ * while INBOX_CARD_ACTION_ON holds it back in the code.
+ */
 export const INBOX_SERVED_TOOLS: readonly (typeof INBOX_MCP_TOOLS)[number][] = INBOX_MCP_TOOLS.filter((name) => name !== "card" || INBOX_CARD_ACTION_ON);
+
+/**
+ * The tools an Inbox serves by default: the Board is off until the person
+ * turns it on (config.json `inboxBoard`, approval "inbox-board" 2026-10-26),
+ * so `card` is not in its tools/list.
+ */
+export const INBOX_DEFAULT_SERVED_TOOLS: readonly (typeof INBOX_MCP_TOOLS)[number][] = INBOX_SERVED_TOOLS.filter((name) => name !== "card");
+
 
 /** Under Claude Code's 2,048-character cap on server instructions. */
 export const INBOX_MCP_INSTRUCTIONS = [
@@ -236,6 +249,13 @@ export interface InboxMcpContext {
    * Absent: only a caller's own connection wakes it (`callerWakes`).
    */
   sessionWakes?: (host: unknown, session: unknown, meta: unknown) => Promise<boolean>;
+  /**
+   * Whether the Board is on (config.json `inboxBoard`, read on every
+   * request). Off: `card` is not in tools/list, and a call (from a session
+   * that listed it while it was on) gets `board_off` with nothing written.
+   * Absent: on, as before the switch.
+   */
+  boardOn?: () => boolean;
 }
 
 
@@ -621,6 +641,20 @@ export function noStakesText(count: number): string {
     : ` ${count} questions you are stopped or held up on have no \`Stakes:\` line; next time add one to each (what the choice affects, one sentence) so the person can decide in one look.`;
 }
 
+/**
+ * The send tools' nudge for a question that marks its recommendation inside
+ * a choice label (`- [ ] Foo (Recommended)`, the AskUserQuestion habit) with
+ * no `Recommended:` line. The card reads one marked choice as the
+ * recommendation, but two on a pick-one question name none, so the agent is
+ * told the grammar. Never a refusal. "" when there is none.
+ */
+export function recommendedInLabelText(count: number): string {
+  if (count <= 0) return "";
+  return count === 1
+    ? " 1 question marks its recommendation inside a choice label; next time mark it only with `Recommended: <label>` on its own line after the choices, and keep labels plain."
+    : ` ${count} questions mark their recommendation inside a choice label; next time mark each only with \`Recommended: <label>\` on its own line after the choices, and keep labels plain.`;
+}
+
 /** A message id (`msg_` and a 26-character ULID), as an agent might pass one as `thread` by mistake. */
 const MESSAGE_ID_SHAPE = /^msg_[0-9A-HJKMNP-TV-Z]{26}$/i;
 
@@ -664,7 +698,7 @@ export async function sendAgentMessage(
   input: AgentSendInput,
   guide?: InboxGuideRef,
   wakes = false,
-): Promise<{ structured: Record<string, unknown>; replayed: boolean; questions: number; attachments: number; superseded: number; actions: number; done: number; imagesNotShown: ImageNotShown[]; noStakes: number; naming: InboxSendResult["naming"] | null }> {
+): Promise<{ structured: Record<string, unknown>; replayed: boolean; questions: number; attachments: number; superseded: number; actions: number; done: number; imagesNotShown: ImageNotShown[]; noStakes: number; recommendedInLabel: number; naming: InboxSendResult["naming"] | null }> {
   const { store } = context;
   refuseIdShapedThread(input.thread, input.reply_to);
   refuseBadSubject(input.subject);
@@ -731,9 +765,13 @@ export async function sendAgentMessage(
   const noStakes = (message.questions ?? [])
     .filter((q) => q.kind !== "action" && (q.stopped !== null || q.holds_up.length > 0) && !q.stakes)
     .map((q) => q.key);
+  // A question written with a recommended marker in a choice label (read
+  // by the parser or not, with or without a `Recommended:` line).
+  const recommendedInLabel = inboxQuestionKeysWithRecommendedMarker(message.body);
   return {
     imagesNotShown: notShown,
     noStakes: noStakes.length,
+    recommendedInLabel: recommendedInLabel.length,
     superseded: superseded.length,
     actions: actions.length,
     done: markedDone.length,
@@ -768,6 +806,8 @@ export async function sendAgentMessage(
       ...(notShown.length > IMAGES_NOT_SHOWN_MAX ? { images_not_shown_more: notShown.length - IMAGES_NOT_SHOWN_MAX } : {}),
       /** Keys of the Stopped / Holds up questions with no `Stakes:` line (a nudge; the message was sent). */
       ...(noStakes.length > 0 ? { no_stakes: noStakes } : {}),
+      /** Keys of the questions that marked their recommendation in a choice label, not a `Recommended:` line (a nudge; the message was sent). */
+      ...(recommendedInLabel.length > 0 ? { recommended_in_label: recommendedInLabel } : {}),
     },
   };
 }
@@ -942,8 +982,14 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
           (sent.actions > 0 ? `${sent.questions > 0 ? " and" : " with"} ${sent.actions} action item${sent.actions === 1 ? "" : "s"}` : "") +
           supersededWords(sent.structured.superseded as string[]) +
           (sent.done > 0 ? `, marking ${sent.done} action item${sent.done === 1 ? "" : "s"} done` : "");
+        // The hints after the sent line, in this order, each "" when it has nothing to say.
+        const hints = [
+          imagesNotShownText(sent.imagesNotShown),
+          noStakesText(sent.noStakes),
+          recommendedInLabelText(sent.recommendedInLabel),
+        ];
         return ok(
-          `${sent.replayed ? "Already sent" : "Sent"} to the Plannotator Inbox${asked} (thread ${sent.structured.thread_id}, ${sent.structured.url}).${namingLine(sent.naming)} ${wakes ? INBOX_REPLY_ARRIVES_TEXT : INBOX_REPLY_WAITS_TEXT}${imagesNotShownText(sent.imagesNotShown)}${noStakesText(sent.noStakes)}`,
+          `${sent.replayed ? "Already sent" : "Sent"} to the Plannotator Inbox${asked} (thread ${sent.structured.thread_id}, ${sent.structured.url}).${namingLine(sent.naming)} ${wakes ? INBOX_REPLY_ARRIVES_TEXT : INBOX_REPLY_WAITS_TEXT}${hints.join("")}`,
           sent.structured,
         );
       }),
@@ -1225,8 +1271,9 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
   // Guided reviews (step 5): packages/server/inbox-guides.ts.
   registerInboxGuideTools(server, context);
 
-  // The Board's cards (approval "inbox-board"): packages/server/inbox-mcp-cards.ts. Held back with INBOX_CARD_ACTION_ON.
-  if (INBOX_CARD_ACTION_ON) registerInboxCardTool(server, context);
+  // The Board's cards (approval "inbox-board"): packages/server/inbox-mcp-cards.ts. Held back in the code with
+  // INBOX_CARD_ACTION_ON, and served only while the person has the Board on (the server is made per request).
+  if (INBOX_CARD_ACTION_ON && (context.boardOn?.() ?? true)) registerInboxCardTool(server, context);
 
   return server;
 }
