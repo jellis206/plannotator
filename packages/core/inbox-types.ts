@@ -17,8 +17,8 @@
 import type { QuestionAnswer, QuestionKind } from "./question-block";
 import type { InboxAnnotationRecord, InboxAttachment, InboxAttachmentKind, InboxInlineImage } from "./inbox-attachments";
 import type { InboxDeliverNowBy, InboxRowDelivery } from "./inbox-delivery";
-import type { InboxRowRun } from "./inbox-acp";
 import type { InboxCard } from "./inbox-cards";
+import type { InboxTidyMark } from "./inbox-tidy";
 import { INBOX_CODEX_QUEUE_MIN_VERSION } from "./inbox-codex";
 import { INBOX_QWEN_WAKE_MIN_VERSION } from "./inbox-qwen";
 
@@ -33,6 +33,8 @@ export * from "./inbox-qwen";
 export * from "./inbox-cards";
 // The surface bridge's messages (the phone, PLAN step S1), the same way.
 export * from "./inbox-surface-bridge";
+// Tidy (the list header's and the Board's ⋮ menu), the same way.
+export * from "./inbox-tidy";
 
 /** Every record and line carries this version. Fields are only ever added. */
 export const INBOX_RECORD_VERSION = 1 as const;
@@ -60,7 +62,7 @@ export function ulid(now: number = Date.now()): string {
 }
 
 /** `upl`: a file the person uploaded for a message; `drf`: a draft of one (compose); `crd`: a Board card. */
-export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev" | "upl" | "drf" | "crd" | "run";
+export type InboxIdPrefix = "msg" | "prj" | "ses" | "dec" | "dev" | "upl" | "drf" | "crd" | "tdy";
 
 export function inboxId(prefix: InboxIdPrefix, now?: number): string {
   return `${prefix}_${ulid(now)}`;
@@ -77,8 +79,8 @@ const ID_RE: Record<InboxIdPrefix, RegExp> = {
   drf: /^drf_[0-9A-HJKMNP-TV-Z]{26}$/,
   /** A Board card (approval "inbox-board"). */
   crd: /^crd_[0-9A-HJKMNP-TV-Z]{26}$/,
-  /** A session the Inbox runs itself over ACP (packages/server/inbox-acp-runner.ts): its agent session id. */
-  run: /^run_[0-9A-HJKMNP-TV-Z]{26}$/,
+  /** One press of Tidy (packages/core/inbox-tidy.ts). */
+  tdy: /^tdy_[0-9A-HJKMNP-TV-Z]{26}$/,
 };
 
 export function isInboxId(prefix: InboxIdPrefix, value: unknown): value is string {
@@ -231,7 +233,8 @@ export type InboxAuthor =
 /**
  * One of the Inbox's own notes to the asking agent: Mark read's set-aside
  * note (`set_aside`), a late Undo's reopened note (`reopened`), or the note
- * that carries a 👍 Looks good to the agent (`ack_of`). They are stored as
+ * that carries a 👍 Looks good to the agent (`ack_of`), or a Tidy note
+ * (`tidy`). They are stored as
  * the person's messages so they reach the agent like any reply, but they are
  * not the person's reply and not a look: the list's `sent`, `unseen`, the
  * look boundary and "came back" all read past them.
@@ -241,10 +244,14 @@ export function isInboxNote(message: {
   set_aside?: readonly string[] | null;
   reopened?: readonly string[] | null;
   ack_of?: string | null;
+  tidy?: InboxTidyMark | null;
 }): boolean {
   return (
     message.author.kind === "person" &&
-    ((message.set_aside?.length ?? 0) > 0 || (message.reopened?.length ?? 0) > 0 || (typeof message.ack_of === "string" && message.ack_of !== ""))
+    ((message.set_aside?.length ?? 0) > 0 ||
+      (message.reopened?.length ?? 0) > 0 ||
+      (typeof message.ack_of === "string" && message.ack_of !== "") ||
+      (typeof message.tidy === "object" && message.tidy !== null))
   );
 }
 
@@ -266,6 +273,7 @@ export const INBOX_HOST_NAMES: Readonly<Record<string, string>> = {
   opencode: "OpenCode",
   codex: "Codex",
   cursor: "Cursor",
+  // Threads the Inbox's Grok Build runner wrote (0.28.34 to 0.28.36; removed) keep their author's name.
   grok: "Grok Build",
   qwen: "Qwen Code",
 };
@@ -369,6 +377,13 @@ export interface InboxMessage {
    * but not sent go with it as answers. Absent on every other message.
    */
   reask?: string[];
+  /**
+   * On a Tidy note (the person's Tidy, 2026-10-28): its run, and whether it
+   * is the one note of its session that carries the wake (`wake`; the others
+   * only show in their threads and are never delivered). An Inbox note: the
+   * row never moves for it. Absent on every other message.
+   */
+  tidy?: InboxTidyMark;
   /**
    * On a root: the seq up to which the asking agent has read the person's
    * replies (wait_for_reply returned one, or read_thread read the thread),
@@ -547,6 +562,30 @@ export interface InboxMessage {
    * agent's read. Absent on every other message and on older records.
    */
   tags?: InboxTag[];
+  /**
+   * On a person's reply that handed the thread to another session (the reply
+   * box's "Hand off instead", approval "inbox-tag-handoff", option A2): the
+   * reply's `to` is the new owner, and every later reply in the thread goes
+   * to it. `from` is the session that owned the thread before (it gets a
+   * notice: a tag with `handed_away`). Held for the Undo window: nobody is
+   * handed the reply until `settled_at` is set. `undone_at`: the person took
+   * the hand-off back inside that window; the reply then went as an Ask (a
+   * tag) and no longer moves the thread. Absent on every other message.
+   */
+  handoff?: InboxHandoff | null;
+}
+
+/** A hand-off a person's reply carries (`InboxMessage.handoff`). */
+export interface InboxHandoff {
+  /** The session that owned the thread before; null when there was none. */
+  from: { host: string | null; session: string } | null;
+  /** The readable label the person picked for the new owner ("Claude Code (herdr)"). */
+  label?: string | null;
+  at: string;
+  /** The Undo window passed: the new owner and the former one are handed it. */
+  settled_at?: string | null;
+  /** Taken back inside the Undo window: the reply went as an Ask instead. */
+  undone_at?: string | null;
 }
 
 /**
@@ -583,6 +622,19 @@ export interface InboxTag {
   wait_started_at?: string | null;
   /** A session that is not woken read the thread with read_thread after the tag (its own read only). */
   read_at?: string | null;
+  /**
+   * "Add instead" (approval "inbox-tag-handoff", A2): the person added this
+   * session to the thread. It works alongside the owner, and every later
+   * reply of the person's in the thread goes to it too (the store tags it
+   * again). Absent: an Ask, today's tag (this one message only).
+   */
+  joined?: boolean;
+  /**
+   * The former owner's notice on a hand-off reply (`InboxMessage.handoff`):
+   * this session is told the thread moved and to stop work on it. Absent on
+   * every other tag.
+   */
+  handed_away?: boolean;
 }
 
 /** The most sessions one reply may tag. */
@@ -1195,13 +1247,6 @@ export interface InboxListRow extends InboxThreadSummary {
    * reads. Additive: absent from an older Inbox.
    */
   pinned_at?: string | null;
-  /**
-   * A session the Inbox runs over ACP works in this thread, or waits on a
-   * permission (packages/server/inbox-acp-runner.ts). Only on the list model
-   * the window and the phone read, never on anything an agent reads.
-   * Additive: absent from an older Inbox.
-   */
-  run?: InboxRowRun | null;
 
   /**
    * Agent messages after the person's last look (a reply of theirs counts as
@@ -1959,6 +2004,9 @@ export function inboxNoteAgentList(ids: readonly InboxNoteAgentId[]): string {
 }
 
 // ─────────────── Compose: a new thread the person starts with a live agent ───────────────
+
+/** The most one uploaded file may hold (decision 1a: under the Inbox's 128 MiB request bound). The window names it too. */
+export const INBOX_UPLOAD_MAX_BYTES = 100 * 1024 * 1024;
 
 /**
  * A file the person uploaded from the window for a thread they start, not

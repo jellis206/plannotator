@@ -42,6 +42,16 @@ const GraphvizBlock = lazy(async () => ({ default: (await import('./GraphvizBloc
 /** ```html and ```svg fences drawn, for a host that opts in (`htmlEmbeds`); loaded only then. */
 const HtmlEmbedBlock = lazy(async () => ({ default: (await import('./html-embed/HtmlEmbedBlock')).HtmlEmbedBlock }));
 const SvgFenceBlock = lazy(async () => ({ default: (await import('./html-embed/SvgFenceBlock')).SvgFenceBlock }));
+/**
+ * Each lazy block sits in a `LazyBlockBoundary`: when its chunk cannot load,
+ * the block shows its source and a Reload notice, and the document stays.
+ */
+const embedFallback = (block: Block) => (notice: React.ReactNode) => (
+  <div className="my-5 [&>[data-block-id]]:my-0">
+    {notice}
+    <CodeBlock block={block} isHovered={false} />
+  </div>
+);
 
 // Debug error boundary to catch silent toolbar crashes
 class ToolbarErrorBoundary extends React.Component<
@@ -67,6 +77,7 @@ import { AttachmentsButton } from './AttachmentsButton';
 import { MessagesIcon } from './icons/MessagesIcon';
 import { DiagramAnchorClaims, DiagramAnchorClaimsContext } from './diagram/anchorClaims';
 import { DiagramBlockPending } from './diagram/DiagramPending';
+import { LazyBlockBoundary } from './LazyBlockBoundary';
 import { isGraphvizLanguage, isMermaidLanguage } from './diagramLanguages';
 import { isHtmlEmbedLanguage, isSvgFenceLanguage } from './html-embed/languages';
 import type { HtmlEmbedHost } from './html-embed/HtmlEmbedBlock';
@@ -309,6 +320,10 @@ export interface ViewerProps {
   /** A small label over each picture tile's picture (see `QuestionBlock`
    *  `pictureBadge`); absent: none. */
   questionPictureBadge?: (choice: { label: string; image: { alt: string; src: string } }) => string | null;
+  /** A picture tile's zoom, told its question's key and the choice's index (see
+   *  `QuestionBlock` `onZoomChoice`). Absent: the zoom opens the picture
+   *  through `onImageClick`, as before. */
+  onQuestionPictureZoom?: (key: string, index: number, url: string, alt: string) => void;
   /** Makes a question's "Records a decision" tag a toggle button
    *  (`aria-pressed`); a click calls this with the question's key and the
    *  next state, which the host stores and returns from
@@ -448,6 +463,9 @@ export interface ViewerHandle {
   removeHighlight: (id: string) => void;
   clearAllHighlights: () => void;
   applySharedAnnotations: (annotations: Annotation[]) => void;
+  /** Markdown `Viewer` only: scroll a heading anchor (`#id`) into view.
+   *  Returns false when it is not in this document. */
+  scrollToAnchor?: (hash: string) => boolean;
   /** `HtmlViewer` only: move a pinned draft to the element around it
    *  (`'parent'`) or back in (`'child'`), for a host that composes
    *  (`onHostDraft`). The markdown `Viewer` does not implement it. */
@@ -819,6 +837,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
   questionContractLines = false,
   questionPictureChoices = true,
   questionPictureBadge,
+  onQuestionPictureZoom,
   onToggleQuestionDecisionRecording,
   onOpenQuestionDecision,
   questionDecisionLocked,
@@ -1315,8 +1334,8 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     const container = containerRef.current;
     if (!container || !scrollViewport) return false;
 
-    const target = document.getElementById(anchor);
-    if (!target || !container.contains(target)) return false;
+    const target = container.querySelector<HTMLElement>(`#${CSS.escape(anchor)}`);
+    if (!target) return false;
 
     const documentHeader = stickyActions
       ? container.querySelector<HTMLElement>('[data-viewer-document-header]')
@@ -1374,6 +1393,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
 
   // Imperative handle — delegates to hook, extends removeHighlight for code blocks
   useImperativeHandle(ref, () => ({
+    scrollToAnchor,
     removeHighlight: (id: string) => {
       // The re-highlight below notifies the swap listener, which would happily
       // paint this annotation's mark straight back in — the host has not
@@ -1401,7 +1421,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
     clearAllHighlights,
     applySharedAnnotations: applyAnnotations,
     takeSelection,
-  }), [hookRemoveHighlight, clearAllHighlights, applyAnnotations, blocks, takeSelection]);
+  }), [hookRemoveHighlight, clearAllHighlights, applyAnnotations, blocks, takeSelection, scrollToAnchor]);
 
   // --- Viewer-specific: code block annotation ---
 
@@ -1801,41 +1821,49 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
               );
             })()
           ) : htmlEmbeds && group.block.type === 'code' && isHtmlEmbedLanguage(group.block.language) ? (
-            <Suspense key={group.block.id} fallback={<CodeBlock block={group.block} isHovered={false} />}>
-              <HtmlEmbedBlock block={group.block} host={htmlEmbeds} />
-            </Suspense>
+            <LazyBlockBoundary key={group.block.id} fallback={embedFallback(group.block)}>
+              <Suspense fallback={<CodeBlock block={group.block} isHovered={false} />}>
+                <HtmlEmbedBlock block={group.block} host={htmlEmbeds} />
+              </Suspense>
+            </LazyBlockBoundary>
           ) : htmlEmbeds && group.block.type === 'code' && isSvgFenceLanguage(group.block.language) ? (
-            <Suspense key={group.block.id} fallback={<CodeBlock block={group.block} isHovered={false} />}>
-              <SvgFenceBlock block={group.block} />
-            </Suspense>
+            <LazyBlockBoundary key={group.block.id} fallback={embedFallback(group.block)}>
+              <Suspense fallback={<CodeBlock block={group.block} isHovered={false} />}>
+                <SvgFenceBlock block={group.block} />
+              </Suspense>
+            </LazyBlockBoundary>
           ) : group.block.type === 'code' && isMermaidLanguage(group.block.language) ? (
-            <Suspense key={group.block.id} fallback={<DiagramBlockPending block={group.block} kind="mermaid" />}>
-              <MermaidBlock
-                block={group.block}
-                annotations={annotations}
-                selectedAnnotationId={selectedAnnotationId}
-                onSelectAnnotation={onSelectAnnotation}
-                onAddAnnotation={authoringOff ? undefined : onAddAnnotation}
-                readOnly={authoringOff}
-                onRestoreReport={onRestoreReport}
-                onAskAI={authoringOff ? undefined : onAskAI}
-                askAISourcePath={linkedDocInfo?.filepath ?? sourceInfo}
-              />
-            </Suspense>
+            <LazyBlockBoundary key={group.block.id} fallback={(notice) => <DiagramBlockPending block={group.block} kind="mermaid" notice={notice} />}>
+              <Suspense fallback={<DiagramBlockPending block={group.block} kind="mermaid" />}>
+                <MermaidBlock
+                  block={group.block}
+                  annotations={annotations}
+                  selectedAnnotationId={selectedAnnotationId}
+                  onSelectAnnotation={onSelectAnnotation}
+                  onAddAnnotation={authoringOff ? undefined : onAddAnnotation}
+                  readOnly={authoringOff}
+                  onRestoreReport={onRestoreReport}
+                  onAskAI={authoringOff ? undefined : onAskAI}
+                  askAISourcePath={linkedDocInfo?.filepath ?? sourceInfo}
+                />
+              </Suspense>
+            </LazyBlockBoundary>
           ) : group.block.type === 'code' && isGraphvizLanguage(group.block.language) ? (
-            <Suspense key={group.block.id} fallback={<DiagramBlockPending block={group.block} kind="graphviz" />}>
-              <GraphvizBlock
-                block={group.block}
-                annotations={annotations}
-                selectedAnnotationId={selectedAnnotationId}
-                onSelectAnnotation={onSelectAnnotation}
-                onAddAnnotation={authoringOff ? undefined : onAddAnnotation}
-                readOnly={authoringOff}
-                onRestoreReport={onRestoreReport}
-                onAskAI={authoringOff ? undefined : onAskAI}
-                askAISourcePath={linkedDocInfo?.filepath ?? sourceInfo}
-              />
-            </Suspense>
+            <LazyBlockBoundary key={group.block.id} fallback={(notice) => <DiagramBlockPending block={group.block} kind="graphviz" notice={notice} />}>
+              <Suspense fallback={<DiagramBlockPending block={group.block} kind="graphviz" />}>
+                <GraphvizBlock
+                  block={group.block}
+                  annotations={annotations}
+                  selectedAnnotationId={selectedAnnotationId}
+                  onSelectAnnotation={onSelectAnnotation}
+                  onAddAnnotation={authoringOff ? undefined : onAddAnnotation}
+                  readOnly={authoringOff}
+                  onRestoreReport={onRestoreReport}
+                  onAskAI={authoringOff ? undefined : onAskAI}
+                  askAISourcePath={linkedDocInfo?.filepath ?? sourceInfo}
+                />
+              </Suspense>
+            </LazyBlockBoundary>
           ) : group.block.type === 'table' ? (
             <TableBlock
               key={group.block.id}
@@ -1957,6 +1985,7 @@ export const Viewer = forwardRef<ViewerHandle, ViewerProps>(({
                   questionContractLines={questionContractLines}
                   questionPictureChoices={questionPictureChoices}
                   questionPictureBadge={questionPictureBadge}
+                  onQuestionPictureZoom={onQuestionPictureZoom}
                 />
               );
               // `textComments`: a question card's words are not commented on

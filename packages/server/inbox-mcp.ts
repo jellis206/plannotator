@@ -18,8 +18,8 @@ import * as z from "zod";
 import { QUESTION_AUTHORING_GUIDE } from "@plannotator/core/question-block";
 import { inboxQuestionKeysWithRecommendedMarker } from "@plannotator/core/inbox-questions";
 import { INBOX_ACTION_EXAMPLE, INBOX_ACTION_GUIDE, INBOX_DONE_DESCRIPTION } from "@plannotator/core/inbox-actions";
-import { checkInboxSubject, INBOX_CARD_ACTION_ON, inboxAgentName, INBOX_NAME_THIS_THREAD_HINT, INBOX_SECTIONS, isInboxNote, INBOX_THREAD_NAME_MAX, type InboxGuideRef, type InboxSectionId, type InboxLine, type InboxMessage, type InboxProject } from "@plannotator/core/inbox-types";
-import { INBOX_AGENT_RULES, INBOX_PEEK_META_KEY, INBOX_REF_LINK_RULE, INBOX_REPLY_TO_CHECK, INBOX_WAKES_META_KEY, inboxTaggedLine } from "@plannotator/shared/inbox/connection";
+import { checkInboxSubject, INBOX_CARD_ACTION_ON, INBOX_HOST_NAMES, inboxAgentName, inboxTidyMcpLine, INBOX_NAME_THIS_THREAD_HINT, INBOX_SECTIONS, isInboxNote, INBOX_THREAD_NAME_MAX, type InboxGuideRef, type InboxSectionId, type InboxLine, type InboxMessage, type InboxProject } from "@plannotator/core/inbox-types";
+import { INBOX_AGENT_RULES, INBOX_PEEK_META_KEY, INBOX_REF_LINK_RULE, INBOX_REPLY_TO_CHECK, INBOX_WAKES_META_KEY, inboxHandedAwayLine, inboxTaggedLine } from "@plannotator/shared/inbox/connection";
 import { inboxBodyForAgent } from "@plannotator/shared/inbox/uploads";
 import { inboxSectionOf } from "@plannotator/shared/inbox/list";
 import { bodyShowsLocalImages, captureInboxInlineImages, type InlineImageFailure } from "@plannotator/shared/inbox/inline-images";
@@ -296,6 +296,31 @@ export async function senderWakes(context: Pick<InboxMcpContext, "sessionWakes">
   return context.sessionWakes(input.agent_host?.trim(), input.agent_session?.trim(), meta).catch(() => false);
 }
 
+/**
+ * Tidy for a session no connection wakes (MCP only): its wake note, once, at
+ * the end of its next Inbox tool result (delivered then). A session that is
+ * woken gets it from its connection when its turn ends instead.
+ */
+async function withTidy(context: InboxMcpContext, result: ToolResult, input: Record<string, unknown>, ctx: unknown): Promise<ToolResult> {
+  const session = typeof input?.agent_session === "string" ? input.agent_session.trim() : "";
+  if (!session || result.isError) return result;
+  const note = context.store.pendingReplies(session).find((m) => m.tidy?.wake);
+  if (!note) return result;
+  const host = typeof input.agent_host === "string" ? input.agent_host : undefined;
+  if (await senderWakes(context, ctx, { agent_host: host, agent_session: session })) return result;
+  try {
+    context.store.recordDelivery(note.id, { host: note.to?.host ?? host ?? "agent", session });
+  } catch {
+    return result;
+  }
+  const tidy = `\n\n${inboxTidyMcpLine(note.id)}\n\n${note.body}`;
+  const content = [...result.content];
+  const last = content.length - 1;
+  if (last >= 0) content[last] = { ...content[last]!, text: `${content[last]!.text}${tidy}` };
+  else content.push({ type: "text", text: tidy.trimStart() });
+  return { ...result, content, ...(result.structuredContent ? { structuredContent: { ...result.structuredContent, tidy: { id: note.id, text: note.body } } } : {}) };
+}
+
 /** The send tools' last sentence for a caller whose reply arrives by itself. */
 export const INBOX_REPLY_ARRIVES_TEXT =
   "The person's reply arrives in this session by itself, as a new message once the session is idle: end your turn, or go on with other work; do not call wait_for_reply.";
@@ -406,6 +431,23 @@ function replyResult(store: InboxStore, reply: InboxMessage, base: string, calle
   // The agent now has this reply (not any later one): a Sent row moves to Quiet.
   // Not for a session only tagged here: its read must not settle what the owner still waits for.
   if (!store.isTaggedGuest(reply.thread_id, caller)) store.markAgentChecked(reply.thread_id, cursor);
+  // The former owner of a handed-off thread (approval "inbox-tag-handoff"): the stop notice alone, never the
+  // person's words, as its bridge command (`replyCommand` in inbox.ts) carries it.
+  if (tag?.handed_away) {
+    const to = reply.to?.host && Object.hasOwn(INBOX_HOST_NAMES, reply.to.host) ? INBOX_HOST_NAMES[reply.to.host]! : "another agent";
+    const notice = inboxHandedAwayLine(to);
+    const url = threadUrl(base, reply.thread_id);
+    const subject = store.threadSubject(reply.thread_id);
+    return okComplete(`Thread ${reply.thread_id}${subject ? ` (${subject})` : ""}: ${notice}\n\n[reply ${reply.id} · ${shortTime(reply.created_at)} · cursor ${cursor} · ${url}]`, {
+      status: "replied",
+      thread_id: reply.thread_id,
+      handed_away: { to },
+      reply: { message_id: reply.id, reply_to: reply.reply_to, body: notice, created_at: reply.created_at },
+      questions: [],
+      cursor,
+      url,
+    });
+  }
   // Every question of each message the reply answers (its reply_to and any other of the session's messages
   // it sent answers or skips on), each named by its message.
   const answered = replyAnsweredMessages(store, reply);
@@ -976,6 +1018,10 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
     { name: "plannotator-inbox", version: "1.0.0" },
     { instructions: INBOX_MCP_INSTRUCTIONS, capabilities: { tools: {} } },
   );
+  // Every tool's result carries a Tidy waiting on an agent no connection wakes (MCP only), once, at its end.
+  const register = server.registerTool.bind(server) as (name: string, config: unknown, handler: (input: never, ctx: unknown) => Promise<ToolResult>) => unknown;
+  server.registerTool = ((name: string, config: unknown, handler: (input: Record<string, unknown>, ctx: unknown) => Promise<ToolResult>) =>
+    register(name, config, async (input: Record<string, unknown>, ctx: unknown) => withTidy(context, await handler(input, ctx), input, ctx))) as unknown as typeof server.registerTool;
 
   server.registerTool(
     "send_message",
@@ -1209,6 +1255,8 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
               : [],
           );
           const forCaller = (message: InboxMessage) => {
+            // A hand-off inside its Undo window goes to nobody yet.
+            if (store.handoffHeld(message)) return false;
             if (caller && (taggedOnly.has(message.thread_id) || (message.tags?.length ?? 0) > 0)) return store.isFor(message, caller);
             return !message.to || message.to.session === caller;
           };
@@ -1217,7 +1265,7 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
             let best: { message: InboxMessage; seq: number } | null = null;
             for (const [threadId, threshold] of thresholds) {
               for (const message of store.thread(threadId)?.messages ?? []) {
-                if (message.author.kind !== "person" || !forCaller(message)) continue;
+                if (message.author.kind !== "person" || message.tidy || !forCaller(message)) continue;
                 const seq = store.messageCursor(message.id) ?? 0;
                 if (seq > threshold && (!best || seq < best.seq)) best = { message, seq };
               }
@@ -1283,7 +1331,7 @@ export function createInboxMcpServer(context: InboxMcpContext): McpServer {
                 const threshold = thresholds.get(message.thread_id);
                 if (threshold === undefined) return;
                 // The note carrying a 👍 is answered as `acknowledged`, from the ack's own line.
-                if (message.author.kind === "person" && !message.ack_of && forCaller(message) && line.seq > threshold && store.messageCursor(message.id) === line.seq) {
+                if (message.author.kind === "person" && !message.ack_of && !message.tidy && forCaller(message) && line.seq > threshold && store.messageCursor(message.id) === line.seq) {
                   finish({ kind: "reply", message });
                 } else if (message.ack?.settled_seq === line.seq && !message.ack.not_sent && ackCounts(message, line.seq)) {
                   finish({ kind: "ack", message });

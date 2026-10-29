@@ -12,7 +12,7 @@
  * cancelling, a one-way or picture question swipes, or Stakes /
  * Why / Shows stop showing.
  *
- * DOM-gated (DOM_TESTS=1, happy-dom), from the test.yml DOM list.
+ * DOM-gated (DOM_TESTS=1, happy-dom), from tests/dom-test-list.txt.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
 import { act } from 'react';
@@ -217,7 +217,8 @@ describe.skipIf(!hasDom)('decision mode: the contract lines', () => {
     const seen = render(decision(DRAWERS, DRAWER_PICTURES));
     press($$('[data-question-zoom]')[2]!);
     expect(seen.answers).toHaveLength(0);
-    expect(seen.images).toEqual([{ names: ['Drawer A', 'Drawer B', 'Drawer C'], index: 2 }]);
+    // The viewer names each picture by its choice (letter and label), not the picture's alt text.
+    expect(seen.images).toEqual([{ names: ['A · Total on top', 'B · Total pinned with Pay', 'C · Three steps'], index: 2 }]);
     press($$('[data-question-picture]')[1]!);
     expect(seen.images).toHaveLength(1);
     expect(seen.answers.map((a) => a.selected)).toEqual([['B · Total pinned with Pay']]);
