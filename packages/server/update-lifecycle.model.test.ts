@@ -24,9 +24,11 @@
  * description; `bun test --todo` runs them (a todo that passes fails, saying
  * the bug is fixed).
  *
- * F1 (the 0.28.37 bug) is fixed by PR #2337. The model reads which rules
- * the code under test has (RELEASE_NOTES_PENDING_RETRY_MS) and follows them,
- * so this file runs unchanged on that branch: there, the F1 todos pass.
+ * F1 (the 0.28.37 bug) is fixed by PR #2337, and F2-F4 by the PR after it
+ * (the spec's WHATS_NEW_FIX), so their tests are ordinary tests. The model
+ * reads which #2337 rules the code under test has
+ * (RELEASE_NOTES_PENDING_RETRY_MS) and follows them; the F2-F4 rules it
+ * always follows.
  *
  * Runs: PLANNOTATOR_MODEL_RUNS (default 100 per property).
  */
@@ -70,6 +72,7 @@ interface ModelInstaller {
   v: number;
   person: boolean;
   phase: Phase;
+  at: number; // started (minutes)
 }
 interface Model {
   now: number; // minutes
@@ -79,6 +82,8 @@ interface Model {
   oursAt: Record<number, number>;
   netUp: boolean;
   netEverDown: boolean;
+  netDowns: number;
+  netBackAt: number;
   checksOn: boolean;
   checksOnSince: number;
   latest: number;
@@ -86,8 +91,11 @@ interface Model {
   rcAt: number;
   rcFailed: boolean;
   notes: Record<number, "none" | "empty" | "content">;
-  nf: Record<number, { at: number; failed: boolean; pub: number }>;
+  /** notesFetch; `quick`: a failure's retryOnline (15 minutes once a release check answered after it). */
+  nf: Record<number, { at: number; failed: boolean; pub: number; quick?: boolean }>;
   inboxVer: number;
+  /** whatsNewPending (0: none). */
+  wnPending: number;
   pendingV: number;
   pendingPerson: boolean;
   resultV: number;
@@ -111,6 +119,8 @@ function initialModel(): Model {
     oursAt: { 1: 0 },
     netUp: true,
     netEverDown: false,
+    netDowns: 0,
+    netBackAt: 0,
     checksOn: true,
     checksOnSince: 0,
     latest: 0,
@@ -120,6 +130,7 @@ function initialModel(): Model {
     notes: {},
     nf: {},
     inboxVer: 1,
+    wnPending: 0,
     pendingV: 0,
     pendingPerson: false,
     resultV: 0,
@@ -133,10 +144,14 @@ function initialModel(): Model {
   };
 }
 
+const DAY = 24 * 60;
 const lockExpired = (m: Model) => !!m.lock && (m.now - m.lock.at >= 60 || m.lock.at - m.now >= 60);
 const holderGone = (m: Model) => !!m.lock && m.lock.kind === "wrapper" && !isRunning(m.inst[m.lock.owner]!);
-const lockHeldView = (m: Model) => !!m.lock && !lockExpired(m) && !holderGone(m);
-const canAcquire = (m: Model) => !m.lock || lockExpired(m) || holderGone(m);
+// A wrapper lock whose install still runs holds past the hour, up to a day (AUTO_UPDATE_LOCK_LIVE_MAX_MS).
+const liveLock = (m: Model) =>
+  !!m.lock && m.lock.kind === "wrapper" && isRunning(m.inst[m.lock.owner]!) && Math.abs(m.now - m.lock.at) < DAY;
+const lockHeldView = (m: Model) => !!m.lock && !holderGone(m) && (!lockExpired(m) || liveLock(m));
+const canAcquire = (m: Model) => !lockHeldView(m);
 
 function uiState(m: Model): string {
   if (!m.ib.alive) return "none";
@@ -172,7 +187,8 @@ const young = (r: { pub: number }, now: number) => r.pub >= 0 && Math.abs(now - 
 function notesDue(m: Model, v: number): boolean {
   const r = m.nf[v];
   if (!r || r.at > m.now) return true;
-  return m.now - r.at >= (r.failed ? 360 : NOTES_FIX && young(r, m.now) ? NOTES_PENDING_RETRY : 1440);
+  if (r.failed) return m.now - r.at >= (r.quick && m.latestAt > r.at ? NOTES_PENDING_RETRY : 360);
+  return m.now - r.at >= (NOTES_FIX && young(r, m.now) ? NOTES_PENDING_RETRY : 1440);
 }
 
 const fetchable = (m: Model, v: number) => v === m.ib.runs || v === m.latest || v === m.ib.onDisk || v === m.pendingV;
@@ -185,12 +201,14 @@ function ensureNotes(m: Model, v: number): void {
   m.nf[v] = { at: m.now, failed: false, pub: keep ? prev!.pub : -1 };
   if (!m.netUp || v > m.published) {
     if (m.netUp) m.tagRequests[v] = (m.tagRequests[v] ?? 0) + 1;
-    m.nf[v] = { at: m.now, failed: true, pub: -1 };
+    // A failure retries 15 minutes after it once a release check answered, unless one answered between it and the failure before.
+    m.nf[v] = { at: m.now, failed: true, pub: -1, quick: !(prev?.failed && m.latestAt > prev.at) };
     return;
   }
   m.tagRequests[v] = (m.tagRequests[v] ?? 0) + 1;
   if (m.body[v] === "ours") {
     m.notes[v] = "content";
+    m.nf[v] = { at: m.now, failed: false, pub: -1 };
   } else {
     m.notes[v] = "empty";
     if (NOTES_FIX) m.nf[v] = { at: m.now, failed: false, pub: m.pubAt[v]! };
@@ -205,8 +223,9 @@ function link(m: Model): number {
   return notesDue(m, v) ? v : 0;
 }
 
+/** A lock that no longer holds (its holder gone, or past its hour) is released and the install recorded failed. */
 function reap(m: Model): void {
-  if (!m.lock || !holderGone(m)) return;
+  if (!m.lock || lockHeldView(m)) return;
   m.lock = null;
   if (m.pendingV && m.resultV !== m.pendingV) {
     m.resultV = m.pendingV;
@@ -220,20 +239,25 @@ function tick(m: Model, fresh: number): void {
   if (m.latest > m.ib.runs && m.notes[m.latest] !== "content") ensureNotes(m, m.latest);
   if (m.ib.updated && m.notes[m.ib.updated] !== "content") ensureNotes(m, m.ib.updated);
   m.ib.lastTick = m.now;
+  // The link offered with readable notes: a later start on this version no longer shows it.
+  if (m.ib.updated && m.notes[m.ib.updated] === "content" && m.wnPending === m.ib.updated) m.wnPending = 0;
 }
 
 function startInbox(m: Model): void {
   const runs = m.binV;
   const newer = m.inboxVer > 0 && runs > m.inboxVer;
-  m.ib = { alive: true, runs, updated: newer ? runs : 0, onDisk: runs, startedAt: m.now, lastTick: m.now };
+  const owed = newer || (m.inboxVer === runs && m.wnPending === runs);
+  if (newer) m.wnPending = runs;
+  m.ib = { alive: true, runs, updated: owed ? runs : 0, onDisk: runs, startedAt: m.now, lastTick: m.now };
   m.inboxVer = runs;
   tick(m, 1);
 }
 
 function launch(m: Model, v: number, person: boolean): boolean {
   if (!canAcquire(m)) return false;
-  m.inst.push({ v, person, phase: "spawned" });
-  m.lock = { kind: "bare", at: m.now, owner: m.inst.length - 1 };
+  m.inst.push({ v, person, phase: "spawned", at: m.now });
+  // launchInstaller names the spawned wrapper in the lock at once.
+  m.lock = { kind: "wrapper", at: m.now, owner: m.inst.length - 1 };
   m.resultV = 0;
   m.resultCode = 0;
   m.pendingV = v;
@@ -246,7 +270,8 @@ function finishModel(m: Model, index: number, code: number): void {
   ins.phase = "done";
   m.resultV = ins.v;
   m.resultCode = code;
-  m.lock = null;
+  // The wrapper removes the lock only while it is still its own.
+  if (m.lock?.owner === index) m.lock = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -369,10 +394,7 @@ function startReal(real: Real): void {
     isManaged: () => true,
     listSessions: () => [],
     probeVersion: async (path) => /^plannotator\s+(\S+)/.exec(readFileSync(path, "utf-8"))?.[1] ?? null,
-    launchInstaller: (launch) => {
-      real.launches.push(launch);
-      real.holders.push(null);
-    },
+    launchInstaller: fakeLaunch(real),
     onChange: () => {},
   });
   // The health tick is called by the test (an Advance), never by a timer.
@@ -395,17 +417,40 @@ function stopReal(real: Real): void {
   real.tickNow = null;
 }
 
-/** Move the lock's mtime back by `minutes` (its checks read the wall clock). */
+/**
+ * Move the lock's mtime back by `minutes` (its checks read the wall clock).
+ * A file's mtime has sub-millisecond precision and can be up to 1 ms ahead
+ * of Date.now() (whole milliseconds), so a lock aged exactly to the model's
+ * 60 minutes could still read as 59:59.999 when the check runs within that
+ * millisecond: count the age from no later than now, never from ahead of it.
+ */
 function ageLock(real: Real, minutes: number): void {
   const lock = autoUpdatePaths(real.dataDir).lock;
   if (!existsSync(lock)) return;
-  const at = statSync(lock).mtimeMs - minutes * MIN;
+  const at = Math.min(statSync(lock).mtimeMs, Date.now()) - minutes * MIN;
   utimesSync(lock, at / 1000, at / 1000);
 }
 
 function holderLine(pid: number): string {
   const m = thisLockMachine();
   return `pid=${pid} group=${pid} host=${m.host} boot=${m.boot} pidns=${m.pidns}\n`;
+}
+
+/** Write the holder's line into the lock, its mtime past the 5 s hand-off. */
+function writeHolderLine(lock: string, holder: ChildProcess): void {
+  writeFileSync(lock, holderLine(holder.pid!));
+  const at = (Date.now() - 10_000) / 1000;
+  utimesSync(lock, at, at);
+}
+
+/** launchInstaller's stand-in: a real process group in place of the wrapper, named in the lock right away as launchInstaller does. */
+function fakeLaunch(real: Real): (launch: InstallerLaunch) => void {
+  return (launch) => {
+    real.launches.push(launch);
+    const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore", detached: true }); // inbox-guard: own child
+    real.holders.push(holder);
+    writeHolderLine(launch.lockPath, holder);
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -441,7 +486,8 @@ class WriteNotes implements Cmd {
 
 class Advance implements Cmd {
   constructor(readonly minutes: number) {}
-  check = () => true;
+  // As in the spec: a spawned wrapper writes its lock line (its first command) before time moves on, or is killed.
+  check = (m: Model) => !m.inst.some((i) => i.phase === "spawned");
   async run(m: Model, r: Real) {
     m.now += this.minutes;
     r.clock += this.minutes * MIN;
@@ -496,6 +542,8 @@ class NetToggle implements Cmd {
   async run(m: Model, r: Real) {
     m.netUp = !m.netUp;
     if (!m.netUp) m.netEverDown = true;
+    if (!m.netUp) m.netDowns++;
+    else m.netBackAt = m.now;
     r.github.netUp = m.netUp;
   }
   toString = () => "NetToggle";
@@ -531,14 +579,10 @@ class InstallerStep implements Cmd {
     const ins = m.inst[index]!;
     const lock = autoUpdatePaths(r.dataDir).lock;
     if (ins.phase === "spawned") {
-      // The wrapper's first line: its process group (a real one) and this machine.
+      // The wrapper's first line: the same process group and machine launchInstaller wrote.
       ins.phase = "locked";
       m.lock = { kind: "wrapper", at: m.now, owner: index };
-      const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore", detached: true }); // inbox-guard: own child
-      r.holders[index] = holder;
-      writeFileSync(lock, holderLine(holder.pid!));
-      const at = (Date.now() - 10_000) / 1000; // past the 5 s hand-off
-      utimesSync(lock, at, at);
+      writeHolderLine(lock, r.holders[index]!);
     } else if (ins.phase === "locked") {
       if (m.netUp) ins.phase = "downloaded";
       else await this.finish(m, r, index, 75);
@@ -556,7 +600,8 @@ class InstallerStep implements Cmd {
     const paths = autoUpdatePaths(r.dataDir);
     writeFileSync(`${paths.result}.tmp`, JSON.stringify({ version: `v${ver(ins.v)}`, exitCode: code }) + "\n");
     renameSync(`${paths.result}.tmp`, paths.result);
-    rmSync(paths.lock, { force: true }); // the wrapper's `rm -f`, whoever holds it now
+    // The wrapper's release_lock: only while the lock still names it.
+    if (existsSync(paths.lock) && readFileSync(paths.lock, "utf-8") === holderLine(r.holders[index]!.pid!)) rmSync(paths.lock);
     await killHolder(r, index);
   }
   toString = () => `InstallerStep(${this.ok ? "ok" : "fails"})`;
@@ -770,10 +815,27 @@ function whatsNewWithinRun(m: Model, r: Real): void {
   expect(r.updates!.updated()).toBe(ver(v));
 }
 
+/**
+ * F3: the same after one network outage of any length, counted from the
+ * network's return. Every run on v counts, not only the first (F4: a
+ * restart before the notes were readable keeps the link).
+ */
+function whatsNewAfterOutage(m: Model, r: Real): void {
+  conforms(m, r);
+  const v = m.ib.updated;
+  if (!m.ib.alive || !v || !m.checksOn || !m.netUp || m.netDowns > 1 || m.body[v] !== "ours") return;
+  if (m.oursAt[v]! - m.pubAt[v]! > 60) return;
+  const since = Math.max(m.oursAt[v]!, m.ib.startedAt, m.checksOnSince, m.netBackAt);
+  if (m.ib.lastTick - since < 30) return;
+  expect(r.updates!.updated()).toBe(ver(v));
+}
+
 /** F5 and F6: never two installers; "Updating…" only while an install runs; a failed install the person started shows. */
 function installsAndLocks(m: Model, r: Real): void {
   conforms(m, r);
-  expect(m.inst.filter(isRunning).length).toBeLessThanOrEqual(1);
+  // A second install starts only beside one that has run for a day (a hung install never holds the lock for good).
+  const running = m.inst.filter(isRunning);
+  for (const older of running.slice(0, -1)) expect(m.now - older.at).toBeGreaterThanOrEqual(DAY);
   const state = r.updates?.current()?.state;
   if (state === "updating") expect(m.inst.some(isRunning)).toBe(true);
 }
@@ -834,10 +896,11 @@ describe("update lifecycle: the code follows the model (spec/update-lifecycle.qn
 });
 
 describe("update lifecycle: properties the code breaks today (findings: the PR #2338 description)", () => {
-  // F1. Fixed by PR #2337 (on that branch this todo passes, so `bun test --todo` fails it: drop the .todo).
+  // F1. Fixed by PR #2337 (the 15-minute retry for a young release): an ordinary test now, guarding it.
   // The seed is pinned: a random seed misses the narrow F1 path in about half the runs, and a miss would
-  // read as "fixed". With this seed main fails after 5 runs; the two F1 traces below fail on any seed.
-  test.todo(
+  // read as "fixed". With this seed the code before #2337 fails after 5 runs; the two F1 traces below
+  // fail on any seed.
+  test(
     "[FINDINGS F1] after an update, the What's new link shows within 30 minutes of the written notes (fixed by #2337)",
     async () => {
       await fc.assert(
@@ -851,8 +914,45 @@ describe("update lifecycle: properties the code breaks today (findings: the PR #
     300_000,
   );
 
-  test.todo(
-    "[FINDINGS F5, F6] never two installers, and Updating… only while an install runs",
+  // F3 and F4 in any order: a network outage before, during or after the update, Inbox quits and starts.
+  // Not pinned to a seed: the minimal traces below guard F3 and F4 on any seed; this explores around them
+  // (with F3's rule removed it fails within about 100 runs, with F4's in most seeds).
+  test(
+    "[FINDINGS F3, F4] after an update, the What's new link shows within 30 minutes of the network's return, in any run on that version",
+    async () => {
+      await fc.assert(
+        fc.asyncProperty(
+          fc.commands(
+            [
+              fc.constant(new Publish()),
+              fc.integer({ min: 2, max: 3 }).map((v) => new WriteNotes(v)),
+              fc.constantFrom(1, 10, 15, 30, 60, 360).map((d) => new Advance(d)),
+              fc.constantFrom(1, 10, 15, 30, 60, 360).map((d) => new Advance(d)),
+              fc.constant(new CliCheck()),
+              fc.constant(new UpdateNowFromCli()),
+              fc.constant(new InstallerStep(true)),
+              fc.constant(new InstallerStep(true)),
+              fc.constant(new InstallerStep(true)),
+              fc.constant(new InstallerStep(true)),
+              fc.constant(new NetToggle()),
+              fc.constant(new NetToggle()),
+              fc.constant(new QuitInbox()),
+              fc.constant(new StartInbox()),
+            ],
+            { maxCommands: 40, size: "xlarge" },
+          ),
+          // Release 2 is known before any Inbox runs, so the update is reachable from the first command.
+          (cmds) => runModel([new Publish(), new CliCheck(), ...cmds], whatsNewAfterOutage),
+        ),
+        { numRuns: RUNS * 4 },
+      );
+    },
+    300_000,
+  );
+
+  // F5 and F6: fixed by PR #2342.
+  test(
+    "[FINDINGS F5, F6] never two installers (within a day), and Updating… only while an install runs",
     async () => {
       await fc.assert(
         fc.asyncProperty(
@@ -883,7 +983,7 @@ describe("update lifecycle: properties the code breaks today (findings: the PR #
 describe("the minimal traces (findings: the PR #2338 description)", () => {
   // F1 as the 0.28.37 report saw it: the Inbox starts on the new version while the release still
   // carries GitHub's generated body.
-  test.todo("[FINDINGS F1] started on the new version before the notes were written: the link shows once they are (fixed by #2337)", async () => {
+  test("[FINDINGS F1] started on the new version before the notes were written: the link shows once they are (fixed by #2337)", async () => {
     await runModel(
       [new Publish(), new CliCheck(), new UpdateNowFromCli(), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new StartInbox(), new WriteNotes(2), new Advance(30), new Advance(30)],
       (m, r) => {
@@ -895,7 +995,7 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
 
   // F1 the way the model found it: the Inbox on 1 fetched 2's notes for the update dialog while the
   // body was generated; the person updated later that day.
-  test.todo("[FINDINGS F1] notes fetched before the update while generated: the link shows after the update (fixed by #2337)", async () => {
+  test("[FINDINGS F1] notes fetched before the update while generated: the link shows after the update (fixed by #2337)", async () => {
     await runModel(
       [new StartInbox(), new Publish(), new Advance(10), new WriteNotes(2), new UpdateNow(), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new Advance(1), new Restart(), new Advance(30), new Advance(30)],
       (m, r) => {
@@ -905,8 +1005,9 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
     );
   });
 
-  // F2: a request for the notes that never answered (its process quit) blocks them 24 h, on #2337 too.
-  test.todo("[FINDINGS F2] a notes request abandoned by a process that quit is asked again within 15 minutes", async () => {
+  // F2: a request for the notes that never answered (its process quit) blocked them 24 h. Fixed: the
+  // claim is marked in flight, and a claim still marked is asked again after 15 minutes.
+  test("[FINDINGS F2] a notes request abandoned by a process that quit is asked again within 15 minutes", async () => {
     const world = newWorld();
     world.r.github.published = 2;
     world.r.github.pubAt[2] = 0;
@@ -929,8 +1030,9 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
     expect(next.outcome).toBe("fetched");
   });
 
-  // F3: one failed request at the start (offline for a moment) hides the link 6 h, on #2337 too.
-  test.todo("[FINDINGS F3] after a network blip at the first fetch, the link shows within 30 minutes of the network's return", async () => {
+  // F3: one failed request at the start (offline for a moment) hid the link 6 h. Fixed: a failure that
+  // may have been the network is asked again 15 minutes after it once a release check answers.
+  test("[FINDINGS F3] after a network blip at the first fetch, the link shows within 30 minutes of the network's return", async () => {
     await runModel(
       [new Publish(), new WriteNotes(2), new CliCheck(), new UpdateNowFromCli(), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new NetToggle(), new StartInbox(), new NetToggle(), new Advance(30), new Advance(30)],
       (m, r) => {
@@ -940,9 +1042,9 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
     );
   });
 
-  // F4: the link is for the run that started on the new version only; a restart before the notes
-  // were readable loses it for good, on #2337 too.
-  test.todo("[FINDINGS F4] What's new survives an Inbox restart before the notes were readable", async () => {
+  // F4: the link was for the run that started on the new version only; a restart before the notes
+  // were readable lost it for good. Fixed: whatsNewPending keeps it until offered with readable notes.
+  test("[FINDINGS F4] What's new survives an Inbox restart before the notes were readable", async () => {
     await runModel(
       [new Publish(), new CliCheck(), new UpdateNowFromCli(), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new InstallerStep(true), new StartInbox(), new QuitInbox(), new StartInbox(), new WriteNotes(2), new Advance(30), new Advance(30)],
       (m, r) => {
@@ -953,8 +1055,8 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
   });
 
   // F5: an install that runs past the lock's hour (install.sh's binary download has no time limit)
-  // loses its lock to the next Update now while its process group is alive.
-  test.todo("[FINDINGS F5] a lock whose wrapper's process group is alive is never taken, however old", async () => {
+  // loses its lock to the next Update now while its process group is alive. Fixed by PR #2342.
+  test("[FINDINGS F5] a lock past its hour whose wrapper's process group is alive is not taken", async () => {
     const world = newWorld();
     const lock = autoUpdatePaths(world.r.dataDir).lock;
     const holder = spawn(process.execPath, ["-e", "setTimeout(() => {}, 600000)"], { stdio: "ignore", detached: true }); // inbox-guard: own child
@@ -966,8 +1068,8 @@ describe("the minimal traces (findings: the PR #2338 description)", () => {
   });
 
   // F6: the install died before the wrapper wrote its line (or on Windows, at any point): "Updating…"
-  // for an hour with no way to retry, then the failure is never shown.
-  test.todo("[FINDINGS F6] an Update now whose install died shows Failed (with Try again), not Updating… for an hour", async () => {
+  // for an hour with no way to retry, then the failure is never shown. Fixed by PR #2342.
+  test("[FINDINGS F6] an Update now whose install died shows Failed (with Try again), not Updating… for an hour", async () => {
     await runModel(
       [new StartInbox(), new Publish(), new Advance(10), new UpdateNow(), new KillInstaller(), new Advance(1), new Advance(60)],
       (m, r) => {
@@ -989,11 +1091,9 @@ class UpdateNowFromCli implements Cmd {
       now: () => r.clock,
       platform: process.platform,
       isManaged: () => true,
-      launchInstaller: (launch) => {
-        r.launches.push(launch);
-        r.holders.push(null);
-      },
+      launchInstaller: fakeLaunch(r),
     });
   }
   toString = () => "UpdateNowFromCli";
 }
+
