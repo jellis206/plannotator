@@ -414,6 +414,7 @@ export const INBOX_AGENT_FIELD_DESCRIPTIONS: Readonly<Record<string, Readonly<Re
       '',
       'Context in one to three plain sentences: what it affects, what you know, why you recommend one. The person switches in cold.',
       '',
+      '- [ ] Nowhere — silent loss, as today',
       '- [ ] Local only, purged after 30 days — cheap',
       '- [ ] Server-side per user — needs a retention policy',
       '',
@@ -421,7 +422,7 @@ export const INBOX_AGENT_FIELD_DESCRIPTIONS: Readonly<Record<string, Readonly<Re
       'Holds up: sync release',
       ':::',
       '',
-      'Your recommendation goes on the `Recommended:` line, never in a choice label. `:::question-multi` takes several choices, `:::question-text` free text. The person can always answer Other, add a note or skip, so never add an Other choice yourself. `Stopped: <why>` only when you cannot go on until it is answered (never `Stopped: no`); `Holds up: <work>` names work that waits while you go on. Ask only what you cannot decide alone, about 8 a round at most. Answers come back in the reply under "Answers to your questions".',
+      'Your recommendation goes on the `Recommended:` line, never in a choice label. Keep the choices in their natural order; never move yours first. `:::question-multi` takes several choices, `:::question-text` free text. The person can always answer Other, add a note or skip, so never add an Other choice yourself. `Stopped: <why>` only when you cannot go on until it is answered (never `Stopped: no`); `Holds up: <work>` names work that waits while you go on. Ask only what you cannot decide alone, about 8 a round at most. Answers come back in the reply under "Answers to your questions".',
       '',
       'Optional lines after the question; most questions need none of these: `Stakes: <what it affects>` (give one with every Stopped or Holds up), `Shows: ![alt](path)` or `Shows: [name](file)` (the one picture or file it is about), `Why: <why your recommendation>` on its own line, `Reversible: no — <why>` only when it cannot be undone. Visual options can be picture choices, `- [ ] Label — ![alt](path)`: the picture picks it, the label comes back.',
       '',
@@ -456,14 +457,14 @@ export const INBOX_AGENT_FIELD_DESCRIPTIONS: Readonly<Record<string, Readonly<Re
  * the send, before anything about the chat, so it reads as about the Inbox.
  */
 export const INBOX_REMINDER_TEXT =
-  `Plannotator Inbox is on: when you finish long work, or need a decision only the person can make, send it with plannotator_inbox send_message and keep going. ${INBOX_FOLLOW_THROUGH_RULE} ${INBOX_THREAD_RULE} Their reply comes back here. A decision in the Inbox stays there: when the person writes here, say what waits and link its thread, but never also ask it in the chat with a blocking question tool (AskUserQuestion or similar). Run \`plannotator inbox --help\` for how it works.`
+  `Plannotator Inbox is on: when you finish long work, or need a decision only the person can make, send it with plannotator_inbox send_message (each decision as a \`:::question\` block) and keep going. ${INBOX_FOLLOW_THROUGH_RULE} ${INBOX_THREAD_RULE} Their reply comes back here. A decision in the Inbox stays there: when the person writes here, say what waits and link its thread, but never also ask it in the chat with a blocking question tool (AskUserQuestion or similar). Run \`plannotator inbox --help\` for how it works.`
 
 /**
  * The same line for a host without the wake (OpenCode 1): the reply does not
  * come back by itself there, so it names wait_for_reply instead.
  */
 export const INBOX_REMINDER_TEXT_NO_WAKE =
-  `Plannotator Inbox is on: when you finish long work, or need a decision only the person can make, send it with plannotator_inbox send_message and keep going. ${INBOX_FOLLOW_THROUGH_RULE} ${INBOX_THREAD_RULE} Call wait_for_reply when you need their answer. A decision in the Inbox stays there: when the person writes here, say what waits and link its thread, but never also ask it in the chat with a blocking question tool (AskUserQuestion or similar). Run \`plannotator inbox --help\` for how it works.`
+  `Plannotator Inbox is on: when you finish long work, or need a decision only the person can make, send it with plannotator_inbox send_message (each decision as a \`:::question\` block) and keep going. ${INBOX_FOLLOW_THROUGH_RULE} ${INBOX_THREAD_RULE} Call wait_for_reply when you need their answer. A decision in the Inbox stays there: when the person writes here, say what waits and link its thread, but never also ask it in the chat with a blocking question tool (AskUserQuestion or similar). Run \`plannotator inbox --help\` for how it works.`
 
 /**
  * The reminder naming the tool as the host registered it. Claude Code defers

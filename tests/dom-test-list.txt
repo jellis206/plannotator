@@ -122,6 +122,7 @@ packages/inbox/reloadHosts.test.tsx
 packages/inbox/pasteFiles.test.tsx
 packages/inbox/questionCardPhone.test.tsx
 packages/inbox/markRead.test.tsx
+packages/inbox/markUnread.test.tsx
 packages/inbox/ack.test.tsx
 packages/inbox/actionChecklist.test.tsx
 packages/inbox/actionDraftSend.test.tsx
@@ -136,6 +137,7 @@ packages/inbox/replyDrafts.test.tsx
 packages/inbox/skipNote.test.tsx
 packages/inbox/picksWhileComposing.test.tsx
 packages/inbox/projectMenu.test.tsx
+packages/inbox/projectRenameWarning.test.tsx
 packages/inbox/rowMenu.test.tsx
 packages/inbox/copyMessage.test.tsx
 packages/inbox/pinnedThreads.test.tsx
@@ -445,3 +447,4 @@ packages/review-editor/components/RepoFileView.test.tsx
 packages/review-editor/components/GoToFile.test.tsx
 packages/inbox/heldPick.test.tsx
 packages/inbox/linkedMachines.test.tsx
+packages/inbox/voiceMirror.test.tsx
