@@ -434,6 +434,8 @@ test('on a phone, the last comment removed from the card leaves focus on the car
   const page = await context.newPage();
   const t = await seededThread(world);
   await page.goto(fileUrl(world, t, t.page, 'full'));
+  // An HTML page on a phone opens clear, the card folded to its pill (inbox-html-phone.spec.ts): the pill opens it.
+  await page.locator('[data-fcomp-pill]').tap();
   await cardChip(page).tap();
   await rowOf(page, t.onMessage).getByRole('button', { name: 'Remove' }).tap();
   await expect(rowOf(page, t.onMessage)).toHaveCount(0);
@@ -604,7 +606,8 @@ test('a thread with no comments gains no link', async ({ browser }) => {
   await expect(pane(page).locator('[data-foot-status]')).toHaveCount(0);
   await expect(page.locator('[data-comments-link]')).toHaveCount(0);
   await pane(page).locator('.ib-pfoot').getByRole('button', { name: 'Reply' }).click();
-  await expect(page.locator('[data-annotations-chip]')).toBeDisabled();
-  await expect(page.locator('[data-annotations-chip]')).toHaveText('No comments');
+  // No comments, no chip in the reply box either (the owner, 2026-11-02: a "No comments" chip only takes space).
+  await expect(pane(page).locator('.ib-rbox textarea')).toBeVisible();
+  await expect(page.locator('[data-annotations-chip]')).toHaveCount(0);
   await page.context().close();
 });
