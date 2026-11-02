@@ -279,13 +279,18 @@ describe("command path helpers", () => {
       expect(launch.command.at(-1)).toEndWith(String.raw`"--workspace" "C:\repo\\""`);
     });
 
-    test("an .exe, a program not on PATH, and every other platform keep the command as built", () => {
-      const asIs = (command: string[], launch: ReturnType<typeof planAgentJobSpawn>) =>
-        expect(launch).toEqual({ command, stdinPrompt: undefined, verbatim: false });
-      asIs(piJob, planAgentJobSpawn(piJob, { which: () => String.raw`C:\tools\pi.exe`, promptOnStdin: piPromptOnStdin, platform: "win32", exists: () => false }));
-      asIs(piJob, planAgentJobSpawn(piJob, { which: () => null, promptOnStdin: piPromptOnStdin, platform: "win32", exists: shimExists }));
-      asIs(piJob, planAgentJobSpawn(piJob, { which: () => "/usr/local/bin/pi", promptOnStdin: piPromptOnStdin, platform: "darwin", exists: () => true }));
-      asIs(piJob, planAgentJobSpawn(piJob, { which: () => "/usr/bin/pi.cmd", promptOnStdin: piPromptOnStdin, platform: "linux", exists: () => true }));
+    // A long review prompt in argv kills Pi on any platform, so the prompt
+    // always moves to stdin; nothing else about the command changes.
+    test("an .exe, a program not on PATH, and every other platform keep the command as built, prompt on stdin", () => {
+      const asIs = (launch: ReturnType<typeof planAgentJobSpawn>) =>
+        expect(launch).toEqual({ command: piJob.slice(0, -1), stdinPrompt: prompt, verbatim: false });
+      asIs(planAgentJobSpawn(piJob, { which: () => String.raw`C:\tools\pi.exe`, promptOnStdin: piPromptOnStdin, platform: "win32", exists: () => false }));
+      asIs(planAgentJobSpawn(piJob, { which: () => null, promptOnStdin: piPromptOnStdin, platform: "win32", exists: shimExists }));
+      asIs(planAgentJobSpawn(piJob, { which: () => "/usr/local/bin/pi", promptOnStdin: piPromptOnStdin, platform: "darwin", exists: () => true }));
+      asIs(planAgentJobSpawn(piJob, { which: () => "/usr/bin/pi.cmd", promptOnStdin: piPromptOnStdin, platform: "linux", exists: () => true }));
+      const claude = ["claude", "-p", "--output-format", "stream-json"];
+      expect(planAgentJobSpawn(claude, { which: () => "/usr/local/bin/claude", platform: "darwin" }))
+        .toEqual({ command: claude, stdinPrompt: undefined, verbatim: false });
     });
   });
 

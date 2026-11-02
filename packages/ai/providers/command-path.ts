@@ -123,12 +123,13 @@ export interface AgentJobSpawn {
  * `spawn pi ENOENT`. Ask AI resolves the shim (`resolveWindowsCommandShim`)
  * and runs it through cmd.exe; jobs do the same here.
  *
- * - Not Windows, a program not on PATH, or an `.exe`: the argv as it is.
+ * - `promptOnStdin` (Pi's) moves the prompt to stdin on every platform: a
+ *   long review prompt in argv kills Pi, and it cannot go through cmd.exe
+ *   (it holds line breaks and quotes).
+ * - Not Windows, a program not on PATH, or an `.exe`: that argv as it is.
  * - A `.cmd`/`.bat`: `cmd.exe /d /s /c ""<script>" "<arg>" …"`, spawned
- *   verbatim. A job's prompt cannot go through cmd.exe (it holds line breaks
- *   and quotes), so `promptOnStdin` (Pi's) moves it to stdin first. When an
- *   argument that is left still has a character cmd.exe would read
- *   (`WINDOWS_COMMAND_SCRIPT_UNSAFE_ARG`), the argv is returned as it is with
+ *   verbatim. When an argument still has a character cmd.exe would read
+ *   (`WINDOWS_COMMAND_SCRIPT_UNSAFE_ARG`), the job's argv is returned with
  *   `unsafeScript` set: nothing the job did not ask for is ever run.
  */
 export function planAgentJobSpawn(
@@ -143,26 +144,29 @@ export function planAgentJobSpawn(
 	},
 ): AgentJobSpawn {
 	const platform = options.platform ?? process.platform;
-	const asIs: AgentJobSpawn = { command, stdinPrompt: options.stdinPrompt, verbatim: false };
-	const program = command[0];
+	let job = command;
+	let stdinPrompt = options.stdinPrompt;
+	if (stdinPrompt === undefined && options.promptOnStdin) {
+		const moved = options.promptOnStdin(command);
+		if (moved) {
+			job = moved.command;
+			stdinPrompt = moved.stdin;
+		}
+	}
+	const asIs: AgentJobSpawn = { command: job, stdinPrompt, verbatim: false };
+	const program = job[0];
 	if (platform !== "win32" || !program) return asIs;
 	const found = options.which(program);
 	if (!found) return asIs;
 	const script = resolveWindowsCommandShim(found, platform, options.exists ?? existsSync);
 	if (!shouldSpawnViaShell(script, platform)) return asIs;
 
-	let args = command.slice(1);
-	let stdinPrompt = options.stdinPrompt;
-	if (stdinPrompt === undefined && options.promptOnStdin) {
-		const moved = options.promptOnStdin(command);
-		if (moved) {
-			args = moved.command.slice(1);
-			stdinPrompt = moved.stdin;
-		}
-	}
+	const args = job.slice(1);
 	if ([script, ...args].some((arg) => WINDOWS_COMMAND_SCRIPT_UNSAFE_ARG.test(arg))) {
 		return {
-			...asIs,
+			command,
+			stdinPrompt: options.stdinPrompt,
+			verbatim: false,
 			unsafeScript: `${script} is a Windows command script, and this job's arguments cannot be passed through cmd.exe safely. Install the CLI as an .exe, or put its .exe first on PATH.`,
 		};
 	}
