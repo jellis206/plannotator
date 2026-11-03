@@ -106,6 +106,8 @@ const PATHS = {
   arrowUp: 'M4.5 10.5 12 3m0 0 7.5 7.5M12 3v18',
   // The Board's "You: …" link to the thread (Heroicons outline arrow-up-right).
   arrowUpRight: 'm4.5 19.5 15-15m0 0H8.25m11.25 0v11.25',
+  // The tour's "Connect agents next →" (Heroicons outline arrow-right).
+  arrowRight: 'M13.5 4.5 21 12m0 0-7.5 7.5M21 12H3',
   // The question sound (Heroicons outline): play, and cursor-arrow-rays for "click once in this tab".
   film: 'M6 5.25h12a2.25 2.25 0 0 1 2.25 2.25v9a2.25 2.25 0 0 1-2.25 2.25H6a2.25 2.25 0 0 1-2.25-2.25v-9A2.25 2.25 0 0 1 6 5.25ZM7.5 5.25v13.5M16.5 5.25v13.5M3.75 9.75H7.5M3.75 14.25H7.5M16.5 9.75h3.75M16.5 14.25h3.75',
   /** The onboarding tour's tag (Heroicons outline "map"). */
@@ -209,6 +211,8 @@ const TAB_GLYPHS: Partial<Record<string, string>> = {
   // Qwen Code: its hexagon around a turned triangle, three bands as one pinwheel.
   qwen: 'M12 2.5 20.23 7.25v9.5L12 21.5 3.77 16.75v-9.5Z M8.97 10.25h6.06L12 15.5Z M8.97 10.25 12 2.5 M15.03 10.25l5.2 6.5 M12 15.5l-8.23 1.25',
   zed: 'M4 4h16v16H4Z M8 8.5h8l-8 7h8',
+  // DeepSeek Harness: a plain letter D over a wave, drawn here (no brand asset in the repo).
+  dsh: 'M6 4h5a7 7 0 0 1 0 14H6Z M3 21c2-1.5 4-1.5 6 0s4 1.5 6 0 4-1.5 6 0',
 };
 
 export function TabGlyph({ harness }: { harness: string }) {
@@ -235,6 +239,7 @@ export function HostMark({ host, big }: { host: string | null | undefined; big?:
     case 'qwen':
     case 'zed':
     case 'vscode':
+    case 'dsh':
       mark = (
         <svg className="ib-glyph" viewBox="0 0 24 24" aria-hidden="true" focusable="false">
           <path d={TAB_GLYPHS[host]} />

@@ -38,6 +38,7 @@ packages/ui/components/chat/ChatComposer.dom.test.tsx
 packages/ui/components/chat/ChatTranscript.dom.test.tsx
 packages/ui/components/chat/chatSanitizer.dom.test.ts
 packages/ui/components/chat/chatRichMarkdown.dom.test.tsx
+packages/ui/components/chat/chatKeepBlankLines.dom.test.tsx
 packages/review-editor/hooks/useAIChat.newChat.test.tsx
 packages/ui/hooks/useAgentSettings.dom.test.tsx
 packages/ui/utils/codeHighlight.test.ts
@@ -76,6 +77,7 @@ packages/inbox/replyFileLinks.test.tsx
 packages/inbox/replyFeedback.test.tsx
 packages/inbox/replyFocusOnOpen.test.tsx
 packages/inbox/replyBoxTyping.test.tsx
+packages/inbox/replyFootPhone.test.tsx
 packages/inbox/issueRefs.test.tsx
 packages/inbox/attachmentKinds.test.tsx
 packages/inbox/updates.test.tsx
@@ -97,11 +99,13 @@ packages/inbox/seenOnSight.test.tsx
 packages/inbox/projectList.test.tsx
 packages/inbox/rowBadges.test.tsx
 packages/inbox/rowAgents.test.tsx
+packages/inbox/rowTip.test.tsx
 packages/inbox/softQuietRows.test.tsx
 packages/inbox/sidebarQuiet.test.tsx
 packages/inbox/leakedSubject.test.tsx
 packages/inbox/connectPromptRow.test.tsx
 packages/inbox/boardPage.test.tsx
+packages/inbox/cardPanelLinks.test.tsx
 packages/inbox/boardProjectFilter.test.tsx
 packages/inbox/boardSend.test.tsx
 packages/inbox/boardOff.test.tsx
@@ -119,7 +123,10 @@ packages/inbox/fullScreenComposer.test.tsx
 packages/inbox/sideBySide.test.tsx
 packages/inbox/attachmentSteppingSave.test.tsx
 packages/inbox/listColumn.test.tsx
+packages/inbox/fitCountsColumn.test.tsx
 packages/inbox/endedSession.test.tsx
+packages/inbox/multiAgentNames.test.tsx
+packages/inbox/replyRecipient.test.tsx
 packages/inbox/compose.test.tsx
 packages/inbox/sessionLabelPicker.test.tsx
 packages/inbox/listHeaderCompose.test.tsx
@@ -153,6 +160,7 @@ packages/inbox/sentReply.test.tsx
 packages/inbox/skillHighlightSent.test.ts
 packages/inbox/threadFoot.test.tsx
 packages/inbox/replyDrafts.test.tsx
+packages/inbox/replyDraftFiles.test.tsx
 packages/inbox/skipNote.test.tsx
 packages/inbox/picksWhileComposing.test.tsx
 packages/inbox/projectMenu.test.tsx
@@ -169,6 +177,7 @@ packages/inbox/clickToRefresh.test.tsx
 packages/inbox/ask/askWindow.test.tsx
 packages/inbox/pullToRefresh.test.tsx
 packages/inbox/threadReadRetry.test.tsx
+packages/inbox/openThreadReadsWiring.test.tsx
 packages/inbox/tabCountWindow.test.tsx
 packages/inbox/phoneList.test.tsx
 packages/inbox/listHeaderPath.test.tsx
@@ -184,6 +193,7 @@ packages/inbox/toast.test.tsx
 packages/inbox/attachmentsHeader.test.tsx
 packages/inbox/threadArtifacts.test.tsx
 packages/inbox/sentQuestionLocked.test.tsx
+packages/inbox/perfMarks.test.ts
 packages/inbox/themeToggle.test.tsx
 packages/inbox/sidebarUpdateDot.test.tsx
 packages/inbox/sidebarSections.test.tsx
@@ -479,3 +489,5 @@ packages/inbox/voiceComposeRenders.test.tsx
 packages/inbox/voiceDebugLog.test.ts
 packages/ui/components/RenderedMarkdown.softLineBreaks.test.tsx
 packages/inbox/personLineBreaks.test.tsx
+packages/inbox/aboutPrivacy.test.tsx
+packages/inbox/snoozeIntroDialog.test.tsx

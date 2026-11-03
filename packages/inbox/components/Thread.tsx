@@ -1,4 +1,5 @@
-import { inboxUrl } from '../inboxUrl';
+import { perfInteraction, perfKeystroke } from '../perfMarks';
+import { inboxUrl, machineOf } from '../inboxUrl';
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { createPortal } from 'react-dom';
 import { capturePlace, holdPlace, openerOf, opensFile, parsePlaceLayout, placeInView, placeLayoutKey, placeSelector, placeShown, restorePlace, type ThreadPlace } from '../threadPlace';
@@ -11,7 +12,7 @@ import { ImageResolverContext, type ImageResolver } from '@plannotator/ui/compon
 import { getImageSrc } from '@plannotator/ui/components/ImageThumbnail';
 import { SoftLineBreaksContext } from '@plannotator/ui/components/InlineMarkdown';
 import { parseMarkdownToBlocks } from '@plannotator/ui/utils/parser';
-import { INBOX_UPLOAD_MAX_BYTES, inboxActionInDraft, inboxActionPersonMark, type InboxDraftFile, type InboxListGroupId, type InboxListRow, type InboxMessageWire, type InboxProjectRepo, type InboxQuestion, type InboxSentRecipient, type InboxThread, type InboxUpload } from '@plannotator/core/inbox-types';
+import { INBOX_UPLOAD_MAX_BYTES, inboxActionInDraft, inboxActionPersonMark, type InboxDraftFile, type InboxListGroupId, type InboxListRow, type InboxMessageWire, type InboxProjectRepo, type InboxQuestion, type InboxReplyDraft, type InboxSentRecipient, type InboxThread, type InboxUpload } from '@plannotator/core/inbox-types';
 import { withoutInboxActionsSection } from '@plannotator/core/inbox-actions';
 import { capQuestionPrompt, emptyQuestionAnswer, indexQuestionBlocks, isQuestionAnswerEmpty, type IndexedQuestion, type QuestionAnswer, type QuestionStatus } from '@plannotator/core/question-block';
 import { INBOX_AUTO_SEND_ACK_NOTES, inboxAskingMessage, wholeMinutes, isInboxNote, isInboxTextKind, readInboxAttachmentKind, type InboxAnnotationRecord, type InboxAttachment, type InboxAttachmentState, type InboxInlineImage, type InboxQuestionState } from '@plannotator/core/inbox-types';
@@ -48,10 +49,10 @@ import { threadLink } from '../rowMenu';
 import { inboxMessageImageBase, inlineImageRefFromSrc, markTallImage } from '../images';
 import { reportUnsentReply } from '../unsent';
 import { registerReloadFlush } from '../stalePage';
-import { useReplyDraft } from '../replyDraft';
+import { landInReplyDraft, useReplyDraft, type ReplyBoxTook } from '../replyDraft';
 import { useReplyHasWords, useReplyText, useReplyTextStore, useReplyTextWhile, type ReplyText } from '../replyText';
 import { GUIDE_REQUEST_WORDS, guideRequestTarget, guideTargetCanEnd } from '../guideRequest';
-import { conflictText, DraftHead, DraftFootNote } from './DraftLabel';
+import { conflictText, DraftHead, DraftFootNote, DraftStamp } from './DraftLabel';
 import { canMarkUnread, canToggleRead } from '../markRead';
 import { NewMessageButton, NewMessageComposer, NewMessagePopover, hostName, useLiveSessions, type NewMessageMode } from './NewMessage';
 import { debugNote } from '../debugLog';
@@ -72,7 +73,9 @@ import {
   mergeRouteRows,
   othersLive,
   redirectedName,
+  raceWhat,
   routeRace,
+  useEndedSessions,
   type AskingSession,
   type RouteState,
 } from './ReplyRoute';
@@ -82,6 +85,9 @@ import { reaskedIn, reaskNoteAgent, reaskOffered, reaskTargets, reaskTooltip } f
 import { ChangedNotice, ReplacedQuestionCard, ReplacesLine, StaleGuard, replacedBy, replacementOf, type JumpTarget } from './ReplacedQuestion';
 import { InboxComposerField, type InboxComposerFieldProps } from './ComposerField';
 import { VoiceFoot } from './VoiceMic';
+import { ReplyFootPhone } from './ReplyFootPhone';
+import { ReplyRecipient } from './ReplyRecipient';
+import { aimable, canTakeAlone, headFolder, knownRecipients, latestBy, RECIPIENTS_MAX, recipientRows, recipientState, sessionFolder, toggleRecipient, type RecipientPerson, type RecipientRow } from '../replyRecipients';
 import { useVoiceSession } from '../voice';
 import type { FullScreenComposerValue } from './FullScreenComposer';
 import { ReplyAnswers, SentAnswers, draftAnswerWords, ReplyActions, type ActionRow, type DraftAnswer } from './ReplyAnswers';
@@ -128,7 +134,7 @@ import { bareKeyAllowed, inOverlay, keyTarget, modalOpen } from '../shortcuts/gu
 import { INBOX_SHORTCUT_EXTRAS } from '../shortcuts/extras';
 import { useShortcutScope } from '@plannotator/ui/shortcuts';
 import { inboxThreadShortcuts } from '../shortcuts/thread.shortcuts';
-import { replyKeysToRenew, routeSendAnnotations, sendTargetAnswerIds, sendTargetsOf, type SendTarget, type SentContents } from '../sendTargets';
+import { replyKeysToRenew, routeSendAnnotations, sendTargetAnswerIds, sendTargetsOf, wordsMessage, type SendTarget, type SentContents } from '../sendTargets';
 
 export { routeSendAnnotations, sendTargetsOf, type SendTarget };
 
@@ -278,6 +284,39 @@ function lastSkipOrPick(thread: InboxThread, skip: ReadonlySet<string>): InboxMe
     if ((m.questions ?? []).some((q) => q.state === 'picked' || (q.state === 'open' && skip.has(`${m.id}/${q.key}`)))) found = m;
   }
   return found;
+}
+
+/**
+ * The other sessions a Send reaches besides the words' (`words`, askingSessionOf): a pick, a skip, an action item
+ * or a comment on another session's message rides a reply to that session (sendTargetsOf, routeSendAnnotations).
+ * Only those whose message came through a waking connection, which can end (askerCanEnd); each once.
+ */
+function otherSendSessions(
+  thread: InboxThread,
+  options: { skip: ReadonlySet<string>; carries: boolean; records: readonly InboxAnnotationRecord[] },
+  words: AskingSession | null,
+): AskingSession[] {
+  const plain = sendTargetsOf(thread, options.skip).filter(
+    (t, index, all) => t.questions.length > 0 || t.skip.length > 0 || t.actions.length > 0 || (options.carries && index === all.length - 1),
+  );
+  const out: AskingSession[] = [];
+  for (const { message } of routeSendAnnotations(thread, plain, options.records).targets) {
+    if (message.author.kind !== 'agent' || !message.author.session || message.wakes !== true) continue;
+    const session = message.author.session;
+    if (session === words?.session || out.some((s) => s.session === session)) continue;
+    out.push({ message, session, host: message.author.host ?? '', name: agentName(message.author) });
+  }
+  return out;
+}
+
+/**
+ * A second agent in a thread (handoff "multi-agent-thread-model", option A): an agent message from another
+ * session than the thread's first agent (`first`: the root's author, or the session a thread the person started
+ * is addressed to). A reply to it goes to that session, so the window names it, not the first agent.
+ */
+export function isOtherAgent(message: InboxMessageWire | null | undefined, first: { host?: string | null; session?: string | null } | null): boolean {
+  if (message?.author.kind !== 'agent' || !first) return false;
+  return (message.author.session ?? null) !== (first.session ?? null) || (message.author.host ?? null) !== (first.host ?? null);
 }
 
 /** The key a reply of a Send keeps across retries: one per session (a message with no session is its own). */
@@ -935,6 +974,8 @@ export interface ThreadPaneProps {
   onChanged: () => Promise<void>;
   /** Raised each time the Inbox says this thread's reply draft changed (`event: drafts`): the draft is read again. */
   draftChanged?: number;
+  /** Raised each time records needed only this thread's files read again, not the thread (openThreadReads.ts). */
+  filesChanged?: number;
   onClose: () => void;
   /** The attachment open beside the thread (`#…&file=att_…`), its version, and an annotation to show. */
   file: { id: string; version: 'current' | 'sent'; focus: string | null; linked?: string | null; view?: 'full' | 'side' | null; set?: string | null } | null;
@@ -1092,8 +1133,8 @@ export interface ThreadPaneProps {
   decide?: OpenQuestionsDecide | null;
 }
 
-/** The thread's attachments as they are now and the annotations waiting for a Send, kept fresh. */
-function useThreadAttachments(threadId: string, revision: unknown) {
+/** The thread's attachments as they are now and the annotations waiting for a Send, kept fresh (read again when `revision` or `again` changes). */
+function useThreadAttachments(threadId: string, revision: unknown, again: number) {
   const [model, setModel] = useState<AttachmentsModel | null>(null);
   const load = useCallback(async () => {
     try {
@@ -1108,7 +1149,7 @@ function useThreadAttachments(threadId: string, revision: unknown) {
   }, [threadId]);
   useEffect(() => {
     void load();
-  }, [load, revision]);
+  }, [load, revision, again]);
   // A file edited on disk shows as changed when the person comes back to the window.
   useEffect(() => {
     const onFocus = () => void load();
@@ -1137,7 +1178,7 @@ export type AckPillState = 'pending' | 'queued' | 'sending' | 'saved' | 'deliver
  * human-only notice (its text stays selectable).
  */
 const REPLY_BOX_CONTROLS =
-  'button, a[href], input, select, textarea, label, summary, [role="button"], [role="dialog"], [role="menu"], [role="listbox"], [role="option"], [data-skill-menu], [data-skill-human-only-notice], [data-compose-file]';
+  'button, a[href], input, select, textarea, label, summary, [role="button"], [role="dialog"], [role="menu"], [role="listbox"], [role="option"], [data-skill-menu], [data-skill-human-only-notice], [data-compose-file], [data-foot-sheet]';
 
 /** The reply box's field: it alone reads the words (replyText.ts), so a key typed re-renders it and nothing else. */
 function ReplyTextField({ replyText, ...props }: Omit<InboxComposerFieldProps, 'value'> & { replyText: ReplyText }) {
@@ -1281,7 +1322,7 @@ async function replyLanded(threadId: string, key: string): Promise<'yes' | 'no' 
 
 const THREAD_GONE_TEXT = 'This thread was deleted, so nothing was sent.';
 
-export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX, onDismissOutbox, sent, onQuestions, onPickSaves, onChanged, draftChanged = 0, onClose, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, onScreenChange, row, drawn = null, onMarkRead, onMarkUnread, onAck, onAction, onArchive, pinned = false, onPin, onSnooze, onUnsnooze, replyRequest, onReplyOpened, askButton = null, askFileButton = null, replyWords = null, onReplyWordsTaken, backLabel = 'Inbox', cardChip, phone = false, stacked = false, fileStacked = false, remote = false, onBackToList, onToast, linkOf, onInboxLink, fullFromSide = false, fullExitFile = null, landing = null, onLanded, artifacts: artifactsRoute = false, onArtifacts, decide = null, threadAlone = false, fullSidebar = true, onFull }: ThreadPaneProps) {
+export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX, onDismissOutbox, sent, onQuestions, onPickSaves, onChanged, draftChanged = 0, filesChanged = 0, onClose, file, onOpenFile, onOpenGuide, lookSeq, seenThrough = null, onSeen, covered = false, onScreenChange, row, drawn = null, onMarkRead, onMarkUnread, onAck, onAction, onArchive, pinned = false, onPin, onSnooze, onUnsnooze, replyRequest, onReplyOpened, askButton = null, askFileButton = null, replyWords = null, onReplyWordsTaken, backLabel = 'Inbox', cardChip, phone = false, stacked = false, fileStacked = false, remote = false, onBackToList, onToast, linkOf, onInboxLink, fullFromSide = false, fullExitFile = null, landing = null, onLanded, artifacts: artifactsRoute = false, onArtifacts, decide = null, threadAlone = false, fullSidebar = true, onFull }: ThreadPaneProps) {
   // "Open in" (OpenIn.tsx): apps on this computer; a new tab only through the tailnet or on a phone.
   const openIn: OpenInSurface | undefined = phone || remote === true ? 'tab' : remote === null ? undefined : 'apps';
   const root = thread.messages[0]!;
@@ -1298,6 +1339,10 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   const liveMessage = (message: InboxMessageWire) => !archived || afterArchive(message);
   const cameBack = archived && thread.messages.some((m) => m.author.kind === 'agent' && afterArchive(m));
   const resolved = archived && !cameBack;
+  // Whom a reply to `message` goes to, named: a second agent by its own name, the thread's first agent as `asker`
+  // (so a thread with one agent reads as it always did). Handoff "multi-agent-thread-model", option A.
+  const firstAgent = startedTo ?? (root.author.kind === 'agent' ? root.author : null);
+  const recipientName = (message: InboxMessageWire | null | undefined) => (isOtherAgent(message, firstAgent) ? agentName(message!.author) : asker);
   const agentMessages = thread.messages.filter((m) => m.author.kind === 'agent');
   const lastAgent = agentMessages[agentMessages.length - 1] ?? root;
   // 👍 Looks good (design record "inbox-acknowledge"): on the agent's latest
@@ -1368,13 +1413,20 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
    * The reply box's words, kept per thread as a server draft (approval
    * "inbox-reply-drafts"): saved while typing, back when the thread opens.
    */
-  const replyDraft = useReplyDraft(thread.thread_id);
+  /** A save of this window's landed: the box takes the draft's files (set below, once the tiles exist). */
+  const takeMergedFiles = useRef<(threadId: string, draft: InboxReplyDraft, wanted: readonly string[]) => void>(() => {});
+  /** Only another window changed the words: the box takes them (set below, once the tiles exist); what it did. */
+  const takeTheirWords = useRef<(threadId: string, draft: InboxReplyDraft, was: string) => ReplyBoxTook>(() => 'differs');
+  const replyDraft = useReplyDraft(thread.thread_id, {
+    onFiles: (threadId, draft, wanted) => takeMergedFiles.current(threadId, draft, wanted),
+    onWords: (threadId, draft, was) => takeTheirWords.current(threadId, draft, was),
+  });
   const keptWords = (replyDraft.conflict ?? replyDraft.draft?.body)?.trim() ?? '';
   /** Whether a Send carries words: the box's, or (the box closed) those kept as its draft. */
   const hasWords = box.open ? boxHasWords : keptWords !== '';
   /** The words a Send carries, as they are now: the box's, or (the box closed) those kept as its draft. */
   const boxWords = () => (box.open ? replyText.get().trim() : keptWords);
-  /** The box closed: the long pastes its draft keeps (approval "inbox-paste-attachment"), which a Send carries too. */
+  /** The box closed: the files its draft keeps (attached, dropped, pasted, long pastes), which a Send carries too. */
   const draftPastes = box.open || replyDraft.conflict !== null ? 0 : (replyDraft.draft?.files?.length ?? 0);
   /** A draft put back in the box opens it without taking focus (the thread's keys and the page keep working). */
   const restoringRef = useRef(false);
@@ -1385,8 +1437,13 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   /**
    * Files pasted, dropped or picked with the paperclip into the reply box (the
    * owner: "paste in images … if I'm focused in a reply"; approval
-   * "inbox-reply-attach"): compose's tiles and upload path. They live with the
-   * box: Cancel, Escape, a Send and another thread forget them.
+   * "inbox-reply-attach"): compose's tiles and upload path. They are part of
+   * the reply draft, beside its words (the owner, 2026-11-02: "ideally it just
+   * syncs"): Cancel, Escape, another thread, a reload, another window and the
+   * phone all keep them, and whichever device sends carries them. A file still
+   * uploading when the box closes or the thread changes lands in that thread's
+   * draft when its upload is in (`landInReplyDraft`). Another machine's thread
+   * keeps no draft: its files live with the box, as before.
    */
   // A paste is said in the thread's polite live region ("Attached pasted-image-….png").
   // A paste of 32 KB or more becomes a pasted text tile (approval "inbox-paste-attachment"), anchored in the box's
@@ -1401,19 +1458,88 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       },
       set: (text) => changeReply(text, true),
     },
+    // The thread pane goes while files upload (a phone's Back): they land in the draft all the same.
+    onUnmountUploads: machine ? undefined : (uploads) => landLater(threadRef.current.thread_id, uploads),
   });
   const replyUploads = replyFiles.uploaded.map((upload) => upload.upload_id);
   /**
-   * The long pastes the draft was last given (approval "inbox-paste-attachment"): a reply draft keeps them beside
-   * the words, so a reload or another window brings the tiles back and Put back still works. A tile that finishes
-   * uploading or is removed saves the draft; one a draft brought back does not save it again.
+   * The files the draft was last given: a reply draft keeps them beside the words, so a reload, another window or
+   * the phone brings the tiles back (Put back still works for a long paste). A tile that finishes uploading or is
+   * removed saves the draft; one a draft brought back does not save it again.
    */
-  const pastedSaved = useRef('');
-  const takeDraftPastes = (files: readonly InboxDraftFile[], words: string) => {
-    replyFiles.restorePasted(files, words);
-    pastedSaved.current = pastedSignature(files.filter((file) => file.pasted));
+  const filesSaved = useRef('');
+  const takeDraftFiles = (files: readonly InboxDraftFile[], words: string, mode: 'replace' | 'add' = 'replace', alsoKeep: readonly string[] = []) => {
+    replyFiles.restoreDraft(files, words, mode, alsoKeep);
+    // What the draft holds is saved already; tiles the person attached before it was read (`add`) are saved with it:
+    // the box's next save names what changed from the draft's files.
+    const held = mode === 'add' ? files : replyFiles.draftFiles();
+    filesSaved.current = pastedSignature(held);
+    replyDraft.boxTook(threadRef.current.thread_id, held.map((file) => file.upload_id));
   };
-  const pastedNow = pastedSignature(replyFiles.pastedDraft());
+  /** Every upload this pane's box finished: a file whose save has not landed comes back as a tile when the box opens again. */
+  const uploadsSeen = useRef(new Map<string, InboxUpload>());
+  for (const upload of replyFiles.uploaded) uploadsSeen.current.set(upload.upload_id, upload);
+  /**
+   * The draft's files with this window's changes not saved yet (`withMyChanges`), as tiles. A file added here whose
+   * upload this pane no longer knows is left out: it still goes with the next save, and the box takes it from that.
+   */
+  const draftFilesWithMine = (files: readonly InboxDraftFile[]): InboxDraftFile[] =>
+    replyDraft.withMyChanges<InboxDraftFile | { upload_id: string; pasted?: InboxDraftFile['pasted'] }>(files).flatMap((file) => {
+      if ('name' in file) return [file];
+      const upload = uploadsSeen.current.get(file.upload_id);
+      return upload ? [{ ...upload, ...(file.pasted ? { pasted: file.pasted } : {}) }] : [];
+    });
+  const filesNow = pastedSignature(replyFiles.draftFiles());
+  /** Files that leave the box still uploading go on, and join this thread's draft once in (not another machine's thread). */
+  const landLater = (threadId: string, uploads: readonly Promise<InboxUpload | null>[]) => {
+    for (const upload of uploads) void landInReplyDraft(threadId, upload);
+  };
+  takeTheirWords.current = (threadId, draft, was) => {
+    // Closed, or showing another thread: no words here to keep (Edit draft and the thread's next visit read the draft).
+    if (threadId !== threadRef.current.thread_id || !boxRef.current.open) return 'hidden';
+    // The box's live words (`replyText.get()`, through `liveBox`): changed since, the person's words win (a conflict).
+    if (boxRef.current.text !== was) return 'differs';
+    // The box still holds the words this window last knew: it takes the other window's, with its files and this
+    // window's file changes not saved yet. A tile finished since the box's last save is in no save yet: it stays, and
+    // its own save adds it.
+    const files = draftFilesWithMine(draft.files ?? []);
+    const listed = new Set(files.map((file) => file.upload_id));
+    const held = new Set(replyDraft.heldOf(threadId));
+    const fresh = replyFiles.draftFiles().map((file) => file.upload_id).filter((id) => !held.has(id) && !listed.has(id));
+    // Through `setBox` only (never `changeReply`: that would save again, and `follow` would move the tiles' anchors).
+    setBox({ open: true, text: draft.body });
+    takeDraftFiles(files, draft.body, 'replace', fresh);
+    if (fresh.length > 0) {
+      const saved = replyFiles.draftFiles().filter((file) => !fresh.includes(file.upload_id));
+      filesSaved.current = pastedSignature(saved);
+      replyDraft.boxTook(threadId, saved.map((file) => file.upload_id));
+    }
+    announce('This reply changed in another window.');
+    return 'took';
+  };
+  takeMergedFiles.current = (threadId, draft, wanted) => {
+    if (threadId !== threadRef.current.thread_id || !boxRef.current.open) return;
+    // A save of this window's landed: the box holds the draft's files (another window's included, one it removed
+    // gone) with this window's changes still on their way (`wanted`). Unchanged: nothing moves (an undo stays armed).
+    const text = boxRef.current.text;
+    const want = new Set(wanted);
+    // A tile that finished uploading since the box's last save is in no save yet: it stays, and its own save adds it.
+    const held = new Set(replyDraft.heldOf(threadId));
+    const all = replyFiles.draftFiles(text).map((file) => file.upload_id);
+    const fresh = all.filter((id) => !held.has(id) && !want.has(id));
+    const now = all.filter((id) => !fresh.includes(id));
+    if (now.length !== want.size || now.some((id) => !want.has(id))) {
+      const inDraft = new Set((draft.files ?? []).map((file) => file.upload_id));
+      // A long paste leaving the box takes words with it: said in the thread's live region.
+      const pastesGone = replyFiles.draftFiles(text).filter((file) => file.pasted && !want.has(file.upload_id) && !fresh.includes(file.upload_id)).length;
+      if (pastesGone > 0) announce(pastesGone === 1 ? 'A pasted text was sent or removed on another device.' : `${pastesGone} pasted texts were sent or removed on another device.`);
+      takeDraftFiles((draft.files ?? []).filter((file) => want.has(file.upload_id)), text, 'replace', [...wanted.filter((id) => !inDraft.has(id)), ...fresh]);
+    }
+    const saved = replyFiles.draftFiles().filter((file) => !fresh.includes(file.upload_id));
+    // Counted as saved without the fresh tiles, so the box's files effect still saves them.
+    if (fresh.length > 0) filesSaved.current = pastedSignature(saved);
+    replyDraft.boxTook(threadId, saved.map((file) => file.upload_id));
+  };
   // The sessions the reply box's text tags with `@` (approval "inbox-tag-agents"), as the field reports them.
   const [taggedIds, setTaggedIds] = useState<readonly string[]>([]);
   // What Send does with the agents tagged in the words (approval "inbox-tag-handoff", A2): an Ask until a link says otherwise.
@@ -1422,14 +1548,17 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     setTaggedIds(ids);
     if (ids.length === 0) setTagMode('ask');
   }, []);
-  const closeBox = () => {
+  /** `discarded`: Discard closed it, so a file still uploading stops instead of joining the draft. */
+  const closeBox = (discarded = false) => {
     // A Send waiting to be confirmed: read back now, so a reply that went leaves no stale "Draft" foot.
     const earlier = unconfirmed.get(thread.thread_id);
     if (earlier) forgetUnconfirmed(earlier, 'closed');
-    // Cancel and Escape keep the words as a draft (saved now); Discard drops them.
+    // Cancel and Escape keep the words and files as a draft (saved now; a file still uploading joins it once in);
+    // Discard drops them.
     replyDraft.flush();
     setBox({ open: false, text: '' });
     setTaggedIds([]);
+    if (!discarded && !machine) landLater(thread.thread_id, replyFiles.detach());
     replyFiles.reset();
   };
   /**
@@ -1603,6 +1732,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     return found?.getAttribute('data-message-article') ?? null;
   };
   const expandAll = () => {
+    perfInteraction('expand-all', thread.messages.length);
     const id = topVisible();
     anchorRef.current = { id, top: id ? (articleOf(id)?.getBoundingClientRect().top ?? 0) : 0, focus: null, folding: false };
     if (allOpen) {
@@ -1794,7 +1924,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   // A saved pick moves neither: only a real read of the thread reads them again.
   const filesRevision = useRef(thread);
   if (!onlyQuestionsChanged(filesRevision.current, thread)) filesRevision.current = thread;
-  const { model: files, load: reloadFiles, patch: patchRecords } = useThreadAttachments(thread.thread_id, filesRevision.current);
+  const { model: files, load: reloadFiles, patch: patchRecords } = useThreadAttachments(thread.thread_id, filesRevision.current, filesChanged);
   const attachments: InboxAttachmentState[] = files?.attachments ?? [];
   // The images the messages' text shows, captured as files (approval "inbox-image-viewer"): opened, stepped and commented like attachments.
   const inlineImages: InboxAttachmentState[] = useMemo(() => files?.inline_images ?? [], [files]);
@@ -1825,14 +1955,29 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   const keepOpen = skipIds.size === 0;
   const toggleKeepOpen = () => setSkipArmed(keepOpen ? new Set(unanswered.map((u) => u.id)) : null);
   const skipping = !keepOpen;
-  const asking = askingSessionOf(thread, { skip: skipIds, carries: hasWords || records.length > 0 || replyUploads.length > 0 || draftPastes > 0 });
-  const askerToWatch = asking && askerCanEnd(asking) ? asking.session : null;
+  const sendCarries = hasWords || records.length > 0 || replyUploads.length > 0 || draftPastes > 0;
+  const wordsAsking = askingSessionOf(thread, { skip: skipIds, carries: sendCarries });
+  const askerToWatch = wordsAsking && askerCanEnd(wordsAsking) ? wordsAsking.session : null;
   // New message (record 5.x): the project's live sessions, and what the button opened.
   const { model: live, load: loadLive } = useLiveSessions(thread.thread_id, askerToWatch);
-  const askerEnded = !resolved && askerHasEnded(asking, live);
-  // Tags (approval "inbox-tag-agents"): who the person can tag with `@`, read while the reply box is open.
-  const taggable = useTaggable(thread.thread_id, (box.open || !!file) && !resolved);
-  const tagOwner = asking?.session ?? taggable?.owner?.session ?? null;
+  // Every other session this Send reaches is checked too (handoff "multi-agent-thread-model", failure 2): a pick
+  // on an ended session's question, while the words go to a live one, opens the choice for that answer.
+  const otherSessions = otherSendSessions(thread, { skip: skipIds, carries: sendCarries, records }, wordsAsking);
+  const otherEnded = useEndedSessions(thread.thread_id, otherSessions.map((s) => s.session));
+  const endedOthers = otherEnded.ended;
+  const wordsEnded = !resolved && askerHasEnded(wordsAsking, live);
+  const endedOther = resolved || wordsEnded ? null : (otherSessions.filter((s) => endedOthers.has(s.session)).at(-1) ?? null);
+  /** The session the ended note and the choice are about: the words', else another this Send answers that ended. */
+  const asking = endedOther ?? wordsAsking;
+  const askerEnded = wordsEnded || endedOther !== null;
+  /** Each session whose replies the choice sends on: every one of this Send's sessions that ended. */
+  const endedSends = new Set([...(wordsEnded && wordsAsking ? [wordsAsking.session] : []), ...otherSessions.filter((s) => !resolved && endedOthers.has(s.session)).map((s) => s.session)]);
+  // Tags (approval "inbox-tag-agents"): who the person can tag with `@`, read while the reply box is open. In a
+  // thread with more than one agent, read with the box closed too: the recipient pill and the message heads name
+  // agents by their folders (approval "inbox-reply-recipient"), and a head must not change when the box opens.
+  const multiAgent = participants.length > 1 || activeHandoff(thread) !== null;
+  const taggable = useTaggable(thread.thread_id, (box.open || !!file || multiAgent) && !resolved);
+  const tagOwner = wordsAsking?.session ?? taggable?.owner?.session ?? null;
   const tagOpts: TagOption[] = useMemo(() => tagOptions(taggable, tagOwner, thread.project.id, whenTime), [taggable, tagOwner, thread.project.id]);
   // Until the list is read (or from an older Inbox) `@` is plain text.
   const composerTags = useMemo(
@@ -1865,6 +2010,10 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   // A thread handed to another session: its replies go there.
   const handedOff = activeHandoff(thread);
   const replyName = handingTo ? handingTo.label : handedOff ? handoffName(handedOff) : null;
+  /** Whom the box's words go to: the hand-off's agent, else the session of the message they answer (wordsMessage). */
+  const replyTo = replyName ?? recipientName(wordsMessage(thread));
+  // The agent that wrote last after the archive (the archived came-back note): named as a reply to it would be.
+  const cameBackName = cameBack ? recipientName(thread.messages.filter((m) => m.author.kind === 'agent' && afterArchive(m)).at(-1)) : asker;
   // The same agents in a file comment's composer (markdown, text and HTML files): a tag there sends the
   // whole reply to that agent, and the composer says so under the field.
   const commentMentions = useMemo<MentionSource | undefined>(
@@ -1885,10 +2034,127 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     [tagOpts],
   );
   const anyOtherLive = asking !== null && othersLive(asking, live).length > 0;
+  // Who gets the reply (approval "inbox-reply-recipient", option E): a pill under the box, right, in a thread with
+  // more than one agent, or one whose only agent ended while another is live (it does the old route choice's job).
+  const pillActive = !resolved && (multiAgent || (askerEnded && anyOtherLive));
+  /** Whom the words go to unless the person aims them: the session of the message they answer (wordsMessage). */
+  const rcptDefault = (() => {
+    const words = wordsMessage(thread);
+    return words.author.kind === 'agent' ? (words.author.session ?? null) : (words.to?.session ?? null);
+  })();
+  // The choice: the first answers its own latest message, the rest ride as tags. Null: not fixed yet (it is fixed
+  // when the box opens, so a new message does not move it). Kept with the draft (its `recipients`).
+  const [rcptPick, setRcptPick] = useState<readonly string[] | null>(null);
+  const [rcptOpen, setRcptOpen] = useState(false);
+  /** Send already stopped once to show that the recipient has ended: pressed again, the reply waits for it. */
+  const rcptAsked = useRef(false);
+  /** Sessions a Send was refused for as not live any more (the race): ended in the list from then on. */
+  const [rcptGone, setRcptGone] = useState<ReadonlyMap<string, string | null>>(() => new Map());
+  const rcptAgents = useMemo((): RecipientRow[] => {
+    if (!pillActive) return [];
+    const people: RecipientPerson[] = [...participants];
+    const add = (host: string | null, session: string) => {
+      if (!people.some((p) => p.session === session)) people.push({ host, session });
+    };
+    const handed = activeHandoff(thread);
+    if (handed?.to) add(handed.to.host, handed.to.session);
+    // The agent asked has ended: the live sessions take its place in the list (its project's, and writers from other folders).
+    if (askerEnded) for (const s of live?.sessions ?? []) add(s.host, s.session);
+    // One that ended as a Send went to it stays in the list, ended.
+    for (const [session, host] of rcptGone) add(host, session);
+    const ended = new Set([...(askerEnded && asking ? [asking.session] : []), ...rcptGone.keys()]);
+    return recipientRows(
+      people,
+      // A live session of the project's list that the `@` list has not read: the thread's folder (the list is its project's).
+      (session) =>
+        sessionFolder(session, thread, taggable) ?? (rcptGone.has(session) || live?.sessions.some((s) => s.session === session) ? thread.project.name : null),
+      (session) => recipientState(session, taggable, ended),
+    ).map((row) => ({ ...row, alone: canTakeAlone(row.state, row.session === rcptDefault || latestBy(thread, row.session) !== undefined) }));
+  }, [pillActive, participants, thread, askerEnded, asking, live, taggable, rcptGone, rcptDefault]);
+  /** Whether a session can be the first recipient (a typed tag's, not in the list, is live). */
+  const rcptAlone = (id: string) => rcptAgents.find((r) => r.session === id)?.alone !== false;
+  /** The choice came back with a draft (not the person's own tap): one led by an agent that can't take it alone is not kept. */
+  const [rcptRestored, setRcptRestored] = useState(false);
+  /**
+   * The choice, without a session this window does not list (a restored draft's): the pill and Send both read it.
+   * A restored one led by an agent that can't take the reply alone is led by the next that can, else the default.
+   */
+  const rcptKnown = knownRecipients(rcptPick, (id) => rcptAgents.some((r) => r.session === id) || tagOpts.some((o) => o.id === id));
+  const rcptPicked = rcptRestored && rcptKnown ? aimable(rcptKnown, rcptAlone) : rcptKnown;
+  const rcptIds: string[] = handingTo ? [handingTo.id] : [...new Set([...(rcptPicked ?? (rcptDefault ? [rcptDefault] : [])), ...taggedIds])];
+  const rcptChosen: RecipientRow[] = rcptIds.flatMap((id) => {
+    const row = rcptAgents.find((r) => r.session === id);
+    if (row) return [row];
+    const option = tagOpts.find((o) => o.id === id);
+    return option ? [{ session: id, host: option.host, label: option.label, short: option.label, state: 'live' as const }] : [];
+  });
+  const rcptNames = namesList(rcptChosen.map((r) => r.label));
+  /** Whom the box's words go to, named: the pill's names where it shows, else as before (the field's name, full screen's card). */
+  const replyToNames = pillActive && rcptNames ? rcptNames : replyTo;
+  // The choice a draft was saved with comes back (a reload, another window, back to the thread). While the box is
+  // open the person's own choice stands: a save's answer never takes it back.
+  const draftAim = replyDraft.draft?.recipients?.join('\u0000') ?? '';
+  useEffect(() => {
+    if (!pillActive || !draftAim) return;
+    const list = draftAim.split('\u0000');
+    if (rcptPick === null || (!boxRef.current.open && rcptPick.join('\u0000') !== draftAim)) {
+      setRcptPick(list);
+      setRcptRestored(true);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftAim, pillActive]);
+  // Fixed when the box opens: a new message does not move it. A box closed with no draft forgets it.
+  useEffect(() => {
+    if (!pillActive) return;
+    if (box.open) {
+      if (rcptPick === null) {
+        const saved = replyDraft.draft?.recipients;
+        if (saved && saved.length > 0) {
+          setRcptPick(saved);
+          setRcptRestored(true);
+        } else if (rcptDefault) {
+          setRcptPick([rcptDefault]);
+          setRcptRestored(false);
+        }
+      }
+      return;
+    }
+    setRcptOpen(false);
+    if (!replyDraft.draft) setRcptPick(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [box.open, pillActive]);
+  useEffect(() => {
+    setRcptPick(null);
+    setRcptRestored(false);
+    setRcptOpen(false);
+    setRcptGone(new Map());
+    rcptAsked.current = false;
+  }, [thread.thread_id]);
+  // The draft's saves name the choice (the server keeps it with the words).
+  useEffect(() => {
+    if (pillActive) replyDraft.aim(rcptPick);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rcptPick, pillActive]);
+  /** The person changed who gets the reply: a draft already kept learns it now. */
+  const aimReply = (pick: readonly string[]) => {
+    setRcptPick(pick);
+    setRcptRestored(false);
+    rcptAsked.current = false;
+    replyDraft.aim(pick);
+    const text = replyText.get();
+    const files = replyFiles.draftFiles(text);
+    if (boxRef.current.open && (text.trim() !== '' || files.length > 0)) replyDraft.save(text, files);
+  };
   const noteId = `ib-asker-note-${thread.thread_id}`;
   const conflictId = `ib-draft-conflict-${thread.thread_id}`;
   // The choice at Send, when the session that asked has ended.
   const [route, setRoute] = useState<RouteState>(CLOSED_ROUTE);
+  /** A Send waits for the read of a session it reaches (useEndedSessions' `check`): a second press meanwhile does nothing. */
+  const checkingEnded = useRef(false);
+  /** Counts the Sends that started posting: a Send that waited for the ended check goes only if none started meanwhile. */
+  const sendStarts = useRef(0);
+  /** The newest render's `send`: a Send that waited for the ended check goes on with the state of now, not of the press. */
+  const latestSend = useRef<(options?: { despiteReplaced?: boolean; routed?: boolean; stayFull?: boolean; endedChecked?: ReadonlySet<string> }) => Promise<void>>(async () => {});
   /** What the route choice is for: a reply, or a Re-ask (the same choice, its own words). */
   const [routeFor, setRouteFor] = useState<'reply' | 'reask'>('reply');
   const reaskRef = useRef<HTMLButtonElement>(null);
@@ -2200,8 +2466,14 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     });
   };
 
+  /** The thread the reply box's files belong to (a file still uploading as the thread changes joins its draft). */
+  const filesFor = useRef(thread.thread_id);
   useEffect(() => {
-    // Another thread: nothing of the last one carries over.
+    // Another thread: nothing of the last one carries over. Its files are in its draft already; one still
+    // uploading joins it once in (another machine's thread keeps no draft: it stops).
+    const previous = filesFor.current;
+    filesFor.current = thread.thread_id;
+    if (previous !== thread.thread_id && !machineOf(previous)) landLater(previous, replyFiles.detach());
     setPending(new Map());
     setBox({ open: false, text: '' });
     replyFiles.reset();
@@ -2793,16 +3065,16 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     // The box's words as the answer comes (a restore or typing may change them meanwhile): edits there
     // win, and the next save is refused if the draft moved.
     void reloadDraft(() =>
-      boxRef.current.open ? { text: boxRef.current.text, files: replyFiles.pastedDraft(boxRef.current.text) } : null,
+      boxRef.current.open ? { text: boxRef.current.text, files: replyFiles.draftFiles(boxRef.current.text) } : null,
     ).then((answer) => {
       if (!answer?.replaceBox) return;
       if (answer.draft) {
         setBox({ open: true, text: answer.draft.body });
-        takeDraftPastes(answer.draft.files ?? [], answer.draft.body);
+        takeDraftFiles(answer.draft.files ?? [], answer.draft.body);
         announce('This reply changed in another window.');
       } else {
-        // Sent or discarded elsewhere: nothing of it is left to show (other pasted files keep the box open).
-        takeDraftPastes([], '');
+        // Sent or discarded elsewhere: nothing of it is left to show (a file still uploading here keeps the box open).
+        takeDraftFiles([], '');
         const others = replyFiles.current().length > 0;
         setBox({ open: others, text: '' });
         if (!others) setTaggedIds([]);
@@ -2812,16 +3084,16 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftChanged, reloadDraft]);
 
-  // A long paste finished uploading, or a tile was removed: the draft keeps the tiles as they are now (the words
+  // A file finished uploading, or a tile was removed (its ×): the draft keeps the tiles as they are now (the words
   // unchanged). A Send on its way, a closed box (Cancel kept the draft as it was) and a draft's own tiles save nothing.
   useEffect(() => {
-    if (pastedNow === pastedSaved.current) return;
-    pastedSaved.current = pastedNow;
+    if (filesNow === filesSaved.current) return;
+    filesSaved.current = filesNow;
     const current = boxRef.current;
     if (!current.open || sending) return;
-    replyDraft.save(current.text, replyFiles.pastedDraft(current.text));
+    replyDraft.save(current.text, replyFiles.draftFiles(current.text));
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pastedNow]);
+  }, [filesNow]);
 
   // A conflict appears (both windows hold words): said once in the thread's live region.
   const conflictShown = replyDraft.conflict !== null;
@@ -2843,8 +3115,10 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     if (current.open && current.text.trim()) return;
     if (!current.open) restoringRef.current = true;
     setBox({ open: true, text: kept });
-    // Its long pastes come back as tiles that Put back still returns (words a conflict left here have none).
-    if (replyDraft.conflict === null) takeDraftPastes(replyDraft.draft?.files ?? [], kept);
+    // Its files come back as tiles (a long paste's Put back still works), beside any the person attached before the
+    // draft was read. With words a conflict left here too: this window's files waiting on the choice show, so Keep
+    // mine keeps them.
+    takeDraftFiles(draftFilesWithMine(replyDraft.draft?.files ?? []), kept, 'add');
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [replyDraft.loadedFor, replyDraft.draft, replyDraft.conflict, thread.thread_id]);
 
@@ -2877,16 +3151,15 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
 
   // The update control's restart guard: an unsent reply is the one thing a
   // restart (a page reload) would lose.
-  // Words are kept as a draft (and sent as the page goes); only files pasted into the box are not.
-  // The restart guard asks while files pasted into the box, or words not saved yet (a save waiting or on
-  // its way, words a conflict left unsaved: replyDraftUnsaved, read when the guard asks), would be lost.
+  // Words and files are kept as a draft (words also sent as the page goes). The restart guard asks while a file
+  // the draft does not hold yet, or words not saved yet (a save waiting or on its way, words a conflict left
+  // unsaved, a file landing in a closed box's draft: replyDraftUnsaved, read when the guard asks), would be lost.
   const unsentSubject = thread.subject ?? 'this thread';
-  // A long paste the reply draft holds on the server (approval "inbox-paste-attachment") is not lost by a restart. One
-  // still uploading, waiting for its save, refused (its upload gone), or on another machine's thread (whose drafts are
-  // not saved) would be: the guard asks.
-  const heldPastes = new Set((replyDraft.draft?.files ?? []).map((file) => file.upload_id));
+  // A file the reply draft holds on the server is not lost by a restart. One still uploading, waiting for its save,
+  // refused (its upload gone), or on another machine's thread (whose drafts are not saved) would be: the guard asks.
+  const heldFiles = new Set((replyDraft.draft?.files ?? []).map((file) => file.upload_id));
   const unsentFiles =
-    box.open && replyFiles.files.some((file) => !(file.pasted && file.state === 'done' && file.upload && !machine && heldPastes.has(file.upload.upload_id)));
+    box.open && replyFiles.files.some((file) => !(file.state === 'done' && file.upload && !machine && heldFiles.has(file.upload.upload_id)));
 
   // Files dropped on the reply box attach there (a dashed "Drop to attach"; approval "inbox-reply-attach").
   const boxDrop = useFileDrop((list) => {
@@ -2907,7 +3180,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   reloadFlush.current = async () => {
     const current = boxRef.current;
     const text = current.open ? current.text : null;
-    const [reply, answers] = await Promise.all([replyDraft.settle(text, text === null ? undefined : replyFiles.pastedDraft(text)), pickQueue.settled()]);
+    const [reply, answers] = await Promise.all([replyDraft.settle(text, text === null ? undefined : replyFiles.draftFiles(text)), pickQueue.settled()]);
     const awayWords = !!machine && text !== null && text.trim() !== '';
     return reply && answers && !unsentFiles && !awayWords;
   };
@@ -3162,6 +3435,8 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
 
   // The person's own sent replies are drawn in their words, with the answers they carried as a
   // short list read from the questions (sentReply.ts): never the agent-facing answers section.
+  // Its times read "8:22 PM" today and "Nov 1, 8:22 PM" after midnight: a new day builds it again.
+  const day = new Date().toDateString();
   const sentAnswersByReply = useMemo(() => {
     const out = new Map<string, SentAnswerGroup[]>();
     for (const m of thread.messages) {
@@ -3170,7 +3445,8 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       if (groups.length > 0) out.set(m.id, groups);
     }
     return out;
-  }, [thread.messages]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- `day` is the key, not an input.
+  }, [thread.messages, day]);
 
   const openBox = () => {
     setNewMessage(null);
@@ -3179,7 +3455,12 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     const kept = replyDraft.conflict ?? replyDraft.draft?.body ?? '';
     const text = kept.trim() ? kept : '';
     setBox({ open: true, text });
-    if (replyDraft.conflict === null && replyDraft.draft?.files?.length) takeDraftPastes(replyDraft.draft.files, text);
+    // Its files come back as tiles (Cancel, another thread or a reload took them out of the box, never the draft), with
+    // this window's changes not saved yet; the box's next save counts from them. With a conflict too: a file whose save
+    // waits on the person's choice shows, so Keep mine keeps it (an empty box would send its removal).
+    const files = draftFilesWithMine(replyDraft.draft?.files ?? []);
+    if (files.length > 0) takeDraftFiles(files, text);
+    else replyDraft.boxTook(thread.thread_id, replyFiles.draftFiles(text).map((file) => file.upload_id));
     setError(null);
   };
 
@@ -3234,6 +3515,8 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   const changeReply = (text: string, behind = false) => {
     // Read-only while a Send is on its way: the words it carries are the words in the box.
     if (sending) return;
+    // A key typed (not a restore): pn:keystroke when the next frame comes 50 ms or more after the key.
+    if (!behind) perfKeystroke();
     // The words changed (or emptied): a Send waiting to be confirmed no longer matches them.
     const earlier = unconfirmed.get(thread.thread_id);
     if (earlier && text.trim() !== earlier.words) forgetUnconfirmed(earlier, text.trim() === '' ? 'emptied' : 'edited');
@@ -3243,10 +3526,10 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     boxRef.current = liveBox(true);
     // A long paste's tile keeps its place in the words, edit by edit (this pane does not render for a key).
     replyFiles.follow();
-    // The long pastes beside the words go in the draft too, each placed in these words (approval "inbox-paste-attachment").
-    const pastes = replyFiles.pastedDraft(text);
-    pastedSaved.current = pastedSignature(pastes);
-    replyDraft.save(text, pastes);
+    // The files beside the words go in the draft too, a long paste placed in these words (approval "inbox-paste-attachment").
+    const files = replyFiles.draftFiles(text);
+    filesSaved.current = pastedSignature(files);
+    replyDraft.save(text, files);
   };
 
   /** The reply box opens behind full screen, without taking focus (full screen's composer writes into it). */
@@ -3384,6 +3667,10 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     else replyDraft.release();
     setTaggedIds([]);
     setTagMode('ask');
+    // The pill's choice resets after Send: the next reply goes to the last writer until the person aims it.
+    setRcptPick(null);
+    setRcptOpen(false);
+    rcptAsked.current = false;
   };
 
   /**
@@ -3391,12 +3678,13 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
    * the person must read in the thread first (a replaced pick's guard, where an ended session's reply goes)
    * takes them there, on the device's route.
    */
-  const send = async (options: { despiteReplaced?: boolean; routed?: boolean; stayFull?: boolean } = {}) => {
+  const send = async (options: { despiteReplaced?: boolean; routed?: boolean; stayFull?: boolean; endedChecked?: ReadonlySet<string> } = {}): Promise<void> => {
     // Whether this Send came from the ⌘Enter key (it draws no focus ring on the head it focuses): read at once.
     const byChord = sentByChord.current;
     sentByChord.current = false;
     // Dictation still running, in this box: the words are not in it yet (Mod+Enter reaches here with Send off).
-    if (sending || voice.busy) return;
+    // A Send waiting for the ended check (below) holds every other press: else both would post the replies.
+    if (sending || voice.busy || checkingEnded.current) return;
     // A pick was replaced while the person was answering: nothing goes until they have read that.
     if (staleQuestions.length > 0 && !options.despiteReplaced) {
       setGuard(true);
@@ -3408,16 +3696,80 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       setError('Wait for the files to finish uploading.');
       return;
     }
+    // Another session this Send reaches, not read yet (the list just changed with a pick): wait for its read,
+    // so "not read yet" never sends to an ended session without the choice (handoff "multi-agent-thread-model").
+    let gateEnded = askerEnded;
+    let gateAsking = asking;
+    if (!options.routed && !askerEnded && !resolved && !options.endedChecked && otherEnded.unchecked) {
+      checkingEnded.current = true;
+      const starts = sendStarts.current;
+      const startedOn = thread.thread_id;
+      let ended: ReadonlySet<string>;
+      try {
+        ended = await otherEnded.check();
+      } finally {
+        checkingEnded.current = false;
+      }
+      // Another Send went while this one waited: this one's replies went with it. The person opened another
+      // thread meanwhile (the pane stays mounted): nothing of this thread goes to that thread's agent.
+      if (sendStarts.current !== starts || threadRef.current.thread_id !== startedOn) return;
+      // What the press saw is stale now (words typed, picks made during the read): the newest Send goes, with
+      // what the read found, and does not wait again.
+      sentByChord.current = byChord;
+      return latestSend.current({ ...options, endedChecked: ended });
+    }
+    if (!options.routed && !askerEnded && !resolved && options.endedChecked) {
+      const found = options.endedChecked;
+      const other = otherSessions.filter((s) => found.has(s.session) || endedOthers.has(s.session)).at(-1) ?? null;
+      if (other) {
+        gateEnded = true;
+        gateAsking = other;
+      }
+    }
+    const gateOtherLive = gateAsking !== null && othersLive(gateAsking, live).length > 0;
+    /** This Send's sessions that ended, with what the read it waited for found (its state may not show it yet). */
+    const sendEnded = new Set([...endedSends, ...(options.endedChecked && !resolved ? otherSessions.filter((s) => options.endedChecked!.has(s.session)).map((s) => s.session) : [])]);
+    // The recipient pill takes the route choice's place (approval "inbox-reply-recipient"): a Send to agents
+    // that have all ended opens its list once, with the live ones in it; pressed again, the reply waits for them.
+    if (pillActive && !options.routed) {
+      const gone = rcptChosen.length > 0 && rcptChosen.every((r) => r.state === 'ended');
+      // Only when the pill's agents get something: the words (or files, comments), or their own questions' answers.
+      // Picks on a live agent's question alone go to it, whoever the pill names.
+      const reaches = sendCarries || rcptChosen.some((r) => sendEnded.has(r.session));
+      // A live agent to pick: one the reply's `to` reaches, an older Plannotator's session too (it can't be tagged, but it takes a reply).
+      if (gone && reaches && rcptAgents.some((r) => r.state === 'live' || r.state === 'old') && !rcptAsked.current) {
+        const empty = picksCount === 0 && records.length === 0 && boxWords() === '' && replyUploads.length === 0 && draftPastes === 0 && !skipping;
+        if (empty) {
+          setError('Write a reply or pick an answer first.');
+          return;
+        }
+        rcptAsked.current = true;
+        setError(null);
+        if (!box.open) openBox();
+        setRcptOpen(true);
+        if (options.stayFull) fileToThread();
+        return;
+      }
+      // The words' agent can't take them alone any more (it ended after it was picked, and never wrote here): nothing
+      // goes, and the list stays open for another pick (its row can't be picked alone).
+      const lead = handingTo ? null : rcptPicked?.[0];
+      if (lead && sendCarries && !rcptAlone(lead)) {
+        if (!box.open) openBox();
+        setRcptOpen(true);
+        if (options.stayFull) fileToThread();
+        return;
+      }
+    }
     // The session that asked has ended and another is live: Send asks where
     // the reply goes first (the choice), and sends nothing yet.
-    if (askerEnded && anyOtherLive && asking && !options.routed) {
+    if (!pillActive && gateEnded && gateOtherLive && gateAsking && !options.routed) {
       const empty = picksCount === 0 && records.length === 0 && boxWords() === '' && replyUploads.length === 0 && draftPastes === 0 && !skipping;
       if (empty) {
         setError('Write a reply or pick an answer first.');
         return;
       }
       setError(null);
-      setRoute((current) => mergeRouteRows({ ...current, open: true, error: null, focus: current.focus + 1 }, asking, live));
+      setRoute((current) => mergeRouteRows({ ...current, open: true, error: null, focus: current.focus + 1 }, gateAsking, live));
       if (options.stayFull) fileToThread();
       return;
     }
@@ -3427,8 +3779,23 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       options.routed && route.selected && route.selected !== LEAVE && route.selected !== asking?.session
         ? (route.rows.find((row) => row.live.session === route.selected && !row.ended)?.live ?? null)
         : null;
-    const to = chosen ? { host: chosen.host, session: chosen.session } : undefined;
+    // The pill's choice: the first gets the words (they answer its own latest message), the rest ride as tags.
+    // Aimed at a live session, the replies to an ended session's questions in this Send follow it (`to`), as
+    // the route choice's pick did.
+    const first = pillActive && !handingTo ? (rcptPicked?.[0] ?? rcptDefault) : null;
+    const aimed = first !== null && first !== rcptDefault ? first : null;
+    const firstLive = first ? (live?.sessions.find((s) => s.session === first) ?? null) : null;
+    const aimedTo = firstLive ? { host: firstLive.host, session: firstLive.session } : undefined;
+    const pillExtra = pillActive && !handingTo && rcptPicked ? rcptPicked.slice(1) : [];
+    const to = chosen ? { host: chosen.host, session: chosen.session } : aimedTo;
+    // Aimed at a session with no message of its own here (tagged in the thread): the words go to it by name (`to`),
+    // live or not as this window last read it. One not live any more is the server's refusal (409), never another agent.
+    const aimedHost = aimed
+      ? (firstLive?.host ?? rcptAgents.find((r) => r.session === aimed)?.host ?? tagOpts.find((o) => o.id === aimed)?.host ?? rcptGone.get(aimed) ?? null)
+      : null;
+    const aimedAway: { host?: string; session: string } | undefined = aimed ? { session: aimed, ...(aimedHost ? { host: aimedHost } : {}) } : undefined;
     sendingFromComposer.current = options.stayFull === true;
+    sendStarts.current += 1;
     setSending(true);
     setError(null);
     /** Replies of this Send that went (or were already there, a retry's replays). */
@@ -3440,6 +3807,8 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     /** The reply that carries the box's words, once its POST went out (its idempotency key), and why the Send stopped. */
     let wordsKey: string | null = null;
     let failure: unknown = null;
+    /** The session the request being posted names (`to`): the one a "not live any more" refusal is about. */
+    let postingTo: { host?: string; session: string } | undefined;
     /** This Send's words, the requests it posts, and the uploads they carry. */
     let sendWords = '';
     /** The Send carries the draft (its words, or a long paste kept beside them): its clear_draft goes, and the draft is done. */
@@ -3501,12 +3870,12 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       }
       let words = boxWords();
       let draftSavedAs: string | null = null;
-      /** The long pastes a closed box's draft keeps (approval "inbox-paste-attachment"): they go with its words. */
+      /** The files a closed box's draft keeps (attached on any device, long pastes too): they go with its words. */
       let draftUploads: string[] = [];
       const savedAs = await replyDraft.claim();
       claimed = true;
       if (box.open) {
-        if (words !== '' || replyFiles.pastedDraft().length > 0) draftSavedAs = savedAs;
+        if (words !== '' || replyFiles.draftFiles().length > 0) draftSavedAs = savedAs;
       } else if (replyDraft.conflict !== null) {
         // Words another window's change left unsaved here: they go, and the newer draft stays.
         words = replyDraft.conflict.trim();
@@ -3519,7 +3888,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
         draftUploads = (kept?.files ?? []).map((file) => file.upload_id);
       }
       sendWords = words;
-      sendClears = words !== '' || draftUploads.length > 0 || (box.open && replyFiles.pastedDraft().length > 0);
+      sendClears = words !== '' || draftUploads.length > 0 || (box.open && replyFiles.draftFiles().length > 0);
       // Only the questions the person chose to skip, and only while still open (sendTargetsOf reads the
       // thread as it is now): a pick saved meanwhile is sent instead, a question that landed is left open.
       const skip = skipArmed ?? new Set<string>();
@@ -3529,40 +3898,69 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       // One reply per session, its picks, skips and action items in the draft. The latest agent message rides
       // last only to carry the words, the annotations and the pasted files; with none, a target with nothing to
       // send is left out.
-      const plain = sendTargetsOf(current, skip).filter(
+      // Aimed with the pill at a session that wrote here: the words answer its latest message.
+      const aimedAt = aimed ? latestBy(current, aimed) : undefined;
+      const plain = sendTargetsOf(current, skip, aimedAt).filter(
         (t, index, all) => t.questions.length > 0 || t.skip.length > 0 || t.actions.length > 0 || (carries && index === all.length - 1),
       );
+      // Aimed at a session that never wrote here: the reply carrying the words goes to it alone (`to`). When that
+      // reply would also answer another session's own questions, it splits in two: the answers go to the session
+      // that asked them, with no words, and the words go only to the aimed one. Each half keeps its own key.
+      const wordsTo = aimed && !aimedAt && carries ? aimedAway : undefined;
       // A comment on another session's message rides a reply to that message (routeSendAnnotations).
       const { targets, carried } = routeSendAnnotations(current, plain, pendingAnnotations);
       if (targets.length === 0) {
         setError('Write a reply or pick an answer first.');
         return;
       }
-      const lastId = targets.at(-1)!.message.id;
-      // Every tag of this Send (the words' and every carried comment's), once each, on the last reply.
+      /** One request of this Send: its target, the key it keeps across retries, its comments, and where it goes. */
+      const parts = targets.map((t) => ({ target: t, key: replyKeyOf(t.message), own: carried.get(t.message.id) ?? [], wordsTo: undefined as typeof wordsTo }));
+      if (wordsTo) {
+        const tail = parts.at(-1)!;
+        const t = tail.target;
+        const wordsPart = { target: { message: t.message, questions: [], skip: [], actions: [] }, key: `w:${wordsTo.session}`, own: tail.own, wordsTo };
+        // Where the tail's own answers go: their asker, or (it ended) the live agent the pill names.
+        const owner = t.message.author.kind === 'agent' ? (t.message.author.session ?? null) : null;
+        const answersTo = to && owner && sendEnded.has(owner) ? to.session : owner;
+        if ((t.questions.length > 0 || t.skip.length > 0 || t.actions.length > 0) && answersTo !== wordsTo.session) {
+          tail.own = [];
+          parts.push(wordsPart);
+        } else {
+          // One agent gets both: one reply, as before.
+          parts[parts.length - 1] = { ...wordsPart, target: t };
+        }
+      }
+      const lastKey = parts.at(-1)!.key;
+      // Every tag of this Send (the words', the pill's other recipients' and every carried comment's), once each, on the last reply.
       const sendTags = sendTagsByTarget(
-        targets.map((t) => ({ id: t.message.id, owner: t.message.author.kind === 'agent' ? (t.message.author.session ?? null) : null })),
-        taggedIds,
-        new Map(targets.map((t) => [t.message.id, (carried.get(t.message.id) ?? []).flatMap((r) => commentTags(r))])),
+        parts.map((p) => ({ id: p.key, owner: p.wordsTo ? p.wordsTo.session : p.target.message.author.kind === 'agent' ? (p.target.message.author.session ?? null) : null })),
+        [...taggedIds, ...pillExtra],
+        new Map(parts.map((p) => [p.key, p.own.flatMap((r) => commentTags(r))])),
         tagOpts,
         sendMode,
       );
+      // The line under the sent reply names the pill's recipients as the pill does ("Claude Code (plannotator)").
+      // A typed `@` keeps its own label: the words carry it, and the sent reply paints it from the label.
+      const pillNamed = new Set(pillExtra.filter((id) => !taggedIds.includes(id)));
+      if (pillNamed.size > 0) {
+        for (const [id, list] of sendTags) sendTags.set(id, list.map((t) => (pillNamed.has(t.session) ? { ...t, label: rcptAgents.find((r) => r.session === t.session)?.label ?? t.label } : t)));
+      }
       if (!sendKeys.current) sendKeys.current = new Map();
-      // One key per session's reply, kept for a retry.
-      for (const t of targets) if (!sendKeys.current.has(replyKeyOf(t.message))) sendKeys.current.set(replyKeyOf(t.message), newUuid());
+      // One key per session's reply (and one for words aimed away from it), kept for a retry.
+      for (const p of parts) if (!sendKeys.current.has(p.key)) sendKeys.current.set(p.key, newUuid());
       // A retry whose words, files or annotations changed, or that carries a pick or skip the last try did
       // not: each reply carrying them is a new one (a replay of the old key would drop the new answer). A pick
       // that went with the last try and is now sent only leaves the list, which keeps the key.
       const contents = new Map<string, SentContents>(
-        targets.map((t) => [
-          replyKeyOf(t.message),
+        parts.map((p) => [
+          p.key,
           {
             value: JSON.stringify([
-              t.message.id,
-              t.message.id === lastId ? [words, uploads, sendTags.get(lastId) ?? []] : [],
-              (carried.get(t.message.id) ?? []).map((r) => [r.id, r.updated_at]),
+              p.target.message.id,
+              p.key === lastKey ? [words, uploads, sendTags.get(lastKey) ?? [], p.wordsTo ?? null] : [],
+              p.own.map((r) => [r.id, r.updated_at]),
             ]),
-            answers: sendTargetAnswerIds(t),
+            answers: sendTargetAnswerIds(p.target),
           },
         ]),
       );
@@ -3572,16 +3970,16 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       // a comment on another session's message rides the reply to it. The
       // skills each reply's words and comments reference ride it too, as one
       // block at its end (skills.ts: a human-only skill's SKILL.md pasted in, its folder named).
-      for (const [index, target] of targets.entries()) {
-        const last = index === targets.length - 1;
-        const own = carried.get(target.message.id) ?? [];
+      for (const [index, part] of parts.entries()) {
+        const { target, own } = part;
+        const last = index === parts.length - 1;
         const annotationsFeedback = own.length > 0 ? await buildFeedback(own) : '';
         const skills = await inboxSkillsBlock([last ? words : '', ...annotationSkillTexts(own)], INBOX_REPLY_SKILL_AUDIENCE);
         const feedback = withSkillsBlock(annotationsFeedback, skills);
         // The agents tagged anywhere in this Send ride the last reply (a tag in a file comment sends the whole reply).
-        const tags = sendTags.get(target.message.id) ?? [];
+        const tags = sendTags.get(part.key) ?? [];
         requests.push({ messageId: target.message.id, input: {
-          idempotency_key: sendKeys.current.get(replyKeyOf(target.message)) ?? newUuid(),
+          idempotency_key: sendKeys.current.get(part.key) ?? newUuid(),
           words: last ? words : '',
           questions: target.questions,
           ...(target.skip.length > 0 ? { skip: target.skip } : {}),
@@ -3594,9 +3992,14 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
           // The reply that carries the box's words: their draft goes with the Send (that draft, or one holding
           // exactly these words when the `updated_at` they were saved as is not known here).
           ...(last && sendClears ? { clear_draft: draftSavedAs ?? '' } : {}),
-          // Only a message the ended session asked goes to the session picked;
-          // an answer to another session's message still goes to that session.
-          ...(to && target.message.author.kind === 'agent' && target.message.author.session === asking?.session ? { to } : {}),
+          // Only a message an ended session of this Send asked goes to the session picked;
+          // an answer to a live session's message still goes to that session.
+          // The words aimed with the pill at a session that never wrote here go to it alone.
+          ...(part.wordsTo
+            ? { to: part.wordsTo }
+            : to && target.message.author.kind === 'agent' && !!target.message.author.session && sendEnded.has(target.message.author.session)
+              ? { to }
+              : {}),
         } });
       }
       // The tiles this Send carries, by the uploads its requests carry: a file pasted while it is in flight stays.
@@ -3606,6 +4009,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       let handedReply: InboxMessageWire | null = null;
       for (const request of requests) {
         if (request.input.words) wordsKey = request.input.idempotency_key;
+        postingTo = request.input.to;
         const answer = await inboxApi.reply(request.messageId, request.input);
         const written = answer.reply as InboxMessageWire | null;
         if (written?.handoff && !answer.replayed) handedReply = written;
@@ -3617,7 +4021,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       focusSent.current = !options.stayFull;
       if (options.stayFull) {
         setComposerSentAt(Date.now());
-        announce(`Sent to ${replyName ?? asker}.`);
+        announce(`Sent to ${replyToNames}.`);
       }
       finishSent(sentUploads, sendClears);
       if (handedReply) {
@@ -3676,8 +4080,19 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       // The race: the chosen session ended before the reply went. Its row
       // greys and the next live one is selected; the error says what went
       // when an earlier part of this Send already had.
-      if (to && cause instanceof InboxApiError && cause.code === 'session_not_live') {
-        setRoute((current) => routeRace(current, to.session, { went, total }));
+      const raceTo = postingTo;
+      if (raceTo && cause instanceof InboxApiError && cause.code === 'session_not_live') {
+        if (pillActive && !chosen) {
+          // The pill's list opens with that agent ended (the route choice is gone, approval "inbox-reply-recipient").
+          const host = raceTo.host ?? rcptAgents.find((r) => r.session === raceTo.session)?.host ?? null;
+          setRcptGone((current) => new Map([...current, [raceTo.session, host]]));
+          setError(raceWhat(host, { went, total }));
+          rcptAsked.current = true;
+          if (!box.open) openBox();
+          setRcptOpen(true);
+        } else {
+          setRoute((current) => routeRace(current, raceTo.session, { went, total }));
+        }
         if (went > 0) await onChanged();
         void loadLive();
         return;
@@ -3720,8 +4135,8 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
         } else {
           replyDraft.release();
           const text = textRef.current?.value ?? '';
-          const pastes = replyFiles.pastedDraft(text);
-          if (text.trim() !== '' || pastes.length > 0) replyDraft.save(text, pastes);
+          const files = replyFiles.draftFiles(text);
+          if (text.trim() !== '' || files.length > 0) replyDraft.save(text, files);
         }
       }
       releasePicks?.();
@@ -3737,6 +4152,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       }
     }
   };
+  latestSend.current = send;
 
   const resolve = async (next: boolean) => {
     setError(null);
@@ -3764,8 +4180,9 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   const toName = (message: InboxMessageWire, to: { host: string; session: string }) =>
     isRedirected(message) ? redirectedName(to, askedBy(message)) : hostName(to.host);
   // Where the person's last message is addressed: its own `to`, or, for a reply in a thread the
-  // person started, the thread's (the server hands it to that session).
-  const lastTo = last.author.kind === 'person' && !isInboxNote(last) ? (last.to ?? (startedTo && last.reply_to ? startedTo : null)) : null;
+  // person started, the thread's (the server hands it to that session), unless it answers another
+  // session that wrote in it (that session takes it, as any plain reply).
+  const lastTo = last.author.kind === 'person' && !isInboxNote(last) ? (last.to ?? (startedTo && last.reply_to && !isOtherAgent(askedBy(last), startedTo) ? startedTo : null)) : null;
   // The session the person's last reply goes to, when its connection wakes it: a message addressed to a
   // session (`lastTo`), or a reply to an agent message sent through a waking connection (`wakes`).
   const repliedTo = last.author.kind === 'person' && !lastTo ? askedBy(last) : undefined;
@@ -3819,14 +4236,14 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
             ...waitInputs(recipientConnection, last.id, { ...last, into_turn: last.delivery?.into_turn ?? null }),
           })
         : deliveryLine({
-            name: asker,
+            name: recipientName(repliedTo),
             // A reply that tags agents: the owner's own delivery, never another recipient's.
             deliveredAt: lastTags.length > 0 ? (last.delivery?.at ?? sent?.recipients?.find((r) => r.owner)?.delivered_at ?? null) : (sent?.checked_at ?? null),
             time: whenTime,
             wakes: (wakingSession !== null || (askedSession !== null && recipientConnection != null)) && !uncertainItem(recipientConnection, last.id),
             sendingNow: !!last.deliver_now_at,
             connection: recipientConnection,
-            askerEnded: askerEnded && asking ? { name: asking.name } : null,
+            askerEnded: wordsEnded && wordsAsking ? { name: wordsAsking.name } : null,
             ...waitInputs(recipientConnection, last.id, { ...last, into_turn: last.delivery?.into_turn ?? null }),
           });
   // A hand-off inside its Undo window (approval "inbox-tag-handoff") goes to nobody yet: its line says when.
@@ -3850,7 +4267,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
     ? last.to
       ? toName(last, last.to)
       : hostName(lastTo.host)
-    : asker;
+    : recipientName(repliedTo);
   const [sendNowState, setSendNowState] = useState<{ id: string; busy: boolean; error: string | null } | null>(null);
   const sendNow = async () => {
     setSendNowState({ id: last.id, busy: true, error: null });
@@ -4136,7 +4553,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
           threadId: thread.thread_id,
           phone,
           reply: {
-            to: replyName ?? asker,
+            to: replyTo,
             value: box.open ? (composerText ?? '') : (replyDraft.conflict ?? replyDraft.draft?.body ?? ''),
             onChange: (text) => changeReply(text, true),
             onSend: () => void send({ stayFull: true }),
@@ -4182,6 +4599,89 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
   const draftNoteId = `ib-foot-draft-${thread.thread_id}`;
   const skipNoteId = `ib-foot-skip-${thread.thread_id}`;
   const footStatusIds = [draftNoteId, waiting && unanswered.length > 0 ? skipNoteId : null].filter(Boolean).join(' ');
+  /** "Tag another agent": a real `@` at the end of the words, so everything after it is today's tagging. */
+  const tagAnother = () => {
+    setRcptOpen(false);
+    const field = textRef.current;
+    if (!field) return;
+    field.focus();
+    const end = field.value.length;
+    field.setSelectionRange(end, end);
+    document.execCommand('insertText', false, end === 0 || /\s$/.test(field.value) ? '@' : ' @');
+  };
+  /** The Reply arrow on an agent's message: the pill aims at that message's agent, and the words stay. */
+  const replyToMessage = (message: InboxMessageWire) => {
+    const session = message.author.kind === 'agent' ? (message.author.session ?? null) : null;
+    if (!pillActive || !session) {
+      openBox();
+      return;
+    }
+    aimReply([session]);
+    setRcptOpen(false);
+    if (boxRef.current.open) {
+      focusReplyEnd();
+      return;
+    }
+    openBox();
+  };
+  /** "Draft  Saved 4:51 PM  Discard" for the open box: under it in Send's row, or above it on a phone. Nothing until the first save. */
+  const stampSavedAt = replyDraft.conflict === null && (boxHasWords || replyDraft.draft?.files?.length) ? (replyDraft.draft?.updated_at ?? null) : null;
+  const stampTooLong = replyDraft.conflict === null && replyDraft.tooLong;
+  const stampFailed = replyDraft.conflict === null && replyDraft.failed && (boxHasWords || replyFiles.files.length > 0);
+  const draftStamp = (
+    <DraftStamp
+      savedAt={stampSavedAt}
+      tooLong={stampTooLong}
+      failed={stampFailed}
+      onDiscard={() => {
+        replyDraft.discard();
+        closeBox(true);
+        announce('Draft discarded.');
+      }}
+    />
+  );
+  // On a phone the Draft line is above the box. Where the foot scrolls in its own box (the keyboard up, the phone
+  // on its side), a line coming or going at its top would push the box and its mic down or pull them up: the
+  // foot's scroll moves by the line's height instead, so what is in view stays where it is.
+  const draftAboveShows = phone && box.open && !(route.open && asking) && (stampTooLong || stampFailed || stampSavedAt !== null);
+  const draftAboveRef = useRef<HTMLDivElement>(null);
+  const draftAboveHeight = useRef(0);
+  useLayoutEffect(() => {
+    const line = draftAboveRef.current;
+    const was = draftAboveHeight.current;
+    let now = 0;
+    if (line && draftAboveShows) {
+      const style = getComputedStyle(line);
+      now = line.offsetHeight + parseFloat(style.marginTop) + parseFloat(style.marginBottom);
+    }
+    draftAboveHeight.current = now;
+    const foot = line?.closest<HTMLElement>('.ib-pfoot');
+    // A foot that does not scroll stays at 0 (the browser holds it there), and grows upward instead.
+    if (foot && now !== was) foot.scrollTop += now - was;
+  }, [draftAboveShows]);
+  const rcptPill = pillActive ? (
+    <ReplyRecipient
+      rows={rcptAgents}
+      chosen={rcptChosen}
+      open={rcptOpen}
+      onOpen={setRcptOpen}
+      onOnly={(row) => {
+        aimReply([row.session]);
+        setRcptOpen(false);
+        announce(`This reply goes to ${row.label}.`);
+      }}
+      onToggle={(row) => {
+        // The agents typed with `@` count toward the most one reply goes to.
+        const base = rcptPicked ?? (rcptDefault ? [rcptDefault] : []);
+        const next = toggleRecipient(base, row.session, RECIPIENTS_MAX - taggedIds.filter((id) => !base.includes(id)).length, rcptAlone);
+        aimReply(next);
+        announce(`This reply goes to ${namesList(next.map((id) => rcptAgents.find((r) => r.session === id)?.label ?? id))}.`);
+      }}
+      onTagAnother={tagAnother}
+      phone={phone}
+      section={sectionRef.current}
+    />
+  ) : null;
   const routeChoice = asking ? (
     <RouteChoice
       kind={routeFor}
@@ -4939,7 +5439,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
           const ownerOfSent = message.to ?? (askedBy(message)?.author.kind === 'agent' ? askedBy(message)!.author : null);
           const toWords = (
             <>
-              to {isAgent ? 'you' : message.to ? toName(message, message.to) : asker}
+              to {isAgent ? 'you' : message.to ? toName(message, message.to) : recipientName(askedBy(message))}
               {isAgent && askerEnded && message.id === asking?.message.id && <SessionEndedMark />}
               {sentTags.length > 0 && (
                 <span data-tagged-names="">
@@ -5005,7 +5505,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
                     {/* The project gives way first; "to you", the session-ended mark and the count never shrink (the row wraps instead). */}
                     <span className="ib-fl-meta">
                       <span className="ib-fl-in" aria-hidden={hide}>
-                        in <bdi>{thread.project.name}</bdi>{' '}
+                        in <bdi>{multiAgent ? headFolder(message, thread, taggable) : thread.project.name}</bdi>{' '}
                       </span>
                       <span className="ib-fl-to" aria-hidden={hide}>
                         <span className="ib-to-sep">·</span> <span className="ib-to">{toWords}</span>
@@ -5020,7 +5520,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
                       </Tip>
                       {isAgent && liveMessage(message) && (
                         <Tip content="Reply">
-                          <button type="button" className="ib-mut" onClick={() => openBox()} aria-label="Reply">
+                          <button type="button" className="ib-mut" onClick={() => replyToMessage(message)} aria-label="Reply">
                             <Icon name="reply" size={15} />
                           </button>
                         </Tip>
@@ -5261,11 +5761,15 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
       <div className="ib-pfoot" hidden={artifactsOn}>
         {/* One status region, always mounted, so a screen reader announces the note when it appears. */}
         <div role="status" id={noteId} data-asker-note="">
-          {showAskerNote && asking && <AskerEndedNote asking={asking} project={thread.project.name} anyLive={anyOtherLive} />}
+          {/* With the pill there, the open box's pill says who gets the reply (and that it ended): no note above it. */}
+          {showAskerNote && !(pillActive && box.open) && asking && <AskerEndedNote asking={asking} project={thread.project.name} anyLive={anyOtherLive} />}
         </div>
         {cameBack && (
           <div className="ib-acts ib-archnote" data-came-back="">
-            <span className="ib-st">Archived · {asker} wrote after you archived it. Your reply goes to it; the thread stays archived.</span>
+            <span className="ib-st">
+              Archived · {cameBackName} wrote after you archived it. Your reply goes to {replyTo === cameBackName ? 'it' : replyTo}; the thread stays
+              archived.
+            </span>
             <button type="button" className="ib-btn" onClick={() => void resolve(false)}>
               Unarchive
             </button>
@@ -5313,38 +5817,40 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
           />
         ) : box.open ? (
           <>
-            <DraftHead
-              label={replyName ? `Reply to ${replyName}` : `Reply to ${asker} in ${thread.project.name}`}
-              savedAt={boxHasWords ? (replyDraft.draft?.updated_at ?? null) : null}
-              tooLong={replyDraft.tooLong}
-              conflict={
-                replyDraft.conflict !== null
-                  ? {
-                      id: conflictId,
-                      text: conflictText(conflictSentElsewhere),
-                      onKeepMine: () => {
-                        const mine = replyText.get();
-                        replyDraft.keepMine(mine, replyFiles.pastedDraft(mine));
-                        announce('Your words are saved.');
-                        requestAnimationFrame(() => textRef.current?.focus());
-                      },
-                      onDiscard: () => {
-                        // Only this window's words go: the other window's draft stays and comes into the box.
-                        const theirs = replyDraft.takeTheirs();
-                        setBox({ open: true, text: theirs });
-                        announce(theirs.trim() ? 'Your words were discarded; the other window’s are in the box.' : 'Your words were discarded.');
-                        requestAnimationFrame(() => textRef.current?.focus());
-                      },
-                    }
-                  : null
-              }
-              onDiscard={() => {
-                replyDraft.discard();
-                closeBox();
-                announce('Draft discarded.');
-              }}
-            />
+            {/* Above the box (approval "inbox-reply-recipient"): after a conflict its line and choice, and on a phone the
+                Draft line (below). On a computer nothing else. */}
+            {replyDraft.conflict !== null && (
+              <DraftHead
+                conflict={{
+                  id: conflictId,
+                  text: conflictText(conflictSentElsewhere),
+                  onKeepMine: () => {
+                    const mine = replyText.get();
+                    replyDraft.keepMine(mine, replyFiles.draftFiles(mine));
+                    announce('Your words are saved.');
+                    requestAnimationFrame(() => textRef.current?.focus());
+                  },
+                  onDiscard: () => {
+                    // Only this window's words and file changes go: the other window's draft stays and comes into the box.
+                    const draft = replyDraft.takeTheirs();
+                    const theirs = draft?.body ?? '';
+                    setBox({ open: true, text: theirs });
+                    takeDraftFiles(draft?.files ?? [], theirs);
+                    announce(theirs.trim() ? 'Your words were discarded; the other window’s are in the box.' : 'Your words were discarded.');
+                    requestAnimationFrame(() => textRef.current?.focus());
+                  },
+                }}
+              />
+            )}
             {staleQuestions.length > 0 && <ChangedNotice questions={staleQuestions} thread={thread} onJump={jumpTo} />}
+            {/* On a phone "Draft  Saved 4:51 PM  Discard" sits above the box, at the right, once something is saved.
+                While the live-session choice stands in for Send's row it goes, as it does on a computer (it lives in
+                that row there), so Discard cannot close the box under the choice. */}
+            {phone && !(route.open && asking) && (
+              <div className="ib-draft-above" data-draft-above="" ref={draftAboveRef}>
+                {draftStamp}
+              </div>
+            )}
             <div
               className="ib-rbox"
               data-drop-over={boxDrop.over ? '' : undefined}
@@ -5360,7 +5866,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
                 replyText={replyText}
                 textareaRef={textRef}
                 voice={voice}
-                ariaLabel={`Reply to ${replyName ?? asker}`}
+                ariaLabel={`Reply to ${replyToNames}`}
                 ariaDescribedBy={[showAskerNote ? noteId : null, replyDraft.conflict !== null ? conflictId : null].filter(Boolean).join(' ') || undefined}
                 placeholder="Write a reply"
                 destination="your reply"
@@ -5402,38 +5908,59 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
               {draftAnswers.length > 0 && <ReplyAnswers answers={draftAnswers} onJump={jumpTo} />}
               {draftActions.length > 0 && <ReplyActions actions={draftActions} onJump={jumpTo} />}
               {/* The box's toolbar: the paperclip first (any file; a phone's picker offers the photo library too, and
-                  names what it hands over as a paste is), then the picks, skip and annotations chips. */}
-              <div className={`ib-rfoot${keepOpen ? ' ib-keep' : ''}`}>
-                <AttachFilesButton
-                  className="ib-rclip"
-                  iconSize={phone ? 19 : 16}
-                  phone={phone}
-                  inputData="data-reply-attach"
-                  onFiles={(list) => {
-                    (phone ? replyFiles.attach : replyFiles.add)(list);
-                    setError(null);
-                  }}
+                  names what it hands over as a paste is), then the picks, skip and annotations chips. A phone draws
+                  one row instead: the paperclip, one line for the questions and comments, the mic (ReplyFootPhone). */}
+              {phone ? (
+                <ReplyFootPhone
+                  clip={
+                    <AttachFilesButton
+                      className="ib-rclip"
+                      iconSize={19}
+                      phone
+                      inputData="data-reply-attach"
+                      onFiles={(list) => {
+                        replyFiles.attach(list);
+                        setError(null);
+                      }}
+                    />
+                  }
+                  skip={{ count: keepOpen ? unanswered.length : skipIds.size, keepOpen, onToggle: toggleKeepOpen }}
+                  dropped={dropped.length}
+                  comments={takesAnnotations ? { props: commentsListProps, list: commentsList, onList: setCommentsList } : null}
+                  voice={voice}
                 />
-                {/* The answers the list above shows, a pick still being saved included, so the two numbers agree. */}
-                {draftAnswers.length > 0 && (
-                  <span className="ib-rchip" data-picks-chip="">
-                    <Icon name="check" size={13} />
-                    {plural(draftAnswers.length, 'pick')}
-                  </span>
-                )}
-                <SkipChip count={keepOpen ? unanswered.length : skipIds.size} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
-                {dropped.length > 0 && (
-                  <Tip content="Replaced; this pick won't be sent">
-                    <span className="ib-rchip ib-dropped" data-dropped-picks-chip="">
-                      {dropped.length} {dropped.length === 1 ? 'pick' : 'picks'} on a replaced question
+              ) : (
+                <div className={`ib-rfoot${keepOpen ? ' ib-keep' : ''}`}>
+                  <AttachFilesButton
+                    className="ib-rclip"
+                    iconSize={16}
+                    inputData="data-reply-attach"
+                    onFiles={(list) => {
+                      replyFiles.add(list);
+                      setError(null);
+                    }}
+                  />
+                  {/* The answers the list above shows, a pick still being saved included, so the two numbers agree. */}
+                  {draftAnswers.length > 0 && (
+                    <span className="ib-rchip" data-picks-chip="">
+                      <Icon name="check" size={13} />
+                      {plural(draftAnswers.length, 'pick')}
                     </span>
-                  </Tip>
-                )}
-                {takesAnnotations && (
-                  <AnnotationsChip {...commentsListProps} list={commentsList?.card ? null : commentsList} onList={setCommentsList} />
-                )}
-                <VoiceFoot voice={voice} phone={phone} />
-              </div>
+                  )}
+                  <SkipChip count={keepOpen ? unanswered.length : skipIds.size} keepOpen={keepOpen} onToggle={toggleKeepOpen} />
+                  {dropped.length > 0 && (
+                    <Tip content="Replaced; this pick won't be sent">
+                      <span className="ib-rchip ib-dropped" data-dropped-picks-chip="">
+                        {dropped.length} {dropped.length === 1 ? 'pick' : 'picks'} on a replaced question
+                      </span>
+                    </Tip>
+                  )}
+                  {takesAnnotations && (
+                    <AnnotationsChip {...commentsListProps} list={commentsList?.card ? null : commentsList} onList={setCommentsList} />
+                  )}
+                  <VoiceFoot voice={voice} phone={false} />
+                </div>
+              )}
               {boxDrop.over && (
                 <div className="ib-rdrop" aria-hidden="true" data-box-drop="">
                   <Icon name="clip" size={18} />
@@ -5449,17 +5976,27 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
             ) : (
               <>
               {error && errorLine}
-              <div className="ib-acts">
-                <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending || voice.busy}>
-                  <Icon name="send" size={15} />
-                  Send
-                </button>
-                <button type="button" className="ib-btn ib-ghost" onClick={closeBox}>
-                  Cancel
-                </button>
-                <span className="ib-sp" />
-                {/* The in-thread New message button is off (approval "inbox-acknowledge"); its route and code stay. */}
-                {SHOW_NEW_MESSAGE_BUTTON && !archived && <NewMessageButton live={live} mode={newMessage} onClick={() => void pressNewMessage()} />}
+              {/* Send's row (approval "inbox-reply-recipient"): Send and Cancel, then at the right "Draft  Saved 4:51 PM
+                  Discard" and, with more than one agent, who gets the reply. On a phone the pill sits after Cancel and
+                  the Draft line is above the box (the owner, 2026-11-03), so the first save grows the foot upward and
+                  the box, its mic and this row stay where they are. */}
+              <div className="ib-acts ib-footrow ib-replyrow" data-reply-row="">
+                <div className="ib-footbtns">
+                  <button type="button" className="ib-btn ib-pri" ref={sendRef} onClick={() => void send()} disabled={sending || voice.busy}>
+                    <Icon name="send" size={15} />
+                    Send
+                  </button>
+                  <button type="button" className="ib-btn ib-ghost" onClick={() => closeBox()}>
+                    Cancel
+                  </button>
+                  {/* The in-thread New message button is off (approval "inbox-acknowledge"); its route and code stay. */}
+                  {SHOW_NEW_MESSAGE_BUTTON && !archived && <NewMessageButton live={live} mode={newMessage} onClick={() => void pressNewMessage()} />}
+                  {pillActive && phone && rcptPill}
+                </div>
+                <div className="ib-footstatus">
+                  {!phone && draftStamp}
+                  {pillActive && !phone && rcptPill}
+                </div>
               </div>
               </>
             )}
@@ -5581,6 +6118,7 @@ export function ThreadPane({ notice, thread, machine = null, outbox = NO_OUTBOX,
             thread={thread}
             asker={asker}
             askerHost={root.author.kind === 'agent' ? root.author.host : null}
+            replyTo={replyToNames}
             live={live}
             mode={newMessage}
             onPick={(target) => setNewMessage({ kind: 'compose', target })}

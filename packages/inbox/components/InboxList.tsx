@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useId, useLayoutEffect, useRef, useState, type FocusEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
+import { memo, useCallback, useEffect, useId, useLayoutEffect, useMemo, useRef, useState, type FocusEvent, type KeyboardEvent as ReactKeyboardEvent, type ReactNode } from 'react';
 import { inboxListShortcuts } from '../shortcuts/list.shortcuts';
 import { shortcutAria, useShortcutAria, withShortcut } from '../shortcuts/hint';
 import { inboxSearchShortcuts } from '../search/searchShortcut';
@@ -11,6 +11,7 @@ import { sentRecipientsWords } from '../tags';
 import { TagStack } from './TagPicker';
 import { RowAgents, RowAgentTiles } from './RowAgents';
 import { isTextCut, ProjectTipText, Tip } from './Tip';
+import { LazyRowTips, opensTips, RowTip } from './RowTip';
 import { AuthorMark, Icon } from '../icons';
 import { ListColumnEdge } from '../shell/ListColumnEdge';
 import { SidebarTrigger, useSidebar } from '../shell/sidebar';
@@ -28,6 +29,8 @@ import { attachPullToRefresh } from '../pullRefresh';
 import { TidyMenu, type TidyController } from './Tidy';
 import { awayLine, type MachinesModel } from '../machines';
 import { listLookClasses, useListLook } from '../listLook';
+import { useInboxTextSize } from '../textSize';
+import { useTheme } from '@plannotator/ui/components/ThemeProvider';
 import { relativeTime, relativeWords, useRelativeClock } from '../relativeTime';
 import { useShortcutScope } from '@plannotator/ui/shortcuts';
 import { isComposingKey, keyTarget, modalOpen } from '../shortcuts/guards';
@@ -408,11 +411,11 @@ function CountWords({ row, tip = false, wide = false }: { row: InboxListRow; tip
   const quiet = row.section === 'quiet' ? ' ib-qlabel' : '';
   if (wide) {
     return (
-      <Tip content={words.full} when={(cell) => cell.scrollWidth > cell.clientWidth + 0.5 || [...cell.querySelectorAll('.ib-cst, .ib-draft-l')].some((t) => t.scrollWidth > t.clientWidth + 0.5)}>
+      <RowTip content={words.full} when={(cell) => cell.scrollWidth > cell.clientWidth + 0.5 || [...cell.querySelectorAll('.ib-cst, .ib-draft-l')].some((t) => t.scrollWidth > t.clientWidth + 0.5)}>
         <span className={`ib-c ib-cwords ib-cfull${quiet}`} data-count-words={words.full}>
           <span className="ib-cs">{typeof words.long === 'string' ? <span className="ib-cst">{words.long}</span> : words.long}</span>
         </span>
-      </Tip>
+      </RowTip>
     );
   }
   const cell = (
@@ -423,7 +426,7 @@ function CountWords({ row, tip = false, wide = false }: { row: InboxListRow; tip
       <span className="ib-sr">{words.full}</span>
     </span>
   );
-  return tip ? <Tip content={words.full}>{cell}</Tip> : cell;
+  return tip ? <RowTip content={words.full}>{cell}</RowTip> : cell;
 }
 
 /**
@@ -440,11 +443,20 @@ function LineCount({ row, tip = false }: { row: InboxListRow; tip?: boolean }) {
 }
 
 /**
+ * What a row's open counts (`OpenCounts`) draw, as a key: its open action items and questions, or '' when it draws
+ * none. Two rows with the same key draw the same counts.
+ */
+function openCountsKey(row: InboxListRow): string {
+  if (row.questions.open < 1 || countWords(row, 0) !== null) return '';
+  return `${rowActionCount(row)}/${row.questions.open}`;
+}
+
+/**
  * What waits on the person, when the row has no words (approval "inbox-row-action-icon", 2026-10-29): the open
  * action items' pill (`ActionBadge`, A2), then the open questions' `?N` (Q3). Under the alert badge in emphasis.
  */
 function OpenCounts({ row, tip = false }: { row: InboxListRow; tip?: boolean }) {
-  if (row.questions.open < 1 || countWords(row, 0) !== null) return null;
+  if (!openCountsKey(row)) return null;
   return (
     <>
       <ActionBadge row={row} tip={tip} />
@@ -469,7 +481,7 @@ function QuestionCount({ row, tip = false }: { row: InboxListRow; tip?: boolean 
       <span className="ib-sr">{words}</span>
     </span>
   );
-  return tip ? <Tip content={words}>{cell}</Tip> : cell;
+  return tip ? <RowTip content={words}>{cell}</RowTip> : cell;
 }
 
 /**
@@ -480,11 +492,11 @@ function QuestionCount({ row, tip = false }: { row: InboxListRow; tip?: boolean 
  */
 function ClipText({ className, text }: { className: string; text: string }) {
   return (
-    <Tip content={text} cut>
+    <RowTip content={text} cut>
       <span className={className} dir="auto">
         {text}
       </span>
-    </Tip>
+    </RowTip>
   );
 }
 
@@ -513,12 +525,12 @@ function Preview({ row }: { row: InboxListRow }) {
 function GuideMark({ row }: { row: InboxListRow }) {
   if (!row.guide || row.section === 'sent') return null;
   return (
-    <Tip content="Guided review" when={guideLabelHidden}>
+    <RowTip content="Guided review" when={guideLabelHidden}>
       <span className="ib-att" data-guide-mark="" role="img" aria-label="Guided review">
         <Icon name="book" size={13} />
         <span className="ib-att-l">Guided review</span>
       </span>
-    </Tip>
+    </RowTip>
   );
 }
 
@@ -589,19 +601,58 @@ const COUNTS_COLUMN_PX = 84;
  * counts and none runs under a pin. The counts sit at their column's right edge, so their width is the column's right
  * edge less their leftmost part, whatever the column's width: a second pass gives the same answer. Without pins, or
  * with counts that fit, the column keeps its 84px (`--ib-cq-w` unset).
+ *
+ * Cells with the same parts and text draw the same counts at the same width (no row state restyles them), so only
+ * one cell of each is read. A read lays out its row (rows are `content-visibility: auto`), and a list has far fewer
+ * different counts than rows: reading every row cost about 25 ms at 700 rows, on every open of a thread and every
+ * return to the list. False when the list is not drawn (nothing in it has a box), so the caller fits it again later.
  */
-function fitCountsColumn(list: HTMLElement, pinColumn: boolean): void {
+function fitCountsColumn(list: HTMLElement, pinColumn: boolean): boolean {
   let widest = 0;
+  let drawn = true;
   if (pinColumn) {
+    const alike = new Map<string, HTMLElement[]>();
     for (const cell of list.querySelectorAll<HTMLElement>('.ib-row > .ib-cq')) {
-      const lefts = [...cell.children].map((part) => part.getBoundingClientRect()).filter((box) => box.width > 1).map((box) => box.left);
-      if (lefts.length) widest = Math.max(widest, cell.getBoundingClientRect().right - Math.min(...lefts));
+      if (!cell.firstElementChild) continue;
+      // What the cell draws: each part's classes and text (its tooltip's id differs on every row).
+      const key = [...cell.children].map((part) => `${part.getAttribute('class')}\t${part.textContent}`).join('\n');
+      const cells = alike.get(key);
+      if (cells) cells.push(cell);
+      else alike.set(key, [cell]);
+    }
+    groups: for (const cells of alike.values()) {
+      for (const cell of cells) {
+        const lefts = [...cell.children].map((part) => part.getBoundingClientRect()).filter((box) => box.width > 1).map((box) => box.left);
+        if (lefts.length) {
+          widest = Math.max(widest, cell.getBoundingClientRect().right - Math.min(...lefts));
+          break;
+        }
+        // Nothing of this cell drawn: try the next alike cell, unless the whole list is undrawn (then none is).
+        if (list.getClientRects().length === 0) {
+          drawn = false;
+          widest = 0;
+          break groups;
+        }
+      }
     }
   }
   const width = widest > COUNTS_COLUMN_PX ? `${Math.ceil(widest)}px` : '';
-  if (list.style.getPropertyValue('--ib-cq-w') === width) return;
-  if (width) list.style.setProperty('--ib-cq-w', width);
-  else list.style.removeProperty('--ib-cq-w');
+  if (list.style.getPropertyValue('--ib-cq-w') !== width) {
+    if (width) list.style.setProperty('--ib-cq-w', width);
+    else list.style.removeProperty('--ib-cq-w');
+  }
+  return drawn;
+}
+
+/** The page's zoom (device pixels per CSS pixel), read again on each resize: a zoom changes it, and text widths with it. */
+function useDevicePixelRatio(): number {
+  const [ratio, setRatio] = useState(() => (typeof window === 'undefined' ? 1 : window.devicePixelRatio));
+  useEffect(() => {
+    const read = () => setRatio(window.devicePixelRatio);
+    window.addEventListener('resize', read);
+    return () => window.removeEventListener('resize', read);
+  }, []);
+  return ratio;
 }
 
 /**
@@ -698,11 +749,20 @@ function RowWithAction({
   const offer = !unread && onMarkRead && offersRowMarkRead(row, drawn);
   // A reply waiting on a busy agent that can take it now: Send now, on hover and keyboard focus as Mark read.
   const sendNow = onSendNow && !offer && !unread && row.delivery?.send_now === true && rowWait(row.delivery) !== null;
+  // The action's tooltip mounts when the pointer or focus first comes into the row (RowTip.tsx), before the action
+  // shows: a Tab moves focus onto it, and focus must never land on a trigger that is about to be drawn again.
+  const [actionTip, setActionTip] = useState(false);
   return (
     <div
       className="ib-rw"
       data-row={row.thread_id}
       data-menu={menu ? '' : undefined}
+      onPointerEnter={(event) => {
+        if (!actionTip && opensTips(event)) setActionTip(true);
+      }}
+      onFocus={() => {
+        if (!actionTip) setActionTip(true);
+      }}
       onKeyDown={(event) => {
         // Tab from the row onto its action (focus fix 1): the action shows only while the row has keyboard focus,
         // and focus leaves the row before it reaches the action, so the browser's own Tab finds it gone and drops
@@ -722,7 +782,7 @@ function RowWithAction({
     >
       {children}
       {sendNow && (
-        <Tip content={`Send now: put your reply into ${agentName(rowAgent(row))}'s running turn without waiting for it to end`}>
+        <RowTip armed={actionTip} content={`Send now: put your reply into ${agentName(rowAgent(row))}'s running turn without waiting for it to end`}>
           <button
             type="button"
             className="ib-ract"
@@ -736,10 +796,10 @@ function RowWithAction({
             <Icon name="send" size={15} />
             Send now
           </button>
-        </Tip>
+        </RowTip>
       )}
       {offer && (
-        <Tip content={withShortcut(`Mark read: out of the top until ${agentName(rowAgent(row))} writes again`, { scope: inboxThreadShortcuts, action: 'markRead' })}>
+        <RowTip armed={actionTip} content={withShortcut(`Mark read: out of the top until ${agentName(rowAgent(row))} writes again`, { scope: inboxThreadShortcuts, action: 'markRead' })}>
           <button
             type="button"
             className="ib-ract"
@@ -753,10 +813,10 @@ function RowWithAction({
             <Icon name="checkCircle" size={15} />
             Mark read
           </button>
-        </Tip>
+        </RowTip>
       )}
       {unread && (
-        <Tip content="Mark unread: back to New, bold. Nothing is sent.">
+        <RowTip armed={actionTip} content="Mark unread: back to New, bold. Nothing is sent.">
           <button
             type="button"
             className="ib-ract"
@@ -770,7 +830,7 @@ function RowWithAction({
             <Icon name="envelope" size={15} />
             Mark unread
           </button>
-        </Tip>
+        </RowTip>
       )}
     </div>
   );
@@ -1050,12 +1110,38 @@ export function InboxList(props: InboxListProps) {
   // The wide rows' pin column (the owner, 2026-10-31: the pin beside the counts): only in a list with a pinned row,
   // Quiet's folded rows included, so a list without pins keeps its columns and opening Quiet moves none.
   const pinColumn = !props.phone && !twoLine && !!props.pinned && visible.some((s) => s.threads.some((row) => props.pinned!.has(row.thread_id)));
-  // With the pin's column, the counts' column holds the widest counts (`fitCountsColumn`), after every render and
-  // once the fonts are in, so no count runs under a pin.
+  // With the pin's column, the counts' column holds the widest counts (`fitCountsColumn`), so no count runs under a
+  // pin: fitted again when what it depends on changes (the pin's column, the counts drawn, the columns the list's
+  // width and look draw, the text size, the palette on screen and its mode, whose `--font-sans` differ, and the
+  // zoom), and once the fonts are in. Not on the commit that opens or closes a thread: it still draws the other
+  // column's rows, and the layout effects draw the new ones before the browser paints.
+  // The rule this rests on: one `openCountsKey` always draws the same parts in `.ib-cq`, with the same classes, text
+  // and width, whatever the row's state (hovered, its tooltip open or not yet mounted). A change inside `.ib-cq` that
+  // breaks it must add what it depends on to `fitKey`, or the column keeps a stale width.
+  const settled = besideThread === props.narrow;
+  const countsKey = useMemo(() => {
+    if (!pinColumn || !settled) return '';
+    const keys = new Set<string>();
+    for (const section of props.sections) {
+      if (section.id === 'quiet' ? !quietOpen : section.id === 'snoozed' ? !snoozedOpen : false) continue;
+      for (const row of section.threads) {
+        const key = openCountsKey(row);
+        if (key) keys.add(key);
+      }
+    }
+    return [...keys].sort().join(' ');
+  }, [pinColumn, settled, props.sections, quietOpen, snoozedOpen]);
+  const textSize = useInboxTextSize();
+  // ThemeProvider puts the palette's classes on <html> while it renders, before this list's layout effects run.
+  const { colorTheme, resolvedMode } = useTheme();
+  const zoom = useDevicePixelRatio();
+  const fitKey = `${pinColumn}|${fullWords}|${noProject}|${listLookClasses(look)}|${textSize}|${colorTheme}|${resolvedMode}|${zoom}|${countsKey}`;
+  const fitted = useRef<string | null>(null);
   const pinColumnRef = useRef(pinColumn);
   pinColumnRef.current = pinColumn;
   useLayoutEffect(() => {
-    if (listRef.current) fitCountsColumn(listRef.current, pinColumn);
+    if (!settled || fitted.current === fitKey || !listRef.current) return;
+    fitted.current = fitCountsColumn(listRef.current, pinColumn) ? fitKey : null;
   });
   useEffect(() => {
     const fonts = typeof document !== 'undefined' ? document.fonts : undefined;
@@ -1214,6 +1300,8 @@ export function InboxList(props: InboxListProps) {
           {props.notice && <HeldNoticeLine count={props.notice.count} project={props.notice.project ?? null} onShow={props.onShowNew} />}
           {/* The band alone is an empty list with a band under it: nothing else says the list is clear. */}
           {visible.every((section) => section.id === 'snoozed') && props.empty}
+          {/* The rows' tooltips mount on first use (RowTip.tsx): drawing every row's at once is most of a redraw. */}
+          <LazyRowTips.Provider value={true}>
           {visible.map((section) => {
             const quiet = section.id === 'quiet';
             const snoozed = section.id === 'snoozed';
@@ -1266,6 +1354,7 @@ export function InboxList(props: InboxListProps) {
               </div>
             );
           })}
+          </LazyRowTips.Provider>
         </ThreadRowMenu>
       {props.reconnecting && (
         <p className="ib-relink" data-inbox-reconnecting="">
