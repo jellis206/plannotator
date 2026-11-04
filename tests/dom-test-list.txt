@@ -88,6 +88,7 @@ packages/inbox/whatsNewImages.test.tsx
 packages/inbox/replaced.test.tsx
 packages/inbox/reask.test.tsx
 packages/inbox/openQuestions.test.tsx
+packages/inbox/threadSteps.test.tsx
 packages/inbox/decisionMode.test.tsx
 packages/inbox/decisionCardContract.test.tsx
 packages/inbox/threadFolding.test.tsx
@@ -209,12 +210,14 @@ packages/inbox/settingsSections.test.tsx
 packages/inbox/searchPalette.test.tsx
 packages/inbox/searchShortcut.test.tsx
 packages/inbox/openIn.test.tsx
+packages/inbox/openInCheck.test.tsx
 packages/inbox/htmlLinks.test.tsx
 packages/inbox/markdownLinks.test.tsx
 packages/inbox/videoAttachment.test.tsx
 packages/inbox/markupAddsToReply.test.tsx
 packages/inbox/commentSubmitKey.test.tsx
 packages/inbox/skillReferences.test.tsx
+packages/inbox/skillListRoom.test.tsx
 packages/inbox/messageComments.test.tsx
 packages/inbox/feedbackDialog.test.tsx
 packages/ui/components/HumanOnlySkillNotice.test.tsx
@@ -255,6 +258,7 @@ packages/review-editor/App.agentTool.test.tsx
 packages/review-editor/App.guideViewed.test.tsx
 packages/review-editor/App.commitsJj.test.tsx
 packages/review-editor/App.emptyDiffSwitch.test.tsx
+packages/review-editor/App.sessionTitle.test.tsx
 packages/review-editor/App.planLookTwoTabs.test.tsx
 packages/review-editor/components/AnnotationToolbar.placement.test.tsx
 packages/review-editor/dock/panels/ReviewPROverviewPanel.ui.test.tsx
@@ -387,6 +391,7 @@ packages/editor/App.planLinkedDrafts.test.tsx
 packages/editor/App.bundle.test.tsx
 packages/editor/App.bundleBackScroll.test.tsx
 packages/editor/App.windowsPaths.test.tsx
+packages/editor/App.sessionTitle.test.tsx
 packages/editor/annotationDraftStaleRetry.test.tsx
 packages/ui/components/blocks/AlertBlock.title.test.tsx
 packages/ui/components/blocks/AlertBlock.seam.test.tsx
@@ -491,3 +496,7 @@ packages/ui/components/RenderedMarkdown.softLineBreaks.test.tsx
 packages/inbox/personLineBreaks.test.tsx
 packages/inbox/aboutPrivacy.test.tsx
 packages/inbox/snoozeIntroDialog.test.tsx
+packages/inbox/boardReveal.test.tsx
+packages/ui/hooks/skillCatalogReload.test.tsx
+packages/inbox/reviewVerdict.test.ts
+packages/inbox/reviewPane.test.tsx

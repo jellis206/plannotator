@@ -89,6 +89,7 @@ import {
   type InboxProject,
   type InboxProjectRepo,
   type InboxTag,
+  inboxStepsProgress,
 } from "@plannotator/core/inbox-types";
 import { checkServerSession, createServerSessionNonce, INBOX_SERVER_SESSION_MISMATCH_ERROR, serverSessionMismatchBody } from "@plannotator/core/server-session";
 import {
@@ -133,6 +134,7 @@ import { perfPhase, retainPerfPhases, watchLoopStalls, withServerTiming } from "
 import { InboxError } from "@plannotator/shared/inbox/schema";
 import { inboxPromptsModel, parseInboxPromptsChange, saveInboxPromptsChange } from "./inbox-prompts";
 import { InboxStore } from "@plannotator/shared/inbox/store";
+import { INBOX_TIDY_WITHDRAWN_HOST, inboxTidyBodyStepsOff, inboxTidyIsStepsOnly, inboxTidyStepsOnlyWakes } from "@plannotator/shared/inbox/tidy";
 import { inboxArchivedRows, inboxListSections, inboxRowArchived } from "@plannotator/shared/inbox/list";
 import { archiveProject, markProjectRead, unarchiveProject, unmarkProjectRead } from "@plannotator/shared/inbox/project-batch";
 import {
@@ -163,7 +165,7 @@ import { openBrowser } from "./browser";
 import { isAddressInUseError } from "./remote";
 import { createRequestHostGuard } from "./request-host-guard";
 import { markPlannotatorResponse, withPlannotatorServerHeader } from "./plannotator-server-marker";
-import { createInboxMcpServer, INBOX_BOARD_OFF_TEXT } from "./inbox-mcp";
+import { createInboxMcpServer, INBOX_BOARD_OFF_TEXT, INBOX_STEPS_OFF_TEXT } from "./inbox-mcp";
 import { inboxGuideRoute } from "./inbox-guides";
 import { createInboxRepoCache } from "./inbox-repos";
 import { createRefCards, type RefRunner } from "./ref-cards";
@@ -199,6 +201,7 @@ import { createInboxPins } from "./inbox-pins";
 import { createInboxSnoozes } from "./inbox-snooze";
 import { inboxRowAsOf, inboxRowSnoozed, inboxSplitSnoozed } from "@plannotator/core/inbox-snooze";
 import { snoozeIntroDue, snoozeIntroFirstUse, type SnoozeIntroSaved } from "./inbox-snooze-intro";
+import { revealLastShown, revealMayClaim, revealNext, type RevealId, type RevealState } from "@plannotator/shared/inbox/reveals";
 import { createInboxEmbeds } from "./inbox-embeds";
 import { createInboxFeedback, INBOX_FEEDBACK_PATH } from "./inbox-feedback";
 import { forgeCardRefResolver, resolveInboxCardRefs } from "./inbox-card-refs";
@@ -206,6 +209,7 @@ import { createCardFavicons, type CardFaviconOptions } from "./inbox-card-favico
 import { createCardMarks } from "./inbox-card-marks";
 import { isInboxBoardSeq, readInboxBoardSeen, writeInboxBoardSeen } from "@plannotator/shared/inbox/board-seen";
 import { createInboxTagsRoute } from "./inbox-tags";
+import { createInboxStepsRoute, inboxStepsStale } from "./inbox-steps";
 import { createInboxDebugLog } from "./inbox-debug-log";
 import { createInboxDevices, DOOR_PREFIX } from "./inbox-devices";
 import { createInboxMachines, type InboxMachines, type MachineFrame, type MachineLinkTimings } from "./inbox-machines";
@@ -246,6 +250,7 @@ import {
   type InboxAgentId,
   type InboxConnectReport,
   type InboxNoteAgentId,
+  type InboxStepsWire,
 } from "@plannotator/core/inbox-types";
 
 /** The hosts whose own connection polls the bridge and wakes its session with the reply: the waking hosts but Codex, which the Inbox wakes itself. */
@@ -396,6 +401,10 @@ export interface InboxServerOptions {
   windowHeartbeatMs?: number;
   /** The Board, decided here instead of config.json `inboxBoard` (tests). Absent: config.json decides on every request. */
   board?: boolean;
+  /** Thread steps, decided here instead of config.json `inboxSteps` (tests). Absent: config.json decides on every request. */
+  steps?: boolean;
+  /** Code review, decided here instead of config.json `inboxCodeReview` (tests). Absent: config.json decides on every request. */
+  codeReview?: boolean;
   /**
    * `plannotator inbox --tailscale`: publish over the tailnet for this run
    * whatever PLANNOTATOR_INBOX_TAILSCALE / config.json `inboxTailscale` say
@@ -591,6 +600,8 @@ const ERROR_STATUS: Record<string, number> = {
   annotation_closed: 409,
   // A comment on a guided review's diff, on a message that carries none.
   guide_not_found: 404,
+  // A verdict on a review while the person has Code review off (Settings → Capabilities).
+  code_review_off: 409,
   // New message (step 8).
   session_not_live: 409,
   // Send now: the session's connection does not poll now, or cannot deliver into a running turn.
@@ -877,6 +888,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const snoozeListeners = new Set<() => void>();
   /** How the list's rows look was saved (config.json `inboxRows`): the windows' streams say `event: rows`. */
   const rowsListeners = new Set<(rows: readonly InboxRowsOption[], rev: number) => void>();
+  /** The steps switch was saved (Settings → Capabilities): the windows' streams say `event: capabilities`. */
+  const capabilityListeners = new Set<() => void>();
   // The Inbox windows open now and whether any can show a notification (inbox-windows.ts).
   const windows = createInboxWindows({ graceMs: options.windowGraceMs });
   /** Event streams open now (health's `event_streams`): Inbox tabs of one origin share one. */
@@ -1006,6 +1019,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         bridgePolls: (host, session) => BRIDGE_WAKING_HOSTS.has(host) && live.pollsNow(host, session),
         // The Board: the card tool is listed and served only while the person has it on.
         boardOn,
+        // Thread steps: the steps tool and field are listed and served only while the person has them on.
+        stepsOn,
+        // Code review: submit_guide's `review` field is listed and served only while the person has it on.
+        codeReviewOn,
         ...(options.mcpNow ? { now: options.mcpNow } : {}),
       }),
     { legacy: "stateless", maxRequestBodySize: INBOX_MAX_REQUEST_BYTES },
@@ -1190,7 +1207,18 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // them out), so the opened card names a done card's thread; a deleted thread is not linked at all.
     const threads: Record<string, ReturnType<typeof store.listRow>> = {};
     for (const card of cards) for (const id of card.threads) if (!(id in threads)) threads[id] = store.listRow(id);
-    return { serverSession, cursor: store.cursor(), cards, dropped_unseen: droppedUnseen, seen_seq: readInboxBoardSeen(store.dir), threads };
+    // `steps` (additive, approval "inbox-thread-steps", part 4): while the person's switch is on, each linked
+    // thread's lists that hold steps, with each session's presence, for the lane card's mark and the opened
+    // card's checklist. Switch off: absent, so the Board shows none.
+    let steps: Record<string, InboxStepsWire[]> | undefined;
+    if (stepsOn()) {
+      steps = {};
+      for (const id of Object.keys(threads)) {
+        const lists = stepsRoute.threadSteps(id).filter((list) => list.steps.length > 0);
+        if (lists.length > 0) steps[id] = lists;
+      }
+    }
+    return { serverSession, cursor: store.cursor(), cards, dropped_unseen: droppedUnseen, seen_seq: readInboxBoardSeen(store.dir), threads, ...(steps ? { steps } : {}) };
   };
 
   /**
@@ -1794,7 +1822,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   const claimListIntro = (via: RequestVia): boolean => {
     if (via !== "local" || !listIntroState().due) return false;
     const at = new Date().toISOString();
-    saveConfig({ inboxListIntro: { ...loadConfig().inboxListIntro, shownAt: at } });
+    // A one-time announcement: it counts toward the reveals' 48 h spacing (shared/inbox/reveals.ts). A dev build never stamps
+    // that clock.
+    saveConfig({
+      inboxListIntro: { ...loadConfig().inboxListIntro, shownAt: at },
+      ...(normalizeStableVersion(version) !== null ? { inboxReveals: { ...loadConfig().inboxReveals, lastShownAt: at } } : {}),
+    });
     // Not written (a read-only data dir): showing it anyway would show it on every load.
     return loadConfig().inboxListIntro?.shownAt === at;
   };
@@ -1820,9 +1853,13 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     const firstUseAt = snoozeIntroFirstUse(store.changesSince(0));
     saveConfig({ inboxSnoozeIntro: { ...(firstUseAt ? { firstUseAt } : {}), ...(store.snoozes().length > 0 ? { snoozedAt: new Date().toISOString() } : {}) } });
   }
-  /** Whether it is due, and for this page: the owner's (this computer or their phone), never a tailnet guest's. */
+  /**
+   * Whether it is due, and for this page: the owner's (this computer or their phone), never a tailnet guest's. Its own
+   * rules, and the reveals' queue (shared/inbox/reveals.ts): the 48 h spacing, and the Board going first once Snooze waited
+   * three days for its moment.
+   */
   const snoozeIntroState = (owner: boolean) => ({
-    due: owner && snoozeIntroDue(snoozeIntroSaved(), new Date(), snoozeIntroRelease),
+    due: owner && revealNow(owner) === "snooze",
   });
   /** The person snoozed something: the dialog never shows. Once; a dev build marks too (only showing is release-only). */
   const markSnoozeUsed = () => {
@@ -1836,7 +1873,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
    */
   const claimSnoozeIntro = (owner: boolean): boolean => {
     if (!snoozeIntroState(owner).due) return false;
-    return saveConfig({ inboxSnoozeIntro: { ...loadConfig().inboxSnoozeIntro, shownAt: new Date().toISOString() } });
+    const at = new Date().toISOString();
+    // One save: the stamp and the reveals' spacing clock.
+    return saveConfig({ inboxSnoozeIntro: { ...loadConfig().inboxSnoozeIntro, shownAt: at }, inboxReveals: { ...loadConfig().inboxReveals, lastShownAt: at } });
   };
 
   /** The two update switches (PLANNOTATOR_UPDATE_CHECK, PLANNOTATOR_AUTO_UPDATE): the effective value and whether the env decides. */
@@ -1910,6 +1949,144 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     saveConfig({ inboxBoard: on });
     if ((loadConfig().inboxBoard === true) !== on) throw new InboxError("config_not_saved", "config.json could not be saved; nothing changed. A config.json that is not valid JSON is never written over: fix or remove it.");
     return { on: boardOn() };
+  };
+  /**
+   * Thread steps (approval "inbox-thread-steps", 2026-11-03): on only when
+   * the person turned it on (config.json `inboxSteps`). Off, agents get
+   * nothing of it: no `steps` tool or field, no wake or compaction line, no
+   * Tidy rule; the window shows no steps. Read on every request; the lists
+   * kept are never deleted by it.
+   */
+  const stepsOn = () => options.steps ?? loadConfig().inboxSteps === true;
+  /**
+   * A Tidy wake that listed only steps, not yet delivered, once steps are off: withdrawn, so no turn goes out
+   * (amendment 2: turning the switch off stops a Tidy that is already running). Recorded delivered by the Inbox
+   * itself (`INBOX_TIDY_WITHDRAWN_HOST`): no connection, wake or next call hands it, and the run reads "nothing".
+   * Every such wake when the switch turns off; and one at a time (`withdrawnTidy`) as a poll or an MCP next call is
+   * about to hand it (a switch turned off in config.json by hand), so the off state scans nothing more per poll.
+   */
+  const withdraw = (note: InboxMessage) => {
+    try {
+      // Never `recordDelivery`: that would settle the person's earlier replies in the thread as read.
+      store.recordTidyWithdrawn(note.id, INBOX_TIDY_WITHDRAWN_HOST);
+    } catch {
+      // Gone or no longer this session's: nothing to withdraw.
+    }
+  };
+  const withdrawStepsOnlyTidies = () => {
+    if (!stepsOn()) for (const note of inboxTidyStepsOnlyWakes(store)) withdraw(note);
+  };
+  /** Whether a pending item is a steps-only Tidy wake with steps off; if so, it is withdrawn now. */
+  const withdrawnTidy = (item: InboxMessage): boolean => {
+    if (!item.tidy?.wake || !inboxTidyIsStepsOnly(item.body) || stepsOn()) return false;
+    withdraw(item);
+    return true;
+  };
+  const saveSteps = (input: unknown, validateOnly = false) => {
+    if (!input || typeof input !== "object" || Array.isArray(input) || typeof (input as { on?: unknown }).on !== "boolean" || Object.keys(input).some((key) => key !== "on")) {
+      throw new InboxError("validation_error", "steps: { on: boolean }.", { field: "steps" });
+    }
+    const on = (input as { on: boolean }).on;
+    if (validateOnly) return { on: stepsOn() };
+    const was = stepsOn();
+    saveConfig({ inboxSteps: on });
+    if ((loadConfig().inboxSteps === true) !== on) throw new InboxError("config_not_saved", "config.json could not be saved; nothing changed. A config.json that is not valid JSON is never written over: fix or remove it.");
+    // Every window follows at once (its Settings switch, the thread's steps button).
+    if (was !== stepsOn()) for (const listener of capabilityListeners) listener();
+    if (was && !stepsOn()) withdrawStepsOnlyTidies();
+    return { on: stepsOn() };
+  };
+
+  /**
+   * Code review in the Inbox (approval "inbox-code-review-direction",
+   * 2026-11-03): on only when the person turned it on (config.json
+   * `inboxCodeReview`). Off or unset, agents get nothing of it (no
+   * submit_guide `review` field, no skill in the catalog) and the window
+   * shows nothing new. Read on every request.
+   */
+  const codeReviewOn = () => options.codeReview ?? loadConfig().inboxCodeReview === true;
+  const saveCodeReview = (input: unknown, validateOnly = false) => {
+    if (!input || typeof input !== "object" || Array.isArray(input) || typeof (input as { on?: unknown }).on !== "boolean" || Object.keys(input).some((key) => key !== "on")) {
+      throw new InboxError("validation_error", "code_review: { on: boolean }.", { field: "code_review" });
+    }
+    const on = (input as { on: boolean }).on;
+    if (validateOnly) return { on: codeReviewOn() };
+    const was = codeReviewOn();
+    saveConfig({ inboxCodeReview: on });
+    if ((loadConfig().inboxCodeReview === true) !== on) throw new InboxError("config_not_saved", "config.json could not be saved; nothing changed. A config.json that is not valid JSON is never written over: fix or remove it.");
+    // Every window follows at once (its Settings switch, the review cards, the "/" list).
+    if (was !== codeReviewOn()) for (const listener of capabilityListeners) listener();
+    return { on: codeReviewOn() };
+  };
+
+  /**
+   * The reveals for returning users (approval "inbox-feature-reveal"; the queue is packages/shared/inbox/reveals.ts):
+   * Snooze, then the Board. Read live, like Snooze: the days pass while the Inbox runs. A dev build decides nothing.
+   * The Board can be revealed only while config.json `inboxBoard` is unset (nobody decided): `true` and `false` are
+   * the person's (or an earlier reveal's), and a test's `board` option decides it too.
+   */
+  const boardUndecided = () => INBOX_CARD_ACTION_ON && options.board === undefined && loadConfig().inboxBoard === undefined;
+  const revealState = (now: Date): RevealState => {
+    const snooze = snoozeIntroSaved();
+    const config = loadConfig();
+    const reveals = config.inboxReveals;
+    // A list options or voice `shownAt` without `dueAt` is a fresh install's mark (never shown), not a show.
+    const shown = (intro: { dueAt?: string; shownAt?: string } | undefined) => (intro?.dueAt ? intro.shownAt : undefined);
+    return {
+      release: snoozeIntroRelease,
+      firstUseAt: snooze?.firstUseAt ?? null,
+      // The spacing clock: the reveals' own stamp, and every announcement shown before this key existed (an upgrade).
+      lastShownAt: revealLastShown([reveals?.lastShownAt, snooze?.shownAt, shown(config.inboxListIntro), shown(config.inboxVoiceIntro), config.inboxBoardIntro?.shownAt]),
+      // Roots in the store. The onboarding tour's threads live in the window only (tour/content), never here.
+      threads: store.threadIds().length,
+      open: {
+        snooze: snoozeIntroDue(snooze, now, snoozeIntroRelease),
+        // Every undecided owner (the owner: "the board we just show every user"), also someone who saw the first-visit
+        // dialog before the Board was a switch: their claim turns it on without the dialog (`claimReveal`).
+        board: boardUndecided() && !reveals?.board?.shownAt,
+      },
+      waitingSince: reveals?.waitingSince,
+    };
+  };
+  /**
+   * The reveal this page may arm, or null. The owner's pages only (this computer, their phone over the tailnet, an
+   * allowed login on a tagged machine), never a guest's. The first time an entry is next is kept, for the patience.
+   */
+  const revealNow = (owner: boolean): RevealId | null => {
+    if (!owner || !snoozeIntroRelease) return null;
+    const now = new Date();
+    const state = revealState(now);
+    const next = revealNext(state, now);
+    if (next && !state.waitingSince?.[next]) {
+      const reveals = loadConfig().inboxReveals;
+      saveConfig({ inboxReveals: { ...reveals, waitingSince: { ...reveals?.waitingSince, [next]: now.toISOString() } } });
+    }
+    return next;
+  };
+  /**
+   * The page about to show a reveal claims it: a compare-and-set over the whole queue (no await between the read and
+   * the write, so two claims cannot interleave). Only `next` can be claimed, and only while the spacing holds. The
+   * Board's claim turns the Board on (unset -> true, its one automatic write), stamps the first-visit dialog (the
+   * reveal shows it, so the Board's first visit does not) and the spacing clock, all in one save. `show`: the page
+   * draws the dialog. Someone who already saw it (before the Board was a switch) gets the Board on and no dialog:
+   * `show: false` with `board.on`, so only the sidebar's row appears, and their old stamp is kept.
+   */
+  const claimReveal = (id: RevealId, owner: boolean): boolean => {
+    if (id === "snooze") return claimSnoozeIntro(owner);
+    if (id !== "board" || !owner || !snoozeIntroRelease) return false;
+    const now = new Date();
+    if (!revealMayClaim("board", revealState(now), now) || !boardUndecided()) return false;
+    const at = now.toISOString();
+    const config = loadConfig();
+    const seen = Boolean(config.inboxBoardIntro?.shownAt);
+    saveConfig({
+      inboxBoard: true,
+      ...(seen ? {} : { inboxBoardIntro: { ...config.inboxBoardIntro, shownAt: at } }),
+      inboxReveals: { ...config.inboxReveals, lastShownAt: at, board: { shownAt: at } },
+    });
+    // Not written (a read-only data dir): showing it anyway would show it on every load.
+    const saved = loadConfig();
+    return !seen && saved.inboxBoard === true && saved.inboxReveals?.board?.shownAt === at;
   };
   const experimentalState = () => ({
     decision_mode: { on: decisionModeOn(), env: parseExperimentalEnv("decision-mode") ?? null },
@@ -1995,6 +2172,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     list_intro: listIntroState(),
     /** The one-time Snooze announcement: whether it waits to be claimed by this page (POST /api/inbox/snooze-intro). */
     snooze_intro: snoozeIntroState(!guest),
+    /** The reveals for returning users (shared/inbox/reveals.ts): the one this page may arm, or null. Never for a guest. */
+    reveal: { next: revealNow(!guest) },
     /** Settings → Voice: off unless turned on. Never a key: its source and, for a saved one, its last 4. */
     voice: voice.settings(via, guest),
     /** Settings → About: update notices and automatic updates. */
@@ -2013,6 +2192,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     experimental: experimentalState(),
     /** The Board (config.json `inboxBoard`): off unless the person turned it on. */
     board: { on: boardOn() },
+    /** Thread steps (config.json `inboxSteps`): off unless the person turned it on. */
+    steps: { on: stepsOn() },
+    /** Code review (config.json `inboxCodeReview`): off unless the person turned it on. */
+    code_review: { on: codeReviewOn() },
     /** The onboarding tour: started, finished or skipped, and whether the first real thread offers notifications once more. */
     tour: tourState(),
     /** Settings → Prompts: the Inbox reminder (editable by the owner) and the plan, review and annotate prompts. */
@@ -2076,6 +2259,10 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       case "card":
         // A Board card (approval "inbox-board"). A reader that does not know the kind skips it.
         return { seq: line.seq, kind: line.kind, id: line.id, card: store.cardWire(line.record) };
+      case "steps":
+        // A session's steps in a thread (approval "inbox-thread-steps"): silent, never a notification or unread.
+        // `thread_id` so a window reads the open thread's steps again only for its own. A reader that does not know the kind skips it.
+        return { seq: line.seq, kind: line.kind, id: line.id, thread_id: line.record.thread_id };
     }
   };
 
@@ -2156,6 +2343,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         // How the rows look was saved (any window's, a phone's too): every window takes it at once. Windows only.
         const onRows = (rows: readonly InboxRowsOption[], rev: number) => send(`event: rows\ndata: ${JSON.stringify({ rows, rev })}\n\n`);
         if (windowId) rowsListeners.add(onRows);
+        // The steps switch was saved (any window's): every window reads its settings and the open thread's steps again. Windows only.
+        const onCapabilities = () => send(`event: capabilities\ndata: ${JSON.stringify({ steps: { on: stepsOn() }, code_review: { on: codeReviewOn() } })}\n\n`);
+        if (windowId) capabilityListeners.add(onCapabilities);
         if (windowId) sendReach();
         // A row's delivery moved with the live sessions (no store line): windows only, like `reach`.
         const sendDeliveries = () => send(`event: deliveries\ndata: {}\n\n`);
@@ -2185,6 +2375,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           pinListeners.delete(onPins);
           snoozeListeners.delete(onSnoozes);
           rowsListeners.delete(onRows);
+          capabilityListeners.delete(onCapabilities);
           deliveryListeners.delete(sendDeliveries);
           stopMachines();
           leave();
@@ -2296,6 +2487,19 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
    * that tags others is told who else it went to.
    */
   const replyCommand = (reply: InboxMessage, sendNow = false, session: string | null = null): InboxReplyCommand => {
+    const command = replyCommandOf(reply, sendNow, session);
+    // A Tidy body is written when the run starts: with steps turned off since, it goes without its steps lines.
+    if (command.tidy && !stepsOn()) return { ...command, body: inboxTidyBodyStepsOff(command.body) };
+    // Thread steps (approval "inbox-thread-steps"): the session's own list in this thread, one wake line, only while
+    // the person has steps on. Never on a Tidy, a 👍 or a hand-off notice: those are not about the thread's work.
+    if (!stepsOn() || command.tidy || command.ack_of || command.handed_away) return command;
+    const receiver = session ?? store.recipientOf(reply)?.session ?? null;
+    const list = receiver ? store.stepsOf(reply.thread_id, receiver) : null;
+    if (!list) return command;
+    const { done, total, doing } = inboxStepsProgress(list.steps);
+    return total > 0 ? { ...command, steps: { done, total, doing } } : command;
+  };
+  const replyCommandOf = (reply: InboxMessage, sendNow: boolean, session: string | null): InboxReplyCommand => {
     const tag = session && !store.isOwner(reply, session) ? (reply.tags?.find((t) => t.session === session) ?? null) : null;
     // Every wake's title, decided once: null on a plain reply in a thread with no name (an older connection says `a reply` too).
     const subject = store.agentTitle(reply, session);
@@ -2394,7 +2598,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     // A busy session that can take an item mid-turn: what has waited long enough goes in now.
     const steer = live.deliveryConnectionOf(session);
     if (sendNow && steer?.busy === true && steer.send_now) autoSendFor(session, tags);
-    const commands = () => store.pendingReplies(session, { tags }).map((reply) => replyCommand(reply, sendNow, session));
+    const commands = () =>
+      store
+        .pendingReplies(session, { tags })
+        .filter((reply) => !withdrawnTidy(reply))
+        .map((reply) => replyCommand(reply, sendNow, session));
     // Ask AI: said on every answer until the client connects, so an answer that no one read loses nothing.
     const askWaits = () => (ask.waits(session) ? { [INBOX_ASK_WAITS_FIELD]: true } : {});
     const now = commands();
@@ -2473,8 +2681,29 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     if (!body || typeof body !== "object" || Array.isArray(body)) return null;
     const call = body as { jsonrpc?: unknown; id?: unknown; method?: unknown; params?: { name?: unknown } };
     if (call.method !== "tools/call" || call.id === undefined) return null;
-    const text = call.params?.name === INBOX_REMOVED_ACTION ? INBOX_REMOVED_ACTION_TEXT : call.params?.name === "card" && !boardOn() ? INBOX_BOARD_OFF_TEXT : null;
+    const text =
+      call.params?.name === INBOX_REMOVED_ACTION
+        ? INBOX_REMOVED_ACTION_TEXT
+        : call.params?.name === "card" && !boardOn()
+          ? INBOX_BOARD_OFF_TEXT
+          : call.params?.name === "steps" && !stepsOn()
+            ? INBOX_STEPS_OFF_TEXT
+            : null;
     return text ? json({ jsonrpc: "2.0", id: call.id, result: { content: [{ type: "text", text }], isError: true } }) : null;
+  };
+
+  /**
+   * A send_message carrying `steps` while steps are off (a session that listed
+   * the field while they were on): the message still goes, without the list,
+   * instead of failing on a field the schema no longer has. Null when the
+   * body needs no change.
+   */
+  const withoutOffSteps = (body: unknown): unknown | null => {
+    if (stepsOn() || !body || typeof body !== "object" || Array.isArray(body)) return null;
+    const call = body as { method?: unknown; params?: { name?: unknown; arguments?: Record<string, unknown> } };
+    if (call.method !== "tools/call" || call.params?.name !== "send_message" || !call.params.arguments || !("steps" in call.params.arguments)) return null;
+    const { steps: _dropped, ...rest } = call.params.arguments;
+    return { ...call, params: { ...call.params, arguments: rest } };
   };
 
   /** The agent sessions a `/mcp` POST's tool calls name (a batch included), as MCP presence. */
@@ -2560,6 +2789,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     store,
     environment: agentEnvironment,
     commandOf: (item, session) => replyCommand(item, false, session),
+    // A steps-only Tidy wake with steps off is withdrawn, never handed (a switch turned off in config.json by hand).
+    skip: (item) => withdrawnTidy(item),
     ...(options.codexWake?.extraClis ? { extraClis: options.codexWake.extraClis } : {}),
     ...(options.codexWake?.now ? { now: options.codexWake.now } : {}),
     ...(options.codexWake?.queueTimeoutMs ? { queueTimeoutMs: options.codexWake.queueTimeoutMs } : {}),
@@ -2572,6 +2803,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     environment: agentEnvironment,
     dataDir,
     commandOf: (item, session) => replyCommand(item, false, session),
+    // A steps-only Tidy wake with steps off is withdrawn, never handed (a switch turned off in config.json by hand).
+    skip: (item) => withdrawnTidy(item),
     ...options.qwenWake,
   });
 
@@ -2581,6 +2814,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     store,
     dataDir,
     commandOf: (item, session) => replyCommand(item, false, session),
+    // A steps-only Tidy wake with steps off is withdrawn, never handed (a switch turned off in config.json by hand).
+    skip: (item) => withdrawnTidy(item),
     ...options.t3Wake,
   });
 
@@ -2647,6 +2882,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
   (deliveryWatch as { unref?: () => void }).unref?.();
 
   const tagsRoute = createInboxTagsRoute({ store, serverSession, live, json });
+  const stepsRoute = createInboxStepsRoute({ store, serverSession, live, stepsOn, json });
 
   // Compose: a new thread the person starts with a live agent, drafts and uploads (packages/server/inbox-compose.ts).
   const compose = createInboxCompose({
@@ -2805,6 +3041,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
     idleSince: (session) => live.lastIdleOf(session),
     mcpAgents: () => live.mcpAgents(),
     boardOn,
+    // Thread steps (approval "inbox-thread-steps", part 5): a stale step in progress is a Tidy item only while the switch is on.
+    stepsStale: () => {
+      if (!stepsOn()) return null;
+      const t = Date.now();
+      return (record) => inboxStepsStale(record, live, t);
+    },
     readBody,
     json,
     combineSuggestions: () => {
@@ -2886,6 +3128,12 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         void noteMcpPresence(body);
         const refused = refusedToolCall(body);
         if (refused) return refused;
+        const stripped = withoutOffSteps(body);
+        if (stripped) {
+          const headers = new Headers(req.headers);
+          headers.delete("content-length");
+          return mcp.fetch(new Request(req.url, { method: "POST", headers, body: JSON.stringify(stripped) }));
+        }
       }
       return mcp.fetch(req);
     }
@@ -3183,15 +3431,21 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
           body.tour === undefined &&
           body.prompts === undefined &&
           body.board === undefined &&
+          body.steps === undefined &&
+          body.code_review === undefined &&
           body.cookie_host === undefined &&
           body.voice === undefined &&
           !updateSwitches
         ) {
-          throw new InboxError("validation_error", "body: inbox_tool, notifications, sound, tailscale, theme, text_size, rows, diff_style, experimental, tour, prompts, board, voice, update_check, auto_update or cookie_host is required.");
+          throw new InboxError("validation_error", "body: inbox_tool, notifications, sound, tailscale, theme, text_size, rows, diff_style, experimental, tour, prompts, board, steps, code_review, voice, update_check, auto_update or cookie_host is required.");
         }
         const owner = ownerOrLocal(req, via);
         // The Board changes what agents on this computer are offered (the card tool): the owner's to change.
         if (body.board !== undefined && !owner) return localOnly();
+        // Steps too (the steps tool, the wake and compaction lines): the owner's to change.
+        if (body.steps !== undefined && !owner) return localOnly();
+        // Code review too (submit_guide's `review` field, the review skills): the owner's to change.
+        if (body.code_review !== undefined && !owner) return localOnly();
         if (body.voice !== undefined && !owner) throw voiceOwnerOnly();
         // Updating changes this computer: the owner's to change.
         if (updateSwitches && !owner) return localOnly();
@@ -3231,6 +3485,8 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         if (body.experimental !== undefined) saveExperimental(body.experimental, true);
         if (body.tour !== undefined) saveTour(body.tour, true);
         if (body.board !== undefined) saveBoard(body.board, true);
+        if (body.steps !== undefined) saveSteps(body.steps, true);
+        if (body.code_review !== undefined) saveCodeReview(body.code_review, true);
         if (body.cookie_host !== undefined) saveCookieHostSwitch(body.cookie_host, true);
         if (body.voice !== undefined) voice.save(body.voice, true);
         const tailnet = tailscaleChange === undefined ? tailscale.state() : tailscale.set(tailscaleChange.on, { via, replaceExposed: tailscaleChange.replaceExposed });
@@ -3249,9 +3505,11 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         const experimental = body.experimental === undefined ? experimentalState() : saveExperimental(body.experimental);
         const tour = body.tour === undefined ? tourState() : saveTour(body.tour);
         const board = body.board === undefined ? { on: boardOn() } : saveBoard(body.board);
+        const steps = body.steps === undefined ? { on: stepsOn() } : saveSteps(body.steps);
+        const codeReview = body.code_review === undefined ? { on: codeReviewOn() } : saveCodeReview(body.code_review);
         if (body.voice !== undefined) voice.save(body.voice);
         if (promptsChange) saveInboxPromptsChange(promptsChange);
-        return json({ inbox_tool: inboxTool, notifications, sound, tailscale: tailnet, updates: updateState, theme, text_size: textSize, ...rows, diff_style: diffStyle, experimental, tour, board, voice: voice.settings(via, !owner), prompts: promptsState(owner), ...(owner ? { cookie_host: cookieHost ?? cookieHostWire() } : {}) });
+        return json({ inbox_tool: inboxTool, notifications, sound, tailscale: tailnet, updates: updateState, theme, text_size: textSize, ...rows, diff_style: diffStyle, experimental, tour, board, steps, code_review: codeReview, voice: voice.settings(via, !owner), prompts: promptsState(owner), ...(owner ? { cookie_host: cookieHost ?? cookieHostWire() } : {}) });
       }
       // Voice dictation (inbox-voice.ts). A read here can start a `codex`, so another site's is refused too.
       if (path.startsWith("/api/inbox/voice/")) {
@@ -3304,15 +3562,29 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
         return json({ show: claimSnoozeIntro(owner), snooze_intro: snoozeIntroState(owner) });
       }
 
+      // The reveals for returning users (approval "inbox-feature-reveal"): one compare-and-set over the queue. Only the
+      // reveal that is still next can be claimed; a guest never claims. The Board's claim turns the Board on.
+      if (path === "/api/inbox/reveal") {
+        if (req.method !== "POST") return json({ error: "Use POST." }, 405);
+        const body = await readBody(req);
+        if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
+        const id = body.id;
+        if (id !== "snooze" && id !== "board" && id !== "steps") throw new InboxError("validation_error", "id: snooze, board or steps.", { field: "id" });
+        const owner = ownerOrLocal(req, via);
+        const show = claimReveal(id, owner);
+        return json({ show, reveal: { next: revealNow(owner) }, board: { on: boardOn() } });
+      }
+
       // The Board's first-visit dialog (approval "inbox-board", intro amendment): the first page on this
-      // computer to open the Board claims it, once per machine (config.json `inboxBoardIntro.shownAt`);
-      // a page reached over the tailnet never claims it.
+      // computer or the owner's phone to open the Board claims it, once per machine (config.json
+      // `inboxBoardIntro.shownAt`); a tailnet guest never claims it (the owner rule: never inhibit the owner
+      // on their own tailnet).
       if (path === "/api/inbox/board/intro") {
         if (req.method !== "POST") return json({ error: "Use POST." }, 405);
         const body = await readBody(req);
         if (checkServerSession(body, serverSession) === "mismatch") return json(serverSessionMismatchBody(INBOX_SERVER_SESSION_MISMATCH_ERROR), 409);
         // Only once the Board is on: the dialog introduces a page the person can see.
-        if (via !== "local" || !boardOn() || loadConfig().inboxBoardIntro?.shownAt) return json({ show: false });
+        if (!ownerOrLocal(req, via) || !boardOn() || loadConfig().inboxBoardIntro?.shownAt) return json({ show: false });
         const at = new Date().toISOString();
         saveConfig({ inboxBoardIntro: { shownAt: at } });
         // Not written (a read-only data dir): showing it anyway would show it on every visit.
@@ -3323,7 +3595,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       const searched = await search.handle(req, url);
       if (searched) return searched;
       // The composers' skill picker and the SKILL.md a Send pastes in (inbox-skills.ts): read routes.
-      const skills = inboxSkillsRoute(req, url);
+      const skills = inboxSkillsRoute(req, url, { codeReview: codeReviewOn() });
       if (skills) return skills;
 
       // Compose: live sessions in every project, a new thread, Send to another session, drafts and uploads.
@@ -3717,7 +3989,7 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       }
 
       // Guided reviews (step 5): the snapshot a message carries (packages/server/inbox-guides.ts).
-      const guide = await inboxGuideRoute(req, path, store, serverSession);
+      const guide = await inboxGuideRoute(req, path, store, serverSession, codeReviewOn);
       if (guide) return guide;
 
       // Undo a hand-off inside its window (approval "inbox-tag-handoff"): the reply goes as an Ask instead.
@@ -3795,6 +4067,14 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
                 idempotency_key: body.idempotency_key as string,
                 feedback: typeof body.feedback === "string" ? body.feedback : undefined,
                 annotation_ids: body.annotation_ids as never,
+                // A verdict on a review (Approve / Send feedback in the review's header): only while Code review is on.
+                ...(body.review_verdict !== undefined && body.review_verdict !== null
+                  ? codeReviewOn()
+                    ? { review_verdict: body.review_verdict }
+                    : (() => {
+                        throw new InboxError("code_review_off", "Code review is off in this Inbox (Settings → Capabilities); nothing was sent.");
+                      })()
+                  : {}),
                 // The questions the person chose to skip ("Skip them"): only these. The old
                 // `skip_unanswered` flag is ignored (approval "inbox-explicit-skip", 2026-10-21).
                 skip: body.skip,
@@ -3893,6 +4173,9 @@ export async function startInboxServer(options: InboxServerOptions = {}): Promis
       // Tags (approval "inbox-tag-agents"): who the person can tag with `@` (packages/server/inbox-tags.ts).
       const taggable = tagsRoute.route(req, path);
       if (taggable) return taggable;
+      // Thread steps (approval "inbox-thread-steps"): a thread's lists with each session's presence (packages/server/inbox-steps.ts).
+      const steps = stepsRoute.route(req, path);
+      if (steps) return steps;
 
       // #1813: an image a message's body shows, read from wherever it is on this
       // computer outside the home folder's hidden folders (packages/server/inbox-message-images.ts).

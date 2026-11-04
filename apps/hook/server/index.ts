@@ -109,7 +109,7 @@ import {
   handleGoalSetupServerReady,
 } from "@plannotator/server/goal-setup";
 import { type DiffType, detectManagedVcs, prepareLocalReviewDiff, gitRuntime } from "@plannotator/server/vcs";
-import { loadConfig, resolveAIEnabled, resolveDefaultDiffType, resolveDefaultDiffTypeFor, resolveSharingEnabled, resolveUpdateCheck } from "@plannotator/shared/config";
+import { loadConfig, resolveAIEnabled, resolveSessionTailscale, sessionTailscaleOptOut, resolveDefaultDiffType, resolveDefaultDiffTypeFor, resolveSharingEnabled, resolveUpdateCheck } from "@plannotator/shared/config";
 import { formatIgnoredReviewWords, parseReviewArgs, resolveReviewTarget, withReviewDirectory, type ParsedReviewArgs } from "@plannotator/shared/review-args";
 import { resolveReviewOpenState, type ReviewOpenState } from "@plannotator/shared/review-open-state";
 import { listBranches, type AvailableBranches } from "@plannotator/shared/review-core";
@@ -136,7 +136,7 @@ import { parsePRUrl, checkPRAuth, fetchPR, type PRAuthResult, getCliName, getCli
 import { writeRemoteShareLink } from "@plannotator/server/share-url";
 import { announceTailscaleSession, enableTailscaleServe } from "@plannotator/server/tailscale-serve";
 import { takeEnvPullSessionBridgeConfig } from "@plannotator/server/ai-runtime";
-import { readTailnetOwner, setSessionTailnetOwner, setSessionTailnetServedUrl } from "@plannotator/server/session-tailnet";
+import { readTailnetOwners, setSessionTailnetOwners, setSessionTailnetServedUrl } from "@plannotator/server/session-tailnet";
 import { scrubModSessionEnv } from "./mod-session-env";
 import { resolveAnnotateTarget } from "./annotate-resolution";
 import { annotateDecisionTarget, reviewDecisionTarget, takeHostReviewId, targetText } from "./decision-target";
@@ -232,6 +232,7 @@ import {
   isTopLevelHelpInvocation,
   isVersionInvocation,
   parseStrictAnnotateOptions,
+  parseTitleOption,
   isUninstallConfirmationAccepted,
   parseUninstallOptions,
 } from "./cli";
@@ -240,6 +241,7 @@ import { completeAnnotateCommand } from "./annotate-command";
 import { ensureInboxRunning, runInboxCommand, selfCommand as inboxSelfCommand } from "./inbox-command";
 import { runCardCommand } from "./card-command";
 import { runInboxCallCommand } from "./inbox-call-command";
+import { runInboxStepsCommand } from "./inbox-steps-command";
 import { runFeedbackCommand } from "./feedback-command";
 import { formatInboxHelp } from "./inbox-help";
 import { INBOX_CARD_ACTION_ON } from "@plannotator/core/inbox-types";
@@ -348,6 +350,21 @@ const rawArgs = process.argv.slice(2);
     );
   }
 }
+// `plannotator inbox steps <thread> --json '<list>'`: an agent's thread steps, sugar over `inbox call steps` (inbox-steps-command.ts).
+{
+  const args = rawArgs;
+  if (args[0] === "inbox" && args[1] === "steps") {
+    const stepsDataDir = getPlannotatorDataDir();
+    process.exit(
+      await runInboxStepsCommand(args.slice(2), {
+        cwd: process.env.PLANNOTATOR_CWD || process.cwd(),
+        env: process.env,
+        askAiChild: isAskAiChild(process.env),
+        ensureRunning: () => ensureInboxRunning(stepsDataDir),
+      }),
+    );
+  }
+}
 // `plannotator feedback --stdin`: the person's feedback about Plannotator,
 // sent to the feedback Worker (feedback-command.ts). Before the strict-annotate
 // parse: it takes its own flags, and its own --help.
@@ -418,6 +435,19 @@ if (browserIdx !== -1 && args[browserIdx + 1]) {
   args.splice(browserIdx, 2);
 }
 
+// Session flag: --title <text> (review / annotate / annotate-last) — the whole
+// tab title, and the annotate header's name, chosen by the caller (#2289).
+// Before the boolean flags, so a title can never be read as one of them.
+let sessionTitle: string | undefined;
+try {
+  const parsedTitle = parseTitleOption(args);
+  sessionTitle = parsedTitle.title;
+  args.splice(0, args.length, ...parsedTitle.remainingArgs);
+} catch (error) {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(annotateStartupFailureExitCode({ requireApproval: requireApprovalFlag, resultFile }));
+}
+
 // Transport flag: --tailscale (review / annotate / annotate-last) — publish
 // the session over the user's tailnet via `tailscale serve`. The server stays
 // LOOPBACK-bound: serve provides reachability plus TLS, so remote mode's wide
@@ -429,14 +459,28 @@ const TAILSCALE_COMMANDS = new Set(["review", "annotate", "annotate-last", "last
 // `plannotator inbox --tailscale` is the Inbox's own flag (inbox-command.ts):
 // a long-lived, owner-only publication, never this per-session transport.
 const tailscaleIdx = args[0] === "inbox" ? -1 : args.indexOf("--tailscale");
-const tailscaleFlag = tailscaleIdx !== -1;
-if (tailscaleFlag) {
+if (tailscaleIdx !== -1) {
   args.splice(tailscaleIdx, 1);
   if (!TAILSCALE_COMMANDS.has(args[0] ?? "")) {
     console.error(
       "--tailscale is only supported with: plannotator review, annotate, annotate-last (last)",
     );
     process.exit(1);
+  }
+}
+// PLANNOTATOR_TAILSCALE / config.json "tailscale" make the flag the default
+// for the same subcommands (every other subcommand ignores them), so a host
+// or agent need not pass it on every call.
+const tailscaleResolved = TAILSCALE_COMMANDS.has(args[0] ?? "")
+  ? resolveSessionTailscale(loadConfig(), process.env, tailscaleIdx !== -1)
+  : { on: false, source: "default" as const };
+const tailscaleFlag = tailscaleResolved.on;
+const tailscaleOptOut = sessionTailscaleOptOut(tailscaleResolved.source);
+if (tailscaleFlag) {
+  if (tailscaleResolved.source !== "flag") {
+    process.stderr.write(
+      `[plannotator] Publishing over your tailnet (${tailscaleResolved.source === "env" ? "PLANNOTATOR_TAILSCALE" : 'config.json "tailscale"'}).\n`,
+    );
   }
   if (isRemoteSession()) {
     process.stderr.write(
@@ -452,8 +496,9 @@ if (tailscaleFlag) {
   process.env.PLANNOTATOR_PUBLIC_URL = "";
   // "Ask this session" stays ON (#2166): the host's bridge config is kept
   // (taken at the top of this file), and the servers answer it only for a tab
-  // on this machine and for the Tailscale login that owns it
-  // (packages/server/session-tailnet.ts). Everyone else on the tailnet gets
+  // on this machine and for the Tailscale login that owns it (or, where
+  // Tailscale names no owner, an inboxTailscaleAllow login;
+  // packages/server/session-tailnet.ts). Everyone else on the tailnet gets
   // the review and Ask AI through the SDKs, as before. Remote mode is
   // unchanged: it still turns the bridge off.
 }
@@ -477,19 +522,21 @@ if (tailscaleFlag) {
  * annotate subcommand, so review sessions always take the exit-1 leg).
  */
 async function handleTailscaleReady(port: number): Promise<void> {
-  // A host handed this CLI an "Ask this session" bridge: say who may use it
-  // over the tailnet (the owner of this machine) before the address exists.
-  // A plain `--tailscale` run (no bridge) asks Tailscale nothing more.
+  // Who counts as the owner over the tailnet (the owner of this machine, or
+  // the inboxTailscaleAllow logins when Tailscale names no owner), read before
+  // the address exists. Every --tailscale session needs it: hover cards
+  // (ref-cards.ts) answer the owner's tab with or without a bridge. With a
+  // host's "Ask this session" bridge, the owner may also ask it; say so.
+  const owners = readTailnetOwners();
+  setSessionTailnetOwners(owners.logins);
   const bridged = resolveAIEnabled() && takeEnvPullSessionBridgeConfig() !== undefined;
   let askOverTailnet = false;
   if (bridged) {
-    const owner = readTailnetOwner();
-    setSessionTailnetOwner(owner.login);
-    askOverTailnet = owner.login !== null;
+    askOverTailnet = owners.logins.length > 0;
     process.stderr.write(
-      owner.login !== null
-        ? `[plannotator] Ask this session: on here, and over your tailnet for ${owner.login} only.\n`
-        : `[plannotator] Ask this session: on this computer only (${owner.reason}); other devices get Ask AI without it.\n`,
+      "reason" in owners
+        ? `[plannotator] Ask this session: on this computer only (${owners.reason}); other devices get Ask AI without it.\n`
+        : `[plannotator] Ask this session: on here, and over your tailnet for ${owners.logins.join(", ")} only${owners.source === "allowlist" ? " (inboxTailscaleAllow: Tailscale names no owner for this machine)" : ""}.\n`,
     );
   }
   let url: string;
@@ -497,7 +544,7 @@ async function handleTailscaleReady(port: number): Promise<void> {
     ({ url } = enableTailscaleServe(port));
   } catch (error) {
     process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`);
-    process.stderr.write("To keep working on this computer, run the same command without --tailscale.\n");
+    process.stderr.write(`To keep working on this computer, ${tailscaleOptOut}.\n`);
     process.exit(
       annotateStartupFailureExitCode({
         requireApproval: requireApprovalFlag,
@@ -656,6 +703,10 @@ if (isVersionInvocation(args)) {
 
 /** The person turned the Inbox's Board on (config.json `inboxBoard`): only then does either help mention cards. */
 const boardOnForHelp = () => INBOX_CARD_ACTION_ON && loadConfig().inboxBoard === true;
+// Thread steps (approval "inbox-thread-steps"): the guide says nothing of them while the person has them off.
+const stepsOnForHelp = () => loadConfig().inboxSteps === true;
+/** The person turned code review on (config.json `inboxCodeReview`): only then does the guide name submit_guide's `review`. */
+const codeReviewOnForHelp = () => loadConfig().inboxCodeReview === true;
 
 if (isTopLevelHelpInvocation(args)) {
   console.log(formatTopLevelHelp({ board: boardOnForHelp() }));
@@ -671,7 +722,7 @@ if (helpSubcommand) {
   // `inbox --help` is the Plannotator Inbox guide for agents (inbox-help.ts).
   console.log(
     helpSubcommand === "inbox"
-      ? formatInboxHelp({ command: inboxSelfCommand(), dataDir: getPlannotatorDataDir(), board: boardOnForHelp() })
+      ? formatInboxHelp({ command: inboxSelfCommand(), dataDir: getPlannotatorDataDir(), board: boardOnForHelp(), steps: stepsOnForHelp(), codeReview: codeReviewOnForHelp() })
       : formatSubcommandHelp(helpSubcommand),
   );
   process.exit(0);
@@ -1519,6 +1570,8 @@ if (args[0] === "sessions") {
     error: diffError,
     origin: detectedOrigin,
     project: reviewProject,
+    // `--title`: the tab names what the caller chose (#2289).
+    title: sessionTitle,
     includeReviewDirectory: !!reviewDirectory,
     diffType: workspace ? (initialDiffType ?? workspace.diffType) : gitContext ? (initialDiffType ?? "unstaged") : initialDiffType,
     gitContext,
@@ -1788,7 +1841,7 @@ if (args[0] === "sessions") {
   // terminal treats tailnet publication; the server throw backstops this.
   if (liveAppResolved && tailscaleFlag) {
     exitAnnotateStartupFailure(
-      "Live app annotation is unavailable with --tailscale (the session is reachable across your tailnet). Run without --tailscale, or use --static to annotate a converted snapshot of the page.",
+      `Live app annotation is unavailable with --tailscale (the session is reachable across your tailnet). To annotate it live, ${tailscaleOptOut}; or use --static to annotate a converted snapshot of the page.`,
     );
   }
 
@@ -1816,6 +1869,8 @@ if (args[0] === "sessions") {
     bundleFiles,
     sourceInfo,
     sourceConverted,
+    // `--title`: the tab and the header name what the caller chose (#2289).
+    title: sessionTitle,
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
@@ -2143,6 +2198,7 @@ if (args[0] === "sessions") {
     filePath: "last-message",
     origin: copilotDetected ? "copilot-cli" : detectedOrigin,
     mode: "annotate-last",
+    title: sessionTitle,
     sharingEnabled,
     shareBaseUrl,
     pasteApiUrl,
