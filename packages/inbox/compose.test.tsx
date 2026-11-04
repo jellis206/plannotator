@@ -20,6 +20,7 @@ import { request } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import type { InboxListSection } from '@plannotator/core/inbox-types';
+import { resetStorageBackend, setStorageBackend, storage } from '@plannotator/ui/utils/storage';
 
 import { NO_BROWSER } from '../../tests/helpers/no-browser';
 
@@ -38,6 +39,7 @@ let root: Root | null = null;
 let host: HTMLElement | null = null;
 let savedFetch: typeof fetch;
 let savedEventSource: unknown;
+const stored = new Map<string, string>();
 let posted: { path: string; body: Record<string, unknown> }[] = [];
 /** When set, the server's answer to a compose Send (POST /api/inbox/messages) is this instead. */
 let sendAnswer: { status: number; body: Record<string, unknown> } | null = null;
@@ -123,6 +125,9 @@ beforeEach(() => {
   };
   posted = [];
   window.location.hash = '';
+  // happy-dom keeps no cookies: the settings live in memory for each test.
+  stored.clear();
+  setStorageBackend({ getItem: (k) => stored.get(k) ?? null, setItem: (k, v) => void stored.set(k, v), removeItem: (k) => void stored.delete(k) });
 });
 
 afterEach(() => {
@@ -133,6 +138,7 @@ afterEach(() => {
   host = null;
   globalThis.fetch = savedFetch;
   (globalThis as Record<string, unknown>).EventSource = savedEventSource;
+  resetStorageBackend();
 });
 
 async function until(check: () => boolean | Promise<boolean>, what: string) {
@@ -824,7 +830,7 @@ const boardChip = () => dialog()!.querySelector<HTMLButtonElement>('[data-compos
 test.skipIf(!hasDom)('Board chip: none while the Board is off', async () => {
   expect((await loopback('/api/inbox/settings', 'POST', JSON.stringify({ board: { on: false } }))).status).toBe(200);
   // The browser's last choice is on: with the Board off, the chip is still not drawn.
-  localStorage.setItem(BOARD_CHOICE_KEY, '1');
+  storage.setItem(BOARD_CHOICE_KEY, '1');
   try {
     await poll('ses_chip_off', 'claude-code', projects[0]!);
     const el = await renderApp();
@@ -832,14 +838,14 @@ test.skipIf(!hasDom)('Board chip: none while the Board is off', async () => {
     await until(() => dialog()!.querySelector('[data-compose-thread-row]') !== null, 'the Thread row');
     expect(boardChip()).toBeNull();
   } finally {
-    localStorage.removeItem(BOARD_CHOICE_KEY);
+    storage.removeItem(BOARD_CHOICE_KEY);
   }
 });
 
 test.skipIf(!hasDom)('Board chip: off by default; on, the Send asks for the Board with the words as typed, the sent message is marked, and the next compose remembers it', async () => {
   expect((await loopback('/api/inbox/settings', 'POST', JSON.stringify({ board: { on: true } }))).status).toBe(200);
   await loopback('/api/inbox/board/intro', 'POST', '{}');
-  localStorage.removeItem(BOARD_CHOICE_KEY);
+  storage.removeItem(BOARD_CHOICE_KEY);
   await poll('ses_chip', 'claude-code', projects[0]!);
   let el = await renderApp();
   await openCompose(el);
@@ -849,7 +855,7 @@ test.skipIf(!hasDom)('Board chip: off by default; on, the Send asks for the Boar
   expect(boardChip()!.getAttribute('aria-label')).toBe('Track on Board');
   act(() => boardChip()!.click());
   expect(boardChip()!.getAttribute('aria-pressed')).toBe('true');
-  expect(localStorage.getItem(BOARD_CHOICE_KEY)).toBe('1');
+  expect(storage.getItem(BOARD_CHOICE_KEY)).toBe('1');
   await pickTo('ses_chip');
   type('Chip tracked work\n\nMove the retry budget into config.');
   act(() => (dialog()!.querySelector('[data-compose-send]') as HTMLButtonElement).click());
@@ -865,7 +871,7 @@ test.skipIf(!hasDom)('Board chip: off by default; on, the Send asks for the Boar
   await until(() => boardChip() !== null, 'the Board chip again');
   expect(boardChip()!.getAttribute('aria-pressed')).toBe('true');
   act(() => boardChip()!.click());
-  expect(localStorage.getItem(BOARD_CHOICE_KEY)).toBeNull();
+  expect(storage.getItem(BOARD_CHOICE_KEY)).toBeNull();
   key('Escape');
   await until(() => dialog() === null, 'closed');
 
@@ -880,7 +886,7 @@ test.skipIf(!hasDom)('Board chip: off by default; on, the Send asks for the Boar
 test.skipIf(!hasDom)('Board chip: a draft keeps it, whatever the browser chose since', async () => {
   expect((await loopback('/api/inbox/settings', 'POST', JSON.stringify({ board: { on: true } }))).status).toBe(200);
   await loopback('/api/inbox/board/intro', 'POST', '{}');
-  localStorage.removeItem(BOARD_CHOICE_KEY);
+  storage.removeItem(BOARD_CHOICE_KEY);
   await poll('ses_chip_draft', 'claude-code', projects[0]!);
   const el = await renderApp();
   await openCompose(el);
@@ -892,7 +898,7 @@ test.skipIf(!hasDom)('Board chip: a draft keeps it, whatever the browser chose s
   await until(() => dialog() === null, 'kept as a draft');
   const kept = (await drafts()).find((d) => d.body.startsWith('Chip draft kept')) as unknown as { id: string; board_request?: boolean };
   expect(kept.board_request).toBe(true);
-  localStorage.removeItem(BOARD_CHOICE_KEY);
+  storage.removeItem(BOARD_CHOICE_KEY);
   act(() => (el.querySelector('[data-drafts-nav]') as HTMLButtonElement).click());
   await until(() => el.querySelector(`[data-draft-id="${kept.id}"]`) !== null, 'the draft row');
   act(() => (el.querySelector(`[data-draft-id="${kept.id}"] .ib-draft-open`) as HTMLButtonElement).click());

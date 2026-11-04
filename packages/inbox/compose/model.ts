@@ -6,6 +6,7 @@
 
 import { derivePersonThreadSubject, suggestPersonThreadName } from '@plannotator/core/inbox-questions';
 import { checkInboxThreadName, INBOX_DRAFT_BODY_MAX, INBOX_HOST_NAMES, type InboxComposeProject, type InboxComposeSession, type InboxDraft, type InboxDraftTo } from '@plannotator/core/inbox-types';
+import { storage } from '@plannotator/ui/utils/storage';
 import { whenTime } from '../format';
 
 /** One live session with the project it works in: what To names. */
@@ -227,26 +228,21 @@ export function draftSnapshot(draft: Pick<InboxDraft, 'body' | 'to' | 'files' | 
   };
 }
 
-/** Where the browser keeps the Board chip's last choice (approval "inbox-compose-board-chip": remembered per browser). */
+/**
+ * Where the browser keeps the Board chip's last choice (approval "inbox-compose-board-chip": remembered per browser).
+ * A cookie, like the other settings, so the choice holds when the Inbox comes back on another port.
+ */
 export const COMPOSE_BOARD_CHOICE_KEY = 'plannotator-inbox-compose-board';
 
 /** The Board chip's last choice in this browser: off unless it was last turned on. */
 export function composeBoardChoice(): boolean {
-  try {
-    return typeof localStorage !== 'undefined' && localStorage.getItem(COMPOSE_BOARD_CHOICE_KEY) === '1';
-  } catch {
-    return false;
-  }
+  return storage.getItem(COMPOSE_BOARD_CHOICE_KEY) === '1';
 }
 
 /** Keep the Board chip's choice for the next compose in this browser. */
 export function rememberComposeBoardChoice(on: boolean): void {
-  try {
-    if (on) localStorage.setItem(COMPOSE_BOARD_CHOICE_KEY, '1');
-    else localStorage.removeItem(COMPOSE_BOARD_CHOICE_KEY);
-  } catch {
-    // Storage refused (private mode, quota): the choice lasts this compose only.
-  }
+  if (on) storage.setItem(COMPOSE_BOARD_CHOICE_KEY, '1');
+  else storage.removeItem(COMPOSE_BOARD_CHOICE_KEY);
 }
 
 /**
