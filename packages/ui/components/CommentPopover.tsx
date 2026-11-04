@@ -96,6 +96,10 @@ interface CommentPopoverProps {
   onAskAI?: CommentAskAIHandler;
   askAIContext?: CommentAskAIContext;
   askAIDisabled?: boolean;
+  /** Opt-in: the primary action's label (Shape: "Change it"). Absent → "Add" / "Save", as always. */
+  submitLabel?: string;
+  /** Opt-in: the Ask AI action's label (Shape: "Ask"). Absent → "Ask AI", as always. */
+  askAILabel?: string;
   /** Opt-in: `/` and `$` skill-reference autocomplete (document UI surfaces). Off by default. */
   skillReferences?: boolean;
   /**
@@ -142,6 +146,15 @@ const GAP = 8;
 
 // Module-level draft store: survives popover unmount so reopening the same key restores in-progress text.
 const draftStore = new Map<string, { text: string; images: ImageAttachment[] }>();
+
+/**
+ * Put words back as the `draftKey` draft after their save failed (the
+ * popover clears the draft on submit), so the next open of that composer
+ * shows them. A draft typed since is newer and is kept.
+ */
+export function restoreCommentDraft(draftKey: string, text: string): void {
+  if (!draftStore.has(draftKey) && text.trim() !== '') draftStore.set(draftKey, { text, images: [] });
+}
 
 /** Mirrors the latest text + images into `draftStore[draftKey]` so they outlive popover unmount. No-op without a key. */
 function useCommentDraftSync(draftKey: string | undefined, text: string, images: ImageAttachment[]) {
@@ -219,6 +232,8 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
   onAskAI,
   askAIContext,
   askAIDisabled = false,
+  submitLabel,
+  askAILabel,
   skillReferences = false,
   mentionSource,
   targetChips,
@@ -776,7 +791,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
                 disabled={!canSubmit}
                 className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
               >
-                {isGlobal ? 'Add' : 'Save'}
+                {submitLabel ?? (isGlobal ? 'Add' : 'Save')}
               </button>
               {quickLookGoodButton}
               {onAskAI && (
@@ -787,7 +802,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
                   title={canAskAI ? 'Ask AI this question' : 'Type a question to ask AI'}
                 >
                   <SparklesIcon className="w-3 h-3" />
-                  Ask AI
+                  {askAILabel ?? 'Ask AI'}
                 </button>
               )}
             </div>
@@ -932,7 +947,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
             disabled={!canSubmit}
             className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary text-primary-foreground hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed transition-opacity"
           >
-            {isGlobal ? 'Add' : 'Save'}
+            {submitLabel ?? (isGlobal ? 'Add' : 'Save')}
           </button>
           {quickLookGoodButton}
           {onAskAI && (
@@ -943,7 +958,7 @@ export const CommentPopover: React.FC<CommentPopoverProps> = ({
               title={canAskAI ? 'Ask AI this question' : 'Type a question to ask AI'}
             >
               <SparklesIcon className="w-3 h-3" />
-              Ask AI
+              {askAILabel ?? 'Ask AI'}
             </button>
           )}
         </div>

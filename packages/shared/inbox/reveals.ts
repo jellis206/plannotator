@@ -1,8 +1,9 @@
 /**
  * The queue of one-time feature reveals for people who come back (approval "inbox-feature-reveal", 2026-11-03): Snooze
- * (its announcement), then the Board, then thread steps. Pure, so a test can move the clock; the Inbox server
- * (packages/server/inbox.ts) builds the state from config.json and the store, reports `revealNext` to the page
- * (`GET /api/inbox/settings` `reveal.next`) and spends the claim with `revealMayClaim` (`POST /api/inbox/reveal`).
+ * (its announcement), then the Board, then the Checklist (thread steps, approval "inbox-checklist-reveal"). Pure, so a
+ * test can move the clock; the Inbox server (packages/server/inbox.ts) builds the state from config.json and the
+ * store, reports `revealNext` to the page (`GET /api/inbox/settings` `reveal.next`) and spends the claim with
+ * `revealMayClaim` (`POST /api/inbox/reveal`).
  *
  * The rules:
  *  - One due at a time: the first entry, in table order, whose "who" holds (a release build, tenure since first use,
@@ -34,11 +35,13 @@ export interface RevealEntry {
 export const INBOX_REVEALS: readonly RevealEntry[] = [
   // Its own rules stay (packages/server/inbox-snooze-intro.ts); the queue adds the spacing.
   { id: "snooze", tenureMs: 2 * DAY_MS, minThreads: 0, enabled: true },
-  // The owner: "ok board can be 3 days, snooze 2". The claim turns the Board on (inboxBoard unset -> true).
+  // The owner: "ok board can be 3 days, snooze 2". Opt-in (the owner, 2026-11-04): the claim only stamps it; the
+  // dialog's "Turn it on" writes inboxBoard (unset -> true), "Not now" leaves it unset.
   { id: "board", tenureMs: 3 * DAY_MS, minThreads: 5, enabled: true },
-  // Thread steps: an offer about a week in, not in the approved record. Its dialog needs its own mock and approval,
-  // so it stays off here: never next, never claimed, and no word of it reaches an agent.
-  { id: "steps", tenureMs: 7 * DAY_MS, minThreads: 0, enabled: false },
+  // The Checklist (thread steps), approval "inbox-checklist-reveal" (2026-11-04): 5 days ("lands around day 6") and the
+  // Board's 5 threads; the Board need not be on. Opt-in, as the Board: the claim only stamps it, `ChecklistIntro` opens,
+  // and only its "Turn it on" writes inboxSteps (unset -> true). Until then no word of it reaches an agent.
+  { id: "steps", tenureMs: 5 * DAY_MS, minThreads: 5, enabled: true },
 ];
 
 /** Never two reveals within this long on one machine. */
